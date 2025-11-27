@@ -1,0 +1,8 @@
+functions-framework==3.*
+vertexai
+google-cloud-secret-manager
+google-api-python-client
+google-cloud-firestore
+requests
+beautifulsoup4
+certifi==2024.7.4 

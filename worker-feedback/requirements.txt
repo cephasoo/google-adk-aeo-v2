@@ -1,0 +1,6 @@
+functions-framework==3.*
+vertexai
+google-cloud-firestore
+google-cloud-tasks
+requests
+certifi==2024.7.4 

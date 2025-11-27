@@ -1,0 +1,3 @@
+functions-framework==3.*
+google-cloud-tasks==2.16.3
+certifi==2024.7.4
