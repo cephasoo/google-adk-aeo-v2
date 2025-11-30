@@ -39,6 +39,14 @@ def dispatch_task(payload, target_url):
     global tasks_client
     if tasks_client is None: tasks_client = tasks_v2.CloudTasksClient()
     parent = tasks_client.queue_path(PROJECT_ID, LOCATION, QUEUE_NAME)
+
+    # --- PRODUCTION HARDENING ---
+    # Add a 10-minute deadline to the task.
+    # This tells Cloud Tasks to stop retrying after 600 seconds.
+    from google.protobuf import duration_pb2
+    deadline = duration_pb2.Duration()
+    deadline.FromSeconds(600)
+
     task = {
         "http_request": {
             "http_method": tasks_v2.HttpMethod.POST,
@@ -46,7 +54,8 @@ def dispatch_task(payload, target_url):
             "headers": {"Content-Type": "application/json"},
             "body": json.dumps(payload).encode(),
             "oidc_token": {"service_account_email": FUNCTION_IDENTITY_EMAIL}
-        }
+        },
+        "dispatch_deadline": deadline # <--- ADD THIS LINE
     }
     tasks_client.create_task(request={"parent": parent, "task": task})
 

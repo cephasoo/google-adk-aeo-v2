@@ -1,8 +1,9 @@
 functions-framework==3.*
 vertexai
 google-cloud-secret-manager
+google-cloud-firestore>=2.17.2
+google-cloud-aiplatform>=1.38.0
 google-api-python-client
-google-cloud-firestore
 requests
 beautifulsoup4
 certifi==2024.7.4 

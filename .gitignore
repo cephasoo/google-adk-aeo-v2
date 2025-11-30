@@ -1,6 +1,14 @@
+# .gitignore
+
+# Python stuff
 venv/
 __pycache__/
 *.pyc
-.env
-.DS_Store
 
+# Local secrets
+.env
+
+# OS-specific clutter
+.DS_Store
+Thumbs.db
+desktop.ini
