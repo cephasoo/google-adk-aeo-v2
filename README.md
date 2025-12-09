@@ -133,7 +133,7 @@ GCP Setup
 6. Create secrets in Secret Manager for google-search-api-key and browserless-api-key.
 
 Local Setup
-1. git clone https://github.com/your-username/google-adk-aeo.git
+1. git clone https://github.com/cephasoo/google-adk-aeo-v2
 2. cd google-adk-aeo
 3. python -m venv venv
 4. .\venv\Scripts\Activate.ps1
