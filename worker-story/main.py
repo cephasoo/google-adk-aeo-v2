@@ -173,7 +173,7 @@ def generate_topic_cluster(topic, context):
     CONTEXT: {context}
     CRITICAL: Respond with a JSON object following this exact schema:
     {{
-      "pillar_page_title": "The Definitive Guide to [Topic]",
+      "pillar_page_title": "[Topic]",
       "clusters": [
         {{ "cluster_title": "...", "sub_topics": ["...", "..."] }}
       ]
@@ -328,7 +328,6 @@ def process_story_logic(request):
         print(f"Worker Error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# --- FUNCTION: Ingest Knowledge ---
 # --- FUNCTION: Ingest Knowledge ---
 @functions_framework.http
 def ingest_knowledge(request):
