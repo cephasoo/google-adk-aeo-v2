@@ -134,7 +134,7 @@ GCP Setup
 
 Local Setup
 1. git clone https://github.com/cephasoo/google-adk-aeo-v2
-2. cd google-adk-aeo
+2. cd google-adk-aeo-v2
 3. python -m venv venv
 4. .\venv\Scripts\Activate.ps1
 5. pip install -r requirements.txt
