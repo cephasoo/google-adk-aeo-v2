@@ -1,4 +1,4 @@
-# --- /worker-story/main.py ---
+# --- /worker-story/main.py (FINAL, WITH V4 TRIAGE) ---
 import functions_framework
 from flask import jsonify
 import vertexai
@@ -21,6 +21,7 @@ import datetime
 PROJECT_ID = os.environ.get("PROJECT_ID")
 LOCATION = os.environ.get("LOCATION")
 MODEL_NAME = os.environ.get("MODEL_NAME")
+FLASH_MODEL_NAME = os.environ.get("FLASH_MODEL_NAME")
 SEARCH_ENGINE_ID = os.environ.get("SEARCH_ENGINE_ID")
 BROWSERLESS_API_KEY = os.environ.get("BROWSERLESS_API_KEY")
 N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL") 
@@ -32,7 +33,7 @@ flash_model = None
 search_api_key = None
 db = None
 
-# --- Utils ---
+# --- Utils (Unchanged) ---
 def get_search_api_key():
     global search_api_key
     if search_api_key is None:
@@ -43,7 +44,7 @@ def get_search_api_key():
 
 def extract_json(text):
     match = re.search(r'\{.*\}', text, re.DOTALL)
-    if not match: raise ValueError(f"No JSON found in text: {text[:100]}...")
+    if not match: raise ValueError(f"No JSON found in text: {text[:200]}...")
     return json.loads(match.group(0))
 
 def extract_url_from_text(text):
@@ -52,15 +53,11 @@ def extract_url_from_text(text):
     if match: return match.group(1)
     return None
 
-def chunk_text(text, chunk_size=1000, overlap=200):
+def chunk_text(text, chunk_size=1500, overlap=300):
     chunks = []
     start = 0
     while start < len(text):
         end = start + chunk_size
-        if end < len(text):
-            natural_break = text.rfind('\n', start, end)
-            if natural_break == -1: natural_break = text.rfind('.', start, end)
-            if natural_break != -1 and natural_break > start + (chunk_size // 2): end = natural_break + 1
         chunks.append(text[start:end].strip())
         start = end - overlap 
     return [c for c in chunks if c]
@@ -173,10 +170,13 @@ def generate_topic_cluster(topic, context):
     CONTEXT: {context}
     CRITICAL: Respond with a JSON object following this exact schema:
     {{
+    
       "pillar_page_title": "[Topic]",
+
       "clusters": [
         {{ "cluster_title": "...", "sub_topics": ["...", "..."] }}
       ]
+
     }}
     """
     response = model.generate_content(prompt)
@@ -225,7 +225,7 @@ def process_story_logic(request):
     if model is None: 
         vertexai.init(project=PROJECT_ID, location=LOCATION)
         model = GenerativeModel(MODEL_NAME) # Pro Model
-        flash_model = GenerativeModel("gemini-2.5-flash-lite") # Flash Model
+        flash_model = GenerativeModel(FLASH_MODEL_NAME) # Flash Model
         db = firestore.Client()
 
     req = request.get_json(silent=True)
@@ -234,24 +234,31 @@ def process_story_logic(request):
     slack_context = req['slack_context']
 
     try:
-        # --- REFINED: STRICT INTENT TRIAGE ---
+        # --- THE FIX: HARDENED TRIAGE V4 ---
         triage_prompt = f"""
-        Classify the user's request INTENT into one of three categories:
+        Analyze the user's PRIMARY GOAL and classify the request into one of three categories.
+        Focus on what the user wants as the FINAL OUTPUT.
 
-        1. **THEN_VS_NOW_PROPOSAL**: ONLY if the user EXPLICITLY asks for a "Then vs Now" comparison, a "Nostalgic Tale", or a structured comparison of eras.
-           *Examples:* "Create a Then vs Now story about SEO.", "Write a nostalgic tale about dial-up internet."
+        1.  **TOPIC_CLUSTER_PROPOSAL**: The user wants you to GENERATE a NEW topic cluster, pillar page, or content cluster page ideas FROM SCRATCH.
+            *   **Select this ONLY if the user has NOT provided a pre-existing list or cluster.**
+            *   *Examples:* "Give me a topic cluster for my blog about coffee.", "I need a pillar page outline."
 
-        2. **TOPIC_CLUSTER_PROPOSAL**: If the user asks for a "Topic Cluster", "Pillar Page", or "Content Strategy" breakdown.
+        2.  **THEN_VS_NOW_PROPOSAL**: The user EXPLICITLY asks for a "Then vs Now" story, draft, or structured comparison.
+            *   *Examples:* "Create a Then vs Now proposal about web design."
 
-        3. **DIRECT_ANSWER**: For ALL other requests. This includes general creative writing, drafting manifestos, writing blog posts, summarizing articles, or answering questions.
-           *Examples:* "Write a manifesto for a design agency.", "Draft a blog post about coffee.", "Summarize this URL."
+        3.  **DIRECT_ANSWER**: This is the default for ALL OTHER tasks. This includes answering questions, writing content, or performing an action *using information the user has provided*.
+            *   **Select this if the user gives you a cluster and asks you to build a strategy from it.**
+            *   *Examples:*
+                * "Summarize this article: [URL]"
+                * "Write a blog post about the following points: [Points]"
+                * "Come up with a strategy FOR this cluster: [Cluster Object Provided by User]"
 
         USER REQUEST: "{topic}"
 
         CRITICAL: Respond with ONLY the category name.
         """
         intent = flash_model.generate_content(triage_prompt).text.strip()
-        print(f"Smart Triage V2 classified intent as: {intent}")
+        print(f"Smart Triage V4 classified intent as: {intent}")
 
         # --- 2. Research (Shared) ---
         research_data = find_trending_keywords(topic)
