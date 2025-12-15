@@ -501,12 +501,18 @@ def find_trending_keywords(clean_topic, history_context=""):
         "tool_logs": tool_logs 
     }
 
-def generate_topic_cluster(topic, context):
+def generate_topic_cluster(topic, context, history=""):
     global model
     print("Tool: Topic Cluster Generator")
     prompt = f"""
-    You are a master Content Strategist. User wants pillar page on "{topic}".
+    You are a master Content Strategist.
+    
+    Conversation History: {history}.
+    
+    User wants pillar page on "{topic}".
+    
     CONTEXT: {context}
+
     CRITICAL: Respond with a JSON object following this exact schema:
     {{
     
@@ -521,7 +527,7 @@ def generate_topic_cluster(topic, context):
     response = model.generate_content(prompt)
     return extract_json(response.text)
 
-def generate_comprehensive_answer(topic, context):
+def generate_comprehensive_answer(topic, context, history=""):
     global model
     is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
     if is_grounded:
@@ -530,7 +536,19 @@ def generate_comprehensive_answer(topic, context):
     else:
         temperature = 0.7
         system_instruction = "You are an expert AI assistant. Use the research context to provide accurate answers."
-    prompt = f"{system_instruction}\n\nThe user asked: \"{topic}\"\n\nResearch Context:\n{context}\n\nAnswer:"
+    prompt = f"""
+        {system_instruction}
+        
+        Conversation History:
+        {history}
+        
+        Current Request: "{topic}"
+        
+        Research Context:
+        {context}
+        
+        Answer:
+        """
     return model.generate_content(prompt, generation_config={"temperature": temperature}).text.strip()
 
 def create_euphemistic_links(keyword_context):
@@ -582,7 +600,7 @@ def process_story_logic(request):
     if session_doc.exists:
         history_events = session_doc.to_dict().get('event_log', [])
         # Create context string for Triage
-        history_text = "\n".join([f"Turn {i+1} ({e.get('event_type')}): {e.get('text', '')[:200]}" for i, e in enumerate(history_events[-10:])])
+        history_text = "\n".join([f"Turn {i+1} ({e.get('event_type')}): {e.get('text', '')}" for i, e in enumerate(history_events[-10:])])
     
     print(f"Worker loaded context with {len(history_events)} past events.")
 
@@ -666,7 +684,7 @@ def process_story_logic(request):
 
         # 3. Generate Output based on Intent
         if intent == "DIRECT_ANSWER":
-            answer_text = generate_comprehensive_answer(original_topic, research_data['context'])
+            answer_text = generate_comprehensive_answer(original_topic, research_data['context'], history=history_text)
             new_events.append({"event_type": "agent_answer", "text": answer_text})
             
             db.collection('agent_sessions').document(session_id).update({
@@ -678,7 +696,7 @@ def process_story_logic(request):
             return jsonify({"msg": "Answer sent"}), 200
 
         elif intent == "TOPIC_CLUSTER_PROPOSAL":
-            cluster_data = generate_topic_cluster(clean_topic, research_data['context'])
+            cluster_data = generate_topic_cluster(clean_topic, research_data['context'], history=history_text)
             formatted_cluster = f"Here is the topic cluster you requested:\n```\n{json.dumps(cluster_data, indent=2)}\n```"
             new_events.append({"event_type": "agent_answer", "proposal_type": "topic_cluster", "data": cluster_data})
             
