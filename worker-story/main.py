@@ -416,7 +416,7 @@ def find_trending_keywords(clean_topic, history_context=""):
     
     if research_context:
         context_snippets.append(research_context)
-        tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": clean_topic, "status": "success"})
+        tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": clean_topic, "status": "success", "content": research_context})
     
     # Fallback to Simple Search
     if not research_context and "NONE" not in choice:
@@ -535,8 +535,21 @@ def process_story_logic(request):
     history_text = ""
     if session_doc.exists:
         history_events = session_doc.to_dict().get('event_log', [])
-        # Create context string for Triage
-        history_text = "\n".join([f"Turn {i+1} ({e.get('event_type')}): {e.get('text', '')}" for i, e in enumerate(history_events[-10:])])
+
+
+    # START: MEMORY EXPANSION & PHOTOGRAPHIC RECALL ---
+    formatted_history = []
+    for i, e in enumerate(history_events[-10:]):
+        if e.get('event_type') == 'tool_call':
+            # FIX: Explicitly read the 'content' field to remember previous search results
+            # Cap at 5000 chars to save tokens while keeping rich context
+            entry = f"Turn {i+1} (System Search Results): {e.get('content', '')[:5000]}" 
+        else:
+            # FIX: Increased limit from 200 to 5000 chars so clusters/long prompts aren't lobotomized
+            entry = f"Turn {i+1} ({e.get('event_type')}): {e.get('text', '')[:5000]}"
+        formatted_history.append(entry)
+
+    history_text = "\n".join(formatted_history)
     
     print(f"Worker loaded context with {len(history_events)} past events.")
 
@@ -671,7 +684,7 @@ def process_story_logic(request):
 
             except ValueError as e:
                 # Fallback
-                answer_text = generate_comprehensive_answer(original_topic, research_data['context'])
+                answer_text = generate_comprehensive_answer(original_topic, research_data['context'], history=history_text)
                 new_events.append({"event_type": "agent_answer", "text": answer_text})
                 db.collection('agent_sessions').document(session_id).update({
                     "status": "awaiting_feedback", "type": "work_answer", "topic": clean_topic,
