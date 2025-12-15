@@ -164,84 +164,6 @@ def search_long_term_memory(query):
         
     return memories
 
-def find_trending_keywords(clean_topic, history_context=""):
-    """
-    An intelligent meta-tool that routes a query to the best specialized search tool.
-    (Updated to use the new Sensory Array tools)
-    """
-    global model, flash_model
-    print(f"Tool: find_trending_keywords (Sensory Array) for clean_topic: '{clean_topic}'")
-    
-    tool_logs = []
-    context_snippets = []
-    
-    # --- 1. INTERNAL RAG: SEARCH OWN MEMORY ---
-    internal_context = search_long_term_memory(clean_topic)
-    if internal_context:
-        context_snippets.append(internal_context)
-        tool_logs.append({"event_type": "tool_call", "tool_name": "internal_knowledge_retrieval", "status": "success"})
-
-    # --- 2. SENSORY ARRAY ROUTER (The Fix) ---
-    tool_choice_prompt = f"""
-    Analyze the user's query to select the single best research tool.
-
-    CONVERSATION HISTORY:
-    {history_context}
-
-    USER'S CORE QUERY: '{clean_topic}'
-
-    Available Tools:
-    - WEB: For deep analysis of web results, knowledge graphs, AI Overviews, and top stories.
-    - IMAGES: If the user explicitly asks for images, pictures, or visual inspiration.
-    - VIDEOS: If the user explicitly asks for videos, clips, or tutorials.
-    - SCHOLAR: If the user is asking for academic papers, research, studies, or highly credible sources.
-    - SIMPLE: For all other general web searches.
-
-    Which tool is most appropriate? Respond with ONLY the tool name (e.g., WEB, IMAGES, SCHOLAR).
-    """
-    choice = flash_model.generate_content(tool_choice_prompt).text.strip().upper()
-    print(f"Sensory Array Router chose tool: {choice}")
-    
-    # --- 3. EXECUTE THE CHOSEN TOOL ---
-    research_context = None
-    tool_name = "unknown"
-    
-    if choice == "WEB":
-        research_context = search_google_web(clean_topic) 
-        tool_name = "serpapi_web_search"
-    elif choice == "IMAGES":
-        research_context = search_google_images(clean_topic)
-        tool_name = "serpapi_image_search"
-    elif choice == "VIDEOS":
-        research_context = search_google_videos(clean_topic)
-        tool_name = "serpapi_video_search"
-    elif choice == "SCHOLAR":
-        research_context = search_google_scholar(clean_topic)
-        tool_name = "serpapi_scholar_search"
-    
-    if research_context:
-        context_snippets.append(research_context)
-        tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": clean_topic, "status": "success"})
-    
-    # --- 4. FALLBACK: SIMPLE WEB SEARCH ---
-    if not research_context:
-        print("Executing simple web search as fallback...")
-        try:
-            api_key = get_search_api_key()
-            service = build("customsearch", "v1", developerKey=api_key)
-            tool_logs.append({"event_type": "tool_call", "tool_name": "google_simple_search", "input": clean_topic})
-            res = service.cse().list(q=clean_topic, cx=SEARCH_ENGINE_ID, num=5).execute()
-            google_snippets = [item.get('snippet', '') for item in res.get('items', [])]
-            if google_snippets:
-                context_snippets.append("[CONTEXT FROM GOOGLE WEB SEARCH]:\n---\n" + "\n---\n".join(google_snippets))
-        except Exception as e:
-            print(f"Simple Google search failed: {e}")
-
-    return {
-        "context": context_snippets, 
-        "tool_logs": tool_logs 
-    }
-
 # 1. The Helper to Parse SerpApi Features
 def _parse_serp_features(results):
     """
@@ -429,6 +351,10 @@ def search_google_scholar(query, num_results=3):
 # 3. The Router (Updated to use the new names)
 
 def find_trending_keywords(clean_topic, history_context=""):
+    """
+    An intelligent meta-tool that routes a query to the best specialized search tool.
+    Now includes a 'NONE' option to prevent redundant searches.
+    """
     global model, flash_model
     print(f"Tool: find_trending_keywords (Sensory Array) for clean_topic: '{clean_topic}'")
     
@@ -456,11 +382,21 @@ def find_trending_keywords(clean_topic, history_context=""):
     - VIDEOS: If the user explicitly asks for videos, clips, or tutorials.
     - SCHOLAR: If the user is asking for academic papers, research, studies, or highly credible sources.
     - SIMPLE: For all other general web searches.
+    - NONE: Select this if the answer can be derived ENTIRELY from the CONVERSATION HISTORY (e.g., "Review the previous results", "Summarize what you just found"). Do not waste budget on new searches.
 
     Which tool is most appropriate? Respond with ONLY the tool name.
     """
     choice = flash_model.generate_content(tool_choice_prompt).text.strip().upper()
     print(f"Sensory Array Router chose tool: {choice}")
+
+    # --- 3. OPTIMIZATION: HANDLE "NONE" ---
+    if "NONE" in choice:
+        print("Router decided context is sufficient. Skipping external search.")
+        # Return whatever internal memory we found, or just an empty context if strictly chat
+        return {
+            "context": context_snippets, 
+            "tool_logs": tool_logs 
+        }
     
     research_context = None
     tool_name = "unknown"
@@ -483,7 +419,7 @@ def find_trending_keywords(clean_topic, history_context=""):
         tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": clean_topic, "status": "success"})
     
     # Fallback to Simple Search
-    if not research_context:
+    if not research_context and "NONE" not in choice:
         print("Executing simple web search as fallback...")
         try:
             api_key = get_search_api_key()
