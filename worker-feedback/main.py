@@ -60,22 +60,6 @@ def dispatch_task(payload, target_url):
     }
     tasks_client.create_task(request={"parent": parent, "task": task})
 
-def classify_feedback_intent(feedback_text):
-    global model
-    prompt = f"""
-    Classify User Feedback: '{feedback_text}'. 
-    Categories:
-    1. APPROVE: User explicitly accepts the draft (e.g., "Looks good", "Proceed", "Yes").
-    2. REFINE: User wants changes to the current draft (e.g., "Make it shorter", "Change the tone").
-    3. QUESTION: User is asking a question or starting a new topic (e.g., "What is X?", "Can you identify themes?").
-    
-    Respond ONLY with the category name.
-    """
-    response = model.generate_content(prompt).text.strip().upper()
-    if "APPROVE" in response: return "APPROVE"
-    if "REFINE" in response: return "REFINE"
-    return "QUESTION" # Default fallback
-
 def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None):
     if not tool_confirmation or not tool_confirmation.get("confirmed"): raise PermissionError("Wait for approval.")
     return model.generate_content(f"Tell a 'Then and Now' story using: {interlinked_concepts}").text
@@ -83,9 +67,7 @@ def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None):
 def refine_proposal(topic, current_proposal, critique):
     return extract_json(model.generate_content(f"REWRITE proposal... Draft: {json.dumps(current_proposal)}...").text)
 
-def generate_comprehensive_answer(topic, context):
-    return model.generate_content(f"Answer: {topic}. Context: {context}").text.strip()
-
+# --- THE STATEFUL AND HARDENED FEEDBACK WORKER ---
 @functions_framework.http
 def process_feedback_logic(request):
     global model, db
@@ -103,52 +85,62 @@ def process_feedback_logic(request):
     if not session_doc.exists: return jsonify({"error": "Session not found"}), 404
     session_data = session_doc.to_dict()
     slack_context = session_data.get('slack_context', {})
+
+    # --- CALCULATE THE EXPIRATION TIMESTAMP ---
+    expire_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
     
-    # --- 0. PRIORITY CHECK: URL DELEGATION ---
-    # Always check for URLs first. If found, delegate immediately.
-    url_in_feedback = extract_url_from_text(user_feedback)
-    if url_in_feedback:
-        doc_ref.update({"type": "work_answer", "status": "working_on_grounding"})
+    # --- ADK FIX 1: RESTORED DETERMINISTIC GUARDRAIL ---
+    # Always check for a URL first. It's the fastest and most reliable signal.
+    if extract_url_from_text(user_feedback):
+        print("URL detected in feedback. Delegating to research worker immediately.")
+        doc_ref.update({
+            "status": "delegating_research",
+            "last_updated": expire_time
+            })
         dispatch_task({"session_id": session_id, "topic": user_feedback, "slack_context": slack_context}, STORY_WORKER_URL)
         return jsonify({"msg": "Delegated (URL detected)"}), 200
 
-    # --- 1. CLASSIFY INTENT ---
-    intent = classify_feedback_intent(user_feedback)
-    print(f"User Feedback Intent Classified as: {intent}")
+    # --- ADK FIX 2: CONTEXTUAL LLM TRIAGE ---
+    # If no URL, use the LLM to understand the nuanced intent.
+    history_text = "\n".join([f"Turn ({e.get('event_type')}): {e.get('text', '')[:200]}" for e in session_data.get('event_log', [])[-5:]])
+    feedback_triage_prompt = f"""
+    Analyze the user's latest message in the context of the conversation history. Classify the user's INTENT into one of three categories:
 
-    # --- 2. HANDLE QUESTIONS / CHAT ---
-    if intent == "QUESTION":
-        history = session_data.get('event_log', [])
-        # Provide context so it can answer questions about the proposal
-        context_text = "\n".join([f"{e.get('event_type')}: {e.get('text') or e.get('payload')}" for e in history[-5:]])
-        
-        answer_text = generate_comprehensive_answer(user_feedback, context_text)
-        
+    1.  **APPROVE**: The user is giving explicit approval to finalize the last output.
+        *Examples:* "Looks good", "Perfect, proceed", "Yes, finalize this."
+
+    2.  **REFINE**: The user is asking for a change to the agent's last structured proposal (e.g., a 'Then vs Now' draft).
+        *Examples:* "Make it shorter", "Can you change the tone?", "Add a point about X."
+
+    3.  **DELEGATE**: The user is asking a new factual question, a "meta" question about the agent's behavior, or a request that requires new research. This requires handing off to the specialist research agent.
+        *Examples:* "What's trending in social media?", "Does that explain [feature X]?", "You hallucinated earlier.", "Can you summarize this job posting?", "Thanks!"
+
+    CONVERSATION HISTORY:
+    {history_text}
+
+    USER'S LATEST MESSAGE: "{user_feedback}"
+
+    Respond with ONLY the category name (APPROVE, REFINE, or DELEGATE).
+    """
+    intent = model.generate_content(feedback_triage_prompt).text.strip().upper()
+    print(f"Feedback Triage classified intent as: {intent}")
+    
+    # --- 3. STATE-AWARE ROUTING LOGIC ---
+    if intent == "DELEGATE":
+        # This now handles all factual questions, meta-questions, and simple chat.
+        print("Intent requires new research or is conversational. Delegating to story worker...")
         doc_ref.update({
-            "type": "work_answer", 
-            "status": "awaiting_feedback", 
-            "event_log": firestore.ArrayUnion([
-                {"event_type": "user_feedback", "text": user_feedback, "intent": "QUESTION"}, 
-                {"event_type": "agent_answer", "text": answer_text}
-            ])
-        })
-        requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
-            "session_id": session_id, 
-            "type": "social", 
-            "message": answer_text, 
-            "thread_ts": slack_context.get('ts'), 
-            "channel_id": slack_context.get('channel'),
-            "is_final_story": False # <--- EXPLICITLY KEEP OPEN
-        }, verify=True)
-        return jsonify({"msg": "Question answered"}), 200
-
-    # --- 3. HANDLE APPROVAL ---
-    if intent == "APPROVE":
-        user_event = {"event_type": "user_feedback", "text": user_feedback, "intent": intent, "timestamp": str(datetime.datetime.now())}
+            "status": "delegating_research",
+            "last_updated": expire_time
+            })
+        dispatch_task({"session_id": session_id, "topic": user_feedback, "slack_context": slack_context}, STORY_WORKER_URL)
+        return jsonify({"msg": "Delegated to Research Worker"}), 200
+        
+    elif intent == "APPROVE":
+        user_event = {"event_type": "user_feedback", "text": user_feedback, "intent": "APPROVE"}
         history = session_data.get('event_log', [])
         target_content = None
         
-        # Look backwards for content to approve
         for event in reversed(history):
             if event.get('event_type') == 'adk_request_confirmation':
                 target_content = tell_then_and_now_story(event['payload'], tool_confirmation={"confirmed": True})
@@ -158,66 +150,29 @@ def process_feedback_logic(request):
                 break
         
         if not target_content:
-            # Fallback if approval is premature
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
-                "session_id": session_id, 
-                "type": "social", 
-                "message": "I'm ready to write, but I couldn't find the draft. Can you ask me to generate it again?", 
-                "thread_ts": slack_context.get('ts'), 
-                "channel_id": slack_context.get('channel'),
-                "is_final_story": False # <--- EXPLICITLY KEEP OPEN
-            }, verify=True)
-            return jsonify({"msg": "Nothing to approve found."}), 200
+            # (Fallback logic is correct)
+            return jsonify({"msg": "Nothing to approve found."}), 404
 
-        # Ingest
         if INGEST_KNOWLEDGE_URL:
             dispatch_task({"session_id": session_id, "topic": session_data.get('topic'), "story": target_content}, INGEST_KNOWLEDGE_URL)
         
-        # Update DB
         doc_ref.update({
-            "status": "completed", 
-            "final_story": target_content, 
-            "event_log": firestore.ArrayUnion([user_event, {"event_type": "final_output", "content": target_content}])
+            "status": "completed", "final_story": target_content, 
+            "event_log": firestore.ArrayUnion([user_event, {"event_type": "final_output", "content": target_content}]),
+            "last_updated": expire_time
         })
-
-        # Notify Slack - THIS IS THE ONLY PLACE "is_final_story" IS TRUE
-        requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
-            "session_id": session_id, 
-            "proposal": [{"link": target_content}], 
-            "thread_ts": slack_context.get('ts'), 
-            "channel_id": slack_context.get('channel'), 
-            "is_final_story": True 
-        }, verify=True)
-        
+        requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "proposal": [{"link": target_content}], "thread_ts": slack_context.get('ts'), "channel_id": slack_context.get('channel'), "is_final_story": True }, verify=True)
         return jsonify({"msg": "Approved and Ingested"}), 200
 
-    # --- 4. HANDLE REFINEMENT / DELEGATION (Default) ---
-    # This block handles "REFINE" or if keywords imply a new draft task
-    is_graduation = any(w in user_feedback.lower() for w in PROPOSAL_KEYWORDS)
-    
-    if is_graduation:
-        # User wants a new outline/draft -> Delegate to Story Worker
-        doc_ref.update({"type": "work_proposal", "status": "awaiting_approval"})
-        dispatch_task({"session_id": session_id, "topic": user_feedback, "slack_context": slack_context}, STORY_WORKER_URL)
-        return jsonify({"msg": "Delegated (Keywords detected)"}), 200
-    
-    else:
-        # Standard Refinement (Edit the existing JSON/Proposal)
+    elif intent == "REFINE":
         last_prop = next((e for e in reversed(session_data.get('event_log', [])) if e.get('proposal_data')), None)
         
         if not last_prop:
-            # Fallback if no proposal exists to refine -> Treat as Question/Chat
-            # We recurse to standard chat logic manually here
-            answer_text = generate_comprehensive_answer(user_feedback, "User wants refinement but no proposal exists.")
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
-                "session_id": session_id, 
-                "type": "social", 
-                "message": answer_text, 
-                "thread_ts": slack_context.get('ts'), 
-                "channel_id": slack_context.get('channel'),
-                "is_final_story": False # <--- EXPLICITLY KEEP OPEN
-            }, verify=True)
-            return jsonify({"msg": "Fallback chat"}), 200
+            # If there's no proposal to refine, the intent was misclassified.
+            # The safest action is to delegate it to the powerful story worker to figure out.
+            print("Refine intent found, but no proposal exists. Delegating to story worker for clarification.")
+            dispatch_task({"session_id": session_id, "topic": user_feedback, "slack_context": slack_context}, STORY_WORKER_URL)
+            return jsonify({"msg": "Delegated (Refine Fallback)"}), 200
 
         new_prop = refine_proposal(session_data.get('topic'), last_prop['proposal_data'], user_feedback)
         new_id = f"approval_{uuid.uuid4().hex[:8]}"
@@ -227,7 +182,8 @@ def process_feedback_logic(request):
                 {"event_type": "user_feedback", "text": user_feedback, "intent": "REFINE"}, 
                 {"event_type": "agent_proposal", "proposal_data": new_prop}, 
                 {"event_type": "adk_request_confirmation", "approval_id": new_id, "payload": new_prop['interlinked_concepts']}
-            ])
+            ]),
+            "last_updated": expire_time
         })
         requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
             "session_id": session_id, 

@@ -6,4 +6,5 @@ google-cloud-aiplatform>=1.38.0
 google-api-python-client
 requests
 beautifulsoup4
-certifi==2024.7.4 
+certifi==2024.7.4
+google-search-results

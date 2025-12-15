@@ -10,10 +10,11 @@ import re
 import certifi
 import requests
 from google.cloud import firestore, tasks_v2
+import datetime
 
 # --- Configuration ---
-PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
-LOCATION = os.environ.get("GCP_LOCATION")
+PROJECT_ID = os.environ.get("PROJECT_ID")
+LOCATION = os.environ.get("LOCATION")
 MODEL_NAME = os.environ.get("MODEL_NAME")
 N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL") 
 QUEUE_NAME = "story-worker-queue"
@@ -55,7 +56,7 @@ def dispatch_task(payload, target_url):
             "body": json.dumps(payload).encode(),
             "oidc_token": {"service_account_email": FUNCTION_IDENTITY_EMAIL}
         },
-        "dispatch_deadline": deadline # <--- ADD THIS LINE
+        "dispatch_deadline": deadline
     }
     tasks_client.create_task(request={"parent": parent, "task": task})
 
@@ -75,6 +76,9 @@ def start_story_workflow(request):
     if not text_input: return jsonify({"error": "Invalid request"}), 400
     
     session_id = str(uuid.uuid4())
+
+    # --- CALCULATE THE EXPIRATION TIMESTAMP ---
+    expire_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
     
     # 1. Deterministic Routing (Regex)
     has_url = extract_url_from_text(text_input) is not None
@@ -89,20 +93,23 @@ def start_story_workflow(request):
         intent = model.generate_content(triage_prompt).text.strip().upper()
     
     if "SOCIAL" in intent:
-        social_prompt = f"User: '{text_input}'. Respond naturally/wittily. Max 2 sentences."
+        social_prompt = f"User: '{text_input}'. Respond naturally/wittily. Keep it brief."
         reply = model.generate_content(social_prompt).text.strip()
         
         # Log and Reply immediately
         db.collection('agent_sessions').document(session_id).set({
             "status": "completed", "type": "social", "topic": "Social", "slack_context": slack_context,
-            "event_log": [{"event_type": "social", "text": text_input}, {"event_type": "agent_reply", "text": reply}]
+            "event_log": [{"event_type": "social", "text": text_input}, {"event_type": "agent_reply", "text": reply}],
+            "last_updated": expire_time
         })
         requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": reply, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts']}, verify=True)
         return jsonify({"msg": "Social reply sent", "session_id": session_id}), 200
     else:
         # Dispatch to Worker
         db.collection('agent_sessions').document(session_id).set({
-             "status": "starting", "type": "work_answer", "topic": text_input, "slack_context": slack_context, "event_log": []
+             "status": "starting", "type": "work_answer", "topic": text_input,
+             "slack_context": slack_context, "event_log": [],
+             "last_updated": expire_time
         })
         # Note: STORY_WORKER_URL is now an Env Var, not hardcoded
         dispatch_task({"session_id": session_id, "topic": text_input, "slack_context": slack_context}, STORY_WORKER_URL)

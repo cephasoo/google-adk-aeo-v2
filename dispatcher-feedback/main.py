@@ -5,8 +5,8 @@ import os
 import json
 from google.cloud import tasks_v2
 
-PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
-LOCATION = os.environ.get("GCP_LOCATION")
+PROJECT_ID = os.environ.get("PROJECT_ID")
+LOCATION = os.environ.get("LOCATION")
 QUEUE_NAME = "story-worker-queue"
 FEEDBACK_WORKER_URL = os.environ.get("FEEDBACK_WORKER_URL")
 FUNCTION_IDENTITY_EMAIL = os.environ.get("FUNCTION_IDENTITY_EMAIL")
