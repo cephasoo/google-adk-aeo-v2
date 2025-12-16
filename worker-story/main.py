@@ -43,27 +43,47 @@ def sanitize_input_text(text):
     # Strips leading/trailing whitespace, asterisks (bold), underscores (italics), and tildes (strikethrough)
     return text.strip().strip('*_~')
 
-def extract_core_topic(user_prompt):
+def extract_core_topic(user_prompt, history=""):
     """
-    Uses a fast LLM to distill a user's natural language prompt 
-    into a rich, effective search query.
+    Distills a user's prompt into a high-precision Google Search query using SEO operators.
     """
-    global flash_model
+    global model
     print(f"Distilling core topic from: '{user_prompt[:100]}...'")
     
     extraction_prompt = f"""
     You are an expert Google Search operator.
-    Convert the user's natural language request into the SINGLE BEST Google Search query to find high-quality results.
+    Convert the user's natural language request into a single, high-precision Google Advanced Search query.
 
-    Guidelines:
-    1.  **Keep it Rich:** Do not over-simplify. If the user compares X and Y, search for "X vs Y".
-    2.  **Use Operators:** Use quotes "" for exact phrases, OR for alternatives, and AND for required concepts.
-    3.  **Remove Fluff:** Remove "I want to know about", "Please tell me", etc.
-    
-    Examples:
-    *   User: "What are the latest trends in SEO?" -> Query: "SEO trends 2025"
-    *   User: "Compare LangChain and AutoGen" -> Query: "LangChain vs AutoGen features"
-    *   User: "Find PDF reports on AI agents" -> Query: "AI agents filetype:pdf"
+    ### SEARCH OPERATOR RULES:
+    1.  **Grouping with Parentheses:** Use `( )` to group synonyms when using OR. 
+        * *Bad:* OpenAI OR Gemini news
+        * *Good:* (OpenAI OR Gemini) news
+    2.  **Alternatives:** Use uppercase `OR` between entities
+        * *User Intent:* Find a recipe for a dessert using either strawberries or raspberries
+        * *Bad Query:* strawberry raspberry dessert recipe (Implies you want both berries).
+        * *Good Query:* (strawberry OR raspberry) dessert recipe
+    3.  **Exact Phrases:** Use quotes `""` for specific multi-word concepts.
+        * *User Intent:* Find the origin of the specific phrase "the early bird catches the worm".
+        * *Bad Query:* early bird catches worm origin (Finds pages with these words scattered anywhere).
+        **Good Query:* "the early bird catches the worm" origin
+    4.  **Exclusion:** Use `-` to remove noise. Example: `jobs -entry_level`
+    5.  **No Commas:** Do not use commas to separate terms; they are ignored
+    6.  **Freshness:** If the user asks for news, include terms like "news", "updates", "latest"
+    7.  **Remove Fluff and stop words:** Remove "I want to know about", "Please tell me", etc
+    8.  **Searching Within a Specified Site:** Use the site: operator along with precise keywords. e.g. "site:nytimes.com climate change impacts"
+    9.  **Searching a Specified File Type:** Use the filetype: operator to find specific document types. e.g. "artificial intelligence filetype:pdf"
+    10. **Combining Operators:** Combine multiple operators for refined searches. e.g. "(AI OR artificial intelligence) site:edu filetype:pdf -outdated"
+    11. **Avoid Ambiguity:** Ensure the query is specific enough to avoid broad or vague results
+    12.  **Limit Length:** Keep the query concise, ideally under 10 words, while retaining precision
+    13.  **Use AND Implicitly:** Remember that Google uses AND by default between terms
+    14.  **Prioritize Relevance:** Focus on the most relevant keywords that capture the essence of the user's request
+    15.  **Avoid Redundancy:** Do not repeat terms or concepts unnecessarily
+
+    ### CONTEXT MAPPING:
+    Use the provided HISTORY to resolve ambiguous terms like "he", "it", or "that" where the specific entity names aren't specified.
+
+    HISTORY:
+    {history[-3000:]}
 
     USER REQUEST:
     "{user_prompt}"
@@ -71,7 +91,7 @@ def extract_core_topic(user_prompt):
     SEARCH QUERY:
     """
     
-    core_topic = flash_model.generate_content(extraction_prompt).text.strip()
+    core_topic = model.generate_content(extraction_prompt).text.strip()
 
     print(f"Distilled Core Topic: '{core_topic}'")
     return core_topic
@@ -350,39 +370,46 @@ def search_google_scholar(query, num_results=3):
 
 # 3. The Router (Updated to use the new names)
 
-def find_trending_keywords(clean_topic, history_context=""):
+def find_trending_keywords(raw_topic, history_context=""):
     """
     An intelligent meta-tool that routes a query to the best specialized search tool.
-    Now includes a 'NONE' option to prevent redundant searches.
+    Uses 'raw_topic' for routing to allow for "NONE" selection on conversational turns.
     """
     global model, flash_model
-    print(f"Tool: find_trending_keywords (Sensory Array) for clean_topic: '{clean_topic}'")
+    print(f"Tool: find_trending_keywords (Sensory Array) for RAW topic: '{raw_topic}'")
     
     tool_logs = []
     context_snippets = []
     
-    # Internal RAG (Unchanged)
-    internal_context = search_long_term_memory(clean_topic)
+    # 1. Internal RAG (We can use raw_topic here; semantic search handles sentences well)
+    internal_context = search_long_term_memory(raw_topic)
     if internal_context:
         context_snippets.append(internal_context)
         tool_logs.append({"event_type": "tool_call", "tool_name": "internal_knowledge_retrieval", "status": "success"})
 
-    # Sensory Array Router
+    # 2. Sensory Array Router (Decides based on RAW input)
     tool_choice_prompt = f"""
     Analyze the user's query to select the single best research tool.
 
     CONVERSATION HISTORY:
     {history_context}
 
-    USER'S CORE QUERY: '{clean_topic}'
+    USER'S CORE QUERY: '{raw_topic}'
 
     Available Tools:
     - WEB: For deep analysis of web results, knowledge graphs, AI Overviews, and top stories.
+        Also, select this if the user asks about:
+        1. RECENT events, news, or trends (e.g. "yesterday", "new", "current").
+        2. Specific FACTS that might be outdated in my training data.
+        3. Entities I might not know (e.g. specific companies, people).
     - IMAGES: If the user explicitly asks for images, pictures, or visual inspiration.
     - VIDEOS: If the user explicitly asks for videos, clips, or tutorials.
     - SCHOLAR: If the user is asking for academic papers, research, studies, or highly credible sources.
     - SIMPLE: For all other general web searches.
-    - NONE: Select this if the answer can be derived ENTIRELY from the CONVERSATION HISTORY (e.g., "Review the previous results", "Summarize what you just found"). Do not waste budget on new searches.
+    - NONE: Select this if:
+        1. The answer is a CORRECTION or REFINEMENT (e.g., "I said strategy not cluster").
+        2. The answer can be derived from HISTORY.
+        3. The user has PROVIDED the source material (e.g., "Summarize this text", "Create a strategy from these points") and just wants you to process/organize it.
 
     Which tool is most appropriate? Respond with ONLY the tool name.
     """
@@ -392,40 +419,45 @@ def find_trending_keywords(clean_topic, history_context=""):
     # --- 3. OPTIMIZATION: HANDLE "NONE" ---
     if "NONE" in choice:
         print("Router decided context is sufficient. Skipping external search.")
-        # Return whatever internal memory we found, or just an empty context if strictly chat
         return {
             "context": context_snippets, 
             "tool_logs": tool_logs 
         }
     
+    # --- 4. LAZY DISTILLATION & EXECUTION ---
+    # Only now do we distill, because we know we need to search.
+    # We pass history so the distiller knows what "that" or "it" refers to.
+    search_query = extract_core_topic(raw_topic, history=history_context)
+    
     research_context = None
     tool_name = "unknown"
 
     if choice == "WEB":
-        research_context = search_google_web(clean_topic) # Replaces get_structured_serp_analysis
+        research_context = search_google_web(search_query) # Use distilled query
         tool_name = "serpapi_web_search"
     elif choice == "IMAGES":
-        research_context = search_google_images(clean_topic)
+        research_context = search_google_images(search_query)
         tool_name = "serpapi_image_search"
     elif choice == "VIDEOS":
-        research_context = search_google_videos(clean_topic)
+        research_context = search_google_videos(search_query)
         tool_name = "serpapi_video_search"
     elif choice == "SCHOLAR":
-        research_context = search_google_scholar(clean_topic)
+        research_context = search_google_scholar(search_query)
         tool_name = "serpapi_scholar_search"
     
     if research_context:
         context_snippets.append(research_context)
-        tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": clean_topic, "status": "success", "content": research_context})
+        # Save 'content' for photographic memory!
+        tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": search_query, "status": "success", "content": research_context})
     
-    # Fallback to Simple Search
+    # --- 5. FALLBACK / SIMPLE SEARCH ---
     if not research_context and "NONE" not in choice:
         print("Executing simple web search as fallback...")
         try:
             api_key = get_search_api_key()
             service = build("customsearch", "v1", developerKey=api_key)
-            tool_logs.append({"event_type": "tool_call", "tool_name": "google_simple_search", "input": clean_topic})
-            res = service.cse().list(q=clean_topic, cx=SEARCH_ENGINE_ID, num=5).execute()
+            tool_logs.append({"event_type": "tool_call", "tool_name": "google_simple_search", "input": search_query})
+            res = service.cse().list(q=search_query, cx=SEARCH_ENGINE_ID, num=5).execute() # Use distilled query
             google_snippets = [item.get('snippet', '') for item in res.get('items', [])]
             if google_snippets:
                 context_snippets.append("[CONTEXT FROM GOOGLE WEB SEARCH]:\n---\n" + "\n---\n".join(google_snippets))
@@ -560,16 +592,17 @@ def process_story_logic(request):
         Analyze the user's latest message in the context of the conversation history.
         Classify the PRIMARY GOAL into one of four categories:
 
-        1.  **SOCIAL_CONVERSATION**: The user is engaging in small talk, saying hello/goodbye, expressing gratitude, or making a comment that DOES NOT require external information or research.
+        1.  **SOCIAL_CONVERSATION**: The user is engaging in "obvious" small talks, greetings, expressing gratitude, or meta-comments, or comments that DOES NOT require external information or research.
             *Examples:* "Thanks!", "Great job.", "I have to go now.", "You are funny.", "Okay.", "Good Morning."
 
-        2.  **TOPIC_CLUSTER_PROPOSAL**: The user wants you to GENERATE a NEW topic cluster, pillar page, or content strategy FROM SCRATCH.
-            *   **Select this ONLY if the user has NOT provided a pre-existing list or cluster.**
+        2.  **TOPIC_CLUSTER_PROPOSAL**: The user specifically wants you to GENERATE a NEW list of topics, topic clusters, pillar page and/or supporting pages outline, or a hierarchical content structure.
+            *   **CRITICAL EXCLUSION:** If the user asks for a "Strategy", "Plan", or "Brief" regarding *existing or user-provided* clusters, select DIRECT_ANSWER.
 
         3.  **THEN_VS_NOW_PROPOSAL**: The user EXPLICITLY asks for a "Then vs Now" story, draft, or structured comparison.
 
-        4.  **DIRECT_ANSWER**: This is the default for KNOWLEDGE TASKS. The user is asking a question, asking for a summary, or giving a command that requires processing information.
-            *Examples:* "Summarize this URL", "Who is the minister?", "Create a strategy for this cluster."
+        4.  **DIRECT_ANSWER**: This is the default for ALL research, and reasoning, logic, creativity tasks (general knowledge that DOES NOT require fresh data).
+            *   **Select this for:** Questions about news, facts, summaries, or strategies (inquiries that could always leverage freshness and recency)...
+            *   **Even if:** The user is polite or casual (e.g., "I was just wondering...", "Can you check...", "Do you know...").
 
         CONVERSATION HISTORY:
         {history_text}
@@ -618,8 +651,8 @@ def process_story_logic(request):
         # === PATH B: WORK/RESEARCH (The Heavy Lifting) ===
         # Only now do we pay the cost to distill and research.
         
-        # 1. Distill
-        clean_topic = extract_core_topic(sanitized_topic)
+        # 1. Stopped for bleeding SERPAPI costs
+        # clean_topic = extract_core_topic(sanitized_topic)
 
         # 2. Research (Handle URL or Keywords)
         url = extract_url_from_text(sanitized_topic)
@@ -627,9 +660,12 @@ def process_story_logic(request):
             article_text = fetch_article_content(url)
             research_data = {"context": [f"GROUNDING_CONTENT:\n{article_text}"], "tool_logs": []}
         else:
-            research_data = find_trending_keywords(clean_topic, history_context=history_text)
+            research_data = find_trending_keywords(sanitized_topic, history_context=history_text)
         
         if "tool_logs" in research_data: new_events.extend(research_data["tool_logs"])
+
+        # CHANGE: Ensure downstream functions use the raw topic too, so they see the full request
+        clean_topic = sanitized_topic
 
         # 3. Generate Output based on Intent
         if intent == "DIRECT_ANSWER":
