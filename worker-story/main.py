@@ -275,7 +275,7 @@ def search_google_web(query):
         from serpapi import GoogleSearch
         
         # 1. Primary Search (The Standard 'google' Engine)
-        params = {"api_key": SERPAPI_API_KEY, "engine": "google", "q": query}
+        params = {"api_key": SERPAPI_API_KEY, "engine": "google", "q": query, "no_cache": True}
         search = GoogleSearch(params)
         results = search.get_dict()
 
@@ -291,7 +291,7 @@ def search_google_web(query):
                     "api_key": SERPAPI_API_KEY,
                     "engine": "google_ai_overview",
                     "page_token": token,
-                     "q": query 
+                    #  "q": query 
                 }
                 
                 aio_search = GoogleSearch(aio_params)
@@ -325,7 +325,50 @@ def search_google_web(query):
         print(f"SerpApi Web Search failed: {e}")
         return None
 
+#3. The Specialist Google Trends Tool
+def search_google_trends(geo="US"):
+    """
+    Specialist tool for fetching 'Trending Now' searches via SerpApi.
+    Accepts a 2-letter ISO geo code (e.g., 'US', 'NG', 'GB').
+    """
+    print(f"Tool: Executing TRENDS search for geo: '{geo}'")
+    try:
+        from serpapi import GoogleSearch
+        # TCREI: Context - We strictly want 'Trending Now' to see breakout topics
+        trend_params = {
+            "api_key": SERPAPI_API_KEY,
+            "engine": "google_trends_trending_now",
+            "geo": geo,       # Defaults to US, can be dynamic
+            "hours": 24       # Look back 24 hours for freshness
+        }
+        
+        search = GoogleSearch(trend_params)
+        results = search.get_dict()
+        
+        # Parse the 'trending_searches' list
+        trending_list = results.get("trending_searches", [])
+        
+        if not trending_list:
+            return f"No trending data found for location '{geo}' at this time."
 
+        # Format for LLM Consumption
+        formatted_trends = [f"**Google Trends (Trending Now in {geo}):**"]
+        for item in trending_list[:10]:
+            query = item.get("query")
+            traffic = item.get("formatted_traffic")
+            
+            # Extract related news articles if available
+            articles = item.get("articles", [])
+            article_snippet = f" (News: {articles[0]['title']} - {articles[0]['source']})" if articles else ""
+            
+            formatted_trends.append(f"- **{query}** [{traffic} searches]{article_snippet}")
+            
+        return "\n".join(formatted_trends)
+
+    except Exception as e:
+        print(f"SerpApi Trends Search failed: {e}")
+        return f"Error fetching trends: {e}"
+    
 def search_google_images(query, num_results=5):
     """Specialist tool for analyzing image search results."""
     print(f"Tool: Executing IMAGE search for: '{query}'")
@@ -374,6 +417,7 @@ def find_trending_keywords(raw_topic, history_context=""):
     """
     An intelligent meta-tool that routes a query to the best specialized search tool.
     Uses 'raw_topic' for routing to allow for "NONE" selection on conversational turns.
+    Uses a Hybrid String strategy to support Dynamic Geo-targetting without breaking standard tool selection.
     """
     global model, flash_model
     print(f"Tool: find_trending_keywords (Sensory Array) for RAW topic: '{raw_topic}'")
@@ -405,16 +449,34 @@ def find_trending_keywords(raw_topic, history_context=""):
     - IMAGES: If the user explicitly asks for images, pictures, or visual inspiration.
     - VIDEOS: If the user explicitly asks for videos, clips, or tutorials.
     - SCHOLAR: If the user is asking for academic papers, research, studies, or highly credible sources.
+    - TRENDS: If the user asks for "trending", "viral", "hottest", or "breaking" topics.
+        * ISOLATED RULE: If a location is specified, append the 2-letter ISO code. 
+        * Format: "TRENDS:CODE" (e.g., "TRENDS:NG" for Nigeria, "TRENDS:GB" for UK). 
+        * Default: "TRENDS:US".
     - SIMPLE: For all other general web searches.
     - NONE: Select this if:
         1. The answer is a CORRECTION or REFINEMENT (e.g., "I said strategy not cluster").
         2. The answer can be derived from HISTORY.
         3. The user has PROVIDED the source material (e.g., "Summarize this text", "Create a strategy from these points") and just wants you to process/organize it.
 
-    Which tool is most appropriate? Respond with ONLY the tool name.
+    Which tool is most appropriate? Respond with the tool selection string (e.g., WEB, SCHOLAR, or TRENDS:US).
     """
-    choice = flash_model.generate_content(tool_choice_prompt).text.strip().upper()
-    print(f"Sensory Array Router chose tool: {choice}")
+    # 3. Robust Parsing Logic
+    try:
+        raw_response = flash_model.generate_content(tool_choice_prompt).text.strip().upper()
+        
+        # Split by colon to check for "Trend-esque" parameters
+        parts = raw_response.split(':')
+        
+        choice = parts[0].strip()       # Always the Tool Name (e.g., "WEB" or "TRENDS")
+        geo_code = parts[1].strip() if len(parts) > 1 else "US" # Only exists for Trends
+        
+    except Exception as e:
+        print(f"Router Parse Error: {e}. Defaulting to SIMPLE.")
+        choice = "SIMPLE"
+        geo_code = "US"
+
+    print(f"Sensory Array decided: Tool={choice}, Geo={geo_code}")
 
     # --- 3. OPTIMIZATION: HANDLE "NONE" ---
     if "NONE" in choice:
@@ -423,46 +485,71 @@ def find_trending_keywords(raw_topic, history_context=""):
             "context": context_snippets, 
             "tool_logs": tool_logs 
         }
-    
-    # --- 4. LAZY DISTILLATION & EXECUTION ---
-    # Only now do we distill, because we know we need to search.
-    # We pass history so the distiller knows what "that" or "it" refers to.
-    search_query = extract_core_topic(raw_topic, history=history_context)
+
+    # --- 4. LAZY DISTILLATION & EXECUTION (optimized for performance) ---
+    # Default: Use the raw topic. 
+    # Why? Because 'extract_core_topic' is slow/expensive. We only run it if necessary.
+    search_query = raw_topic
     
     research_context = None
     tool_name = "unknown"
 
-    if choice == "WEB":
-        research_context = search_google_web(search_query) # Use distilled query
-        tool_name = "serpapi_web_search"
-    elif choice == "IMAGES":
-        research_context = search_google_images(search_query)
-        tool_name = "serpapi_image_search"
-    elif choice == "VIDEOS":
-        research_context = search_google_videos(search_query)
-        tool_name = "serpapi_video_search"
-    elif choice == "SCHOLAR":
-        research_context = search_google_scholar(search_query)
-        tool_name = "serpapi_scholar_search"
-    
-    if research_context:
-        context_snippets.append(research_context)
-        # Save 'content' for photographic memory!
-        tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": search_query, "status": "success", "content": research_context})
+    # GROUP A: Keyword-Heavy Tools (WEB, SCHOLAR, etc.)
+    # These require a highly refined search query to work well.
+    if choice in ["WEB", "IMAGES", "VIDEOS", "SCHOLAR", "SIMPLE"]:
+        # ACTION: Distill the topic using History.
+        search_query = extract_core_topic(raw_topic, history=history_context)
+        
+        if choice == "WEB":
+            research_context = search_google_web(search_query)
+            tool_name = "serpapi_web_search"
+        elif choice == "IMAGES":
+            research_context = search_google_images(search_query)
+            tool_name = "serpapi_image_search"
+        elif choice == "VIDEOS":
+            research_context = search_google_videos(search_query)
+            tool_name = "serpapi_video_search"
+        elif choice == "SCHOLAR":
+            research_context = search_google_scholar(search_query)
+            tool_name = "serpapi_scholar_search"
+        elif choice == "SIMPLE":
+            # (Handled in fallback block, but query is now ready)
+            pass
+
+        # GROUP B: Parameter-Based Tools (TRENDS)
+        # The 'google_trends_trending_now' API IGNORES search queries. It only accepts 'geo'.
+        # Therefore, running 'extract_core_topic' here is a waste of time and tokens.
+        elif choice == "TRENDS":
+            # We don't need a specific query for "Trending Now", it's geo-based.
+            # Optional: You could extract a country code from 'raw_topic' if you wanted to be fancy.
+            research_context = search_google_trends(geo=geo_code) 
+            tool_name = "serpapi_trends_search"
     
     # --- 5. FALLBACK / SIMPLE SEARCH ---
     if not research_context and "NONE" not in choice:
+        # Edge Case: If Trends failed, or we chose SIMPLE, we ensure we have a refined query.
+        # If we skipped distillation earlier (Group B) but failed, we do it now for the fallback.
+        if search_query == raw_topic: 
+             search_query = extract_core_topic(raw_topic, history=history_context)
+
         print("Executing simple web search as fallback...")
         try:
             api_key = get_search_api_key()
             service = build("customsearch", "v1", developerKey=api_key)
             tool_logs.append({"event_type": "tool_call", "tool_name": "google_simple_search", "input": search_query})
-            res = service.cse().list(q=search_query, cx=SEARCH_ENGINE_ID, num=5).execute() # Use distilled query
+            res = service.cse().list(q=search_query, cx=SEARCH_ENGINE_ID, num=5).execute()
             google_snippets = [item.get('snippet', '') for item in res.get('items', [])]
+
             if google_snippets:
                 context_snippets.append("[CONTEXT FROM GOOGLE WEB SEARCH]:\n---\n" + "\n---\n".join(google_snippets))
+                
         except Exception as e:
             print(f"Simple Google search failed: {e}")
+
+        if research_context:
+            context_snippets.append(research_context)
+            # Save 'content' for photographic memory!
+            tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": search_query, "status": "success", "content": research_context})
 
     return {
         "context": context_snippets, 

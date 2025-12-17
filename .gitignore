@@ -12,3 +12,12 @@ __pycache__/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# VSCode-specific files
+.vs/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.sqlite
