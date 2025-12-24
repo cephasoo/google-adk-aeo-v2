@@ -20,7 +20,7 @@ N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL")
 STORY_WORKER_URL = os.environ.get("STORY_WORKER_URL") 
 QUEUE_NAME = "story-worker-queue"
 FUNCTION_IDENTITY_EMAIL = os.environ.get("FUNCTION_IDENTITY_EMAIL")
-PROPOSAL_KEYWORDS = ["outline", "draft", "proposal", "story", "brief"]
+# PROPOSAL_KEYWORDS = ["outline", "draft", "proposal", "story", "brief"]
 INGEST_KNOWLEDGE_URL = os.environ.get("INGEST_KNOWLEDGE_URL")
 
 model = None
@@ -101,8 +101,18 @@ def process_feedback_logic(request):
         return jsonify({"msg": "Delegated (URL detected)"}), 200
 
     # --- ADK FIX 2: CONTEXTUAL LLM TRIAGE ---
-    # If no URL, use the LLM to understand the nuanced intent.
-    history_text = "\n".join([f"Turn ({e.get('event_type')}): {e.get('text', '')[:200]}" for e in session_data.get('event_log', [])[-5:]])
+    # FIX: Read from 'events' subcollection instead of 'event_log' array
+    events_ref = doc_ref.collection('events')
+    
+    # 1. Sort DESCENDING (Newest first) and get the top 5
+    recent_events_query = events_ref.order_by('timestamp', direction=firestore.Query.DESCENDING).limit(5)
+
+
+    # 2. Stream and then REVERSE the list to get chronological order (Oldest -> Newest)
+    recent_events = [doc.to_dict() for doc in recent_events_query.stream()][::-1]
+    
+    history_text = "\n".join([f"Turn ({e.get('event_type')}): {e.get('text', '')[:200]}" for e in recent_events])
+
     feedback_triage_prompt = f"""
     Analyze the user's latest message in the context of the conversation history. Classify the user's INTENT into one of three categories:
 
@@ -137,11 +147,14 @@ def process_feedback_logic(request):
         return jsonify({"msg": "Delegated to Research Worker"}), 200
         
     elif intent == "APPROVE":
-        user_event = {"event_type": "user_feedback", "text": user_feedback, "intent": "APPROVE"}
-        history = session_data.get('event_log', [])
+        ts = datetime.datetime.now(datetime.timezone.utc)
+        user_event = {"event_type": "user_feedback", "text": user_feedback, "intent": "APPROVE", "timestamp": ts}
+
+        # FIX: Fetch FULL history from subcollection to find the proposal
+        full_history = [doc.to_dict() for doc in events_ref.order_by('timestamp').stream()]
         target_content = None
         
-        for event in reversed(history):
+        for event in reversed(full_history):
             if event.get('event_type') == 'adk_request_confirmation':
                 target_content = tell_then_and_now_story(event['payload'], tool_confirmation={"confirmed": True})
                 break
@@ -150,26 +163,30 @@ def process_feedback_logic(request):
                 break
         
         if not target_content:
-            # (Fallback logic is correct)
             return jsonify({"msg": "Nothing to approve found."}), 404
 
         if INGEST_KNOWLEDGE_URL:
             dispatch_task({"session_id": session_id, "topic": session_data.get('topic'), "story": target_content}, INGEST_KNOWLEDGE_URL)
         
+        # FIX: Update parent status, but write events to subcollection
         doc_ref.update({
-            "status": "completed", "final_story": target_content, 
-            "event_log": firestore.ArrayUnion([user_event, {"event_type": "final_output", "content": target_content}]),
+            "status": "completed", 
+            "final_story": target_content,
             "last_updated": expire_time
         })
+        
+        events_ref.add(user_event)
+        events_ref.add({"event_type": "final_output", "content": target_content, "timestamp": datetime.datetime.now(datetime.timezone.utc)})
+        
         requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "proposal": [{"link": target_content}], "thread_ts": slack_context.get('ts'), "channel_id": slack_context.get('channel'), "is_final_story": True }, verify=True)
         return jsonify({"msg": "Approved and Ingested"}), 200
 
     elif intent == "REFINE":
-        last_prop = next((e for e in reversed(session_data.get('event_log', [])) if e.get('proposal_data')), None)
+        # FIX: Fetch history from subcollection
+        full_history = [doc.to_dict() for doc in events_ref.order_by('timestamp').stream()]
+        last_prop = next((e for e in reversed(full_history) if e.get('proposal_data')), None)
         
         if not last_prop:
-            # If there's no proposal to refine, the intent was misclassified.
-            # The safest action is to delegate it to the powerful story worker to figure out.
             print("Refine intent found, but no proposal exists. Delegating to story worker for clarification.")
             dispatch_task({"session_id": session_id, "topic": user_feedback, "slack_context": slack_context}, STORY_WORKER_URL)
             return jsonify({"msg": "Delegated (Refine Fallback)"}), 200
@@ -177,21 +194,21 @@ def process_feedback_logic(request):
         new_prop = refine_proposal(session_data.get('topic'), last_prop['proposal_data'], user_feedback)
         new_id = f"approval_{uuid.uuid4().hex[:8]}"
         
-        doc_ref.update({
-            "event_log": firestore.ArrayUnion([
-                {"event_type": "user_feedback", "text": user_feedback, "intent": "REFINE"}, 
-                {"event_type": "agent_proposal", "proposal_data": new_prop}, 
-                {"event_type": "adk_request_confirmation", "approval_id": new_id, "payload": new_prop['interlinked_concepts']}
-            ]),
-            "last_updated": expire_time
-        })
+        # FIX: Write to subcollection
+        ts = datetime.datetime.now(datetime.timezone.utc)
+        events_ref.add({"event_type": "user_feedback", "text": user_feedback, "intent": "REFINE", "timestamp": ts})
+        events_ref.add({"event_type": "agent_proposal", "proposal_data": new_prop, "timestamp": ts})
+        events_ref.add({"event_type": "adk_request_confirmation", "approval_id": new_id, "payload": new_prop['interlinked_concepts'], "timestamp": ts})
+        
+        doc_ref.update({"last_updated": expire_time})
+        
         requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
             "session_id": session_id, 
             "approval_id": new_id, 
             "proposal": new_prop['interlinked_concepts'], 
             "thread_ts": slack_context.get('ts'), 
             "channel_id": slack_context.get('channel'),
-            "is_final_story": False # <--- EXPLICITLY KEEP OPEN
+            "is_final_story": False 
         }, verify=True)
 
     return jsonify({"message": "Refinement processed."}), 200

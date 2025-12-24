@@ -89,26 +89,60 @@ def start_story_workflow(request):
         intent = "WORK"
     else:
         # 2. AI Triage (Only if no URL)
-        triage_prompt = f"Classify: '{text_input}'. Classes: [SOCIAL, WORK]. Respond ONLY with class name."
+        triage_prompt = f"""
+        Classify the user's intent based on the definitions below.
+        
+        DEFINITIONS:
+        - WORK: Requests for information, research, news, trends, 'viral' topics, strategies, drafts, analysis, or review.
+          (e.g., "What is trending?", "Tell me about X", "Draft a story", "Who is...", "Viral in Nigeria").
+        - SOCIAL: Pure small talk, greetings, compliments, or gratitude WITHOUT an information request.
+          (e.g., "Hi", "Thanks", "Good job", "You are funny", "God bless you").
+          
+        USER INPUT: "{text_input}"
+        
+        RESPOND ONLY WITH "SOCIAL" OR "WORK".
+        """
         intent = model.generate_content(triage_prompt).text.strip().upper()
     
     if "SOCIAL" in intent:
         social_prompt = f"User: '{text_input}'. Respond naturally/wittily. Keep it brief."
         reply = model.generate_content(social_prompt).text.strip()
         
-        # Log and Reply immediately
-        db.collection('agent_sessions').document(session_id).set({
-            "status": "completed", "type": "social", "topic": "Social", "slack_context": slack_context,
-            "event_log": [{"event_type": "social", "text": text_input}, {"event_type": "agent_reply", "text": reply}],
+        # --- FIX: WRITE TO SUBCOLLECTION (Prevent 1MB Crash) ---
+        session_ref = db.collection('agent_sessions').document(session_id)
+        
+        # 1. Set Parent Metadata (No 'event_log' array)
+        session_ref.set({
+            "status": "completed", 
+            "type": "social", 
+            "topic": "Social", 
+            "slack_context": slack_context,
             "last_updated": expire_time
         })
+
+        # 2. Write Events to Subcollection
+        batch = db.batch()
+        ts = datetime.datetime.now(datetime.timezone.utc)
+        
+        event_1 = {"event_type": "social", "text": text_input, "timestamp": ts}
+        event_2 = {"event_type": "agent_reply", "text": reply, "timestamp": ts}
+        
+        # Use .document() to generate auto-ID
+        batch.set(session_ref.collection('events').document(), event_1)
+        batch.set(session_ref.collection('events').document(), event_2)
+        batch.commit()
+        
+        # Send Reply via Webhook
         requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": reply, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts']}, verify=True)
         return jsonify({"msg": "Social reply sent", "session_id": session_id}), 200
     else:
         # Dispatch to Worker
+        # --- REMOVED 'event_log': [] ---
         db.collection('agent_sessions').document(session_id).set({
-             "status": "starting", "type": "work_answer", "topic": text_input,
-             "slack_context": slack_context, "event_log": [],
+             "status": "starting", 
+             "type": "work_answer", 
+             "topic": text_input,
+             "slack_context": slack_context,
              "last_updated": expire_time
         })
         # Note: STORY_WORKER_URL is now an Env Var, not hardcoded
