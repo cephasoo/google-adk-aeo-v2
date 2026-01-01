@@ -3,7 +3,9 @@ import functions_framework
 from flask import jsonify
 import vertexai
 from vertexai.generative_models import GenerativeModel
+import litellm
 from litellm import completion
+litellm.drop_params = True  # CRITICAL: Handle unsupported params for new models (like gpt-5)
 from vertexai.language_models import TextEmbeddingModel
 import os
 import json
@@ -82,7 +84,7 @@ class UnifiedModel:
                     messages=[{"role": "user", "content": prompt}],
                     temperature=temp,
                     num_retries=3,
-                    timeout=30
+                    timeout=60  # Increased for complex recursive drafting
                 )
                 
                 # Create a Fake Vertex Response Object
@@ -118,28 +120,20 @@ def extract_core_topic(user_prompt, history=""):
 
     ### SEARCH OPERATOR RULES:
     1.  **Grouping with Parentheses:** Use `( )` to group synonyms when using OR. 
-        * *Bad:* OpenAI OR Gemini news
-        * *Good:* (OpenAI OR Gemini) news
-    2.  **Alternatives:** Use uppercase `OR` between entities
-        * *User Intent:* Find a recipe for a dessert using either strawberries or raspberries
-        * *Bad Query:* strawberry raspberry dessert recipe (Implies you want both berries).
-        * *Good Query:* (strawberry OR raspberry) dessert recipe
+    2.  **Alternatives:** Use uppercase `OR` between entities.
     3.  **Exact Phrases:** Use quotes `""` for specific multi-word concepts.
-        * *User Intent:* Find the origin of the specific phrase "the early bird catches the worm".
-        * *Bad Query:* early bird catches worm origin (Finds pages with these words scattered anywhere).
-        **Good Query:* "the early bird catches the worm" origin
-    4.  **Exclusion:** Use `-` to remove noise. Example: `jobs -entry_level`
-    5.  **No Commas:** Do not use commas to separate terms; they are ignored
-    6.  **Freshness:** If the user asks for news, include terms like "news", "updates", "latest"
-    7.  **Remove Fluff and stop words:** Remove "I want to know about", "Please tell me", etc
-    8.  **Searching Within a Specified Site:** Use the site: operator along with precise keywords. e.g. "site:nytimes.com climate change impacts"
-    9.  **Searching a Specified File Type:** Use the filetype: operator to find specific document types. e.g. "artificial intelligence filetype:pdf"
-    10. **Combining Operators:** Combine multiple operators for refined searches. e.g. "(AI OR artificial intelligence) site:edu filetype:pdf -outdated"
-    11. **Avoid Ambiguity:** Ensure the query is specific enough to avoid broad or vague results
-    12.  **Limit Length:** Keep the query concise, ideally under 10 words, while retaining precision
-    13.  **Use AND Implicitly:** Remember that Google uses AND by default between terms
-    14.  **Prioritize Relevance:** Focus on the most relevant keywords that capture the essence of the user's request
-    15.  **Avoid Redundancy:** Do not repeat terms or concepts unnecessarily
+    4.  **Exclusion:** Use `-` to remove noise.
+    5.  **No Commas:** Do not use commas.
+    6.  **Freshness:** If news, include "news" or "latest".
+    7.  **Remove Fluff:** Remove "I want to know", "Please tell me", etc.
+    8.  **Site Operator:** Use site: for specific domains.
+    9.  **Filetype Operator:** Use filetype: for PDFs/docs.
+    10. **Limit Length:** Under 10 words.
+    11. **Implicit AND:** No need for AND.
+    12. **CRITICAL: FILTER EDITORIAL INSTRUCTIONS.**
+        - Remove words like: "outline", "draft", "strategy", "blog post", "article", "word count", "Grade 8", "1500+ words", "logic flow".
+        - But PRESERVE discovery intent words: "why", "how", "reasons", "causes", "factors", "impact", "trends".
+        - Focus ONLY on the SUBJECT MATTER and DISCOVERY INTENT.
 
     ### CONTEXT MAPPING:
     Use the provided HISTORY to resolve ambiguous terms like "he", "it", or "that" where the specific entity names aren't specified.
@@ -157,6 +151,41 @@ def extract_core_topic(user_prompt, history=""):
 
     print(f"Distilled Core Topic: '{core_topic}'")
     return core_topic
+
+def extract_target_word_count(user_prompt):
+    """
+    Finds a numeric word count in the prompt (e.g., "1500 words").
+    Defaults to 1500 if none found.
+    """
+    matches = re.findall(r'(\d+)\+?[\s-]*words?', user_prompt, re.IGNORECASE)
+    if matches:
+        return int(matches[0])
+    return 1500
+
+def strip_html_tags(text):
+    """Removes HTML tags for clean context stitching and plain-text views."""
+    return re.sub(r'<[^>]+>', '', text).strip()
+
+def convert_html_to_markdown(html):
+    """Converts architectural HTML into Slack-friendly Markdown."""
+    # 1. Headers
+    text = re.sub(r'<h2>(.*?)</h2>', r'*\1*\n', html)
+    text = re.sub(r'<h3>(.*?)</h3>', r'_\1_\n', text)
+    
+    # 2. Sections to separators
+    text = text.replace('</section>', '\n---\n')
+    text = re.sub(r'<section[^>]*>', '', text)
+    
+    # 3. Lists (Simple conversion)
+    text = text.replace('<ul>', '').replace('</ul>', '')
+    text = text.replace('<li>', '• ').replace('</li>', '\n')
+    
+    # 4. Final Strip
+    text = re.sub(r'<[^>]+>', '', text)
+    
+    # Clean up excess newlines
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 def extract_trend_term(user_prompt, history=""):
     """
@@ -211,11 +240,10 @@ def extract_json(text):
     if not match: raise ValueError(f"No JSON found in text: {text[:200]}...")
     return json.loads(match.group(0))
 
-def extract_url_from_text(text):
+def extract_urls_from_text(text):
+    """Extracts ALL URLs from a given string."""
     url_pattern = r'(https?://[^\s<>|]+)'
-    match = re.search(url_pattern, text)
-    if match: return match.group(1)
-    return None
+    return re.findall(url_pattern, text)
 
 def chunk_text(text, chunk_size=1500, overlap=300):
     chunks = []
@@ -250,7 +278,7 @@ def fetch_article_content(url):
 #2. The Internal Knowledge Retrieval Tool
 def search_long_term_memory(query):
     global db
-    if db is None: db = firestore.Client()
+    if db is None: db = firestore.Client(project=PROJECT_ID)
     
     print(f"Tool: Accessing Hippocampus (Vector Search) for: '{query}'")
     
@@ -631,7 +659,7 @@ def find_trending_keywords(raw_topic, history_context=""):
 
     # 2. Sensory Array Router (Decides based on RAW input)
     tool_choice_prompt = f"""
-    Analyze the user's query to select the single best research tool.
+    Analyze the user's query to select the most appropriate research tool(s).
 
     CONVERSATION HISTORY:
     {history_context}
@@ -643,42 +671,33 @@ def find_trending_keywords(raw_topic, history_context=""):
 
     ### DECISION PROTOCOL (CHECK IN ORDER):
     1. **CHECK HISTORY (Priority #1):**
-        - If the user is asking for information that CAN BE GATHERED from the "LONG-TERM MEMORY" or "CONVERSATION HISTORY", select **NONE**.
+        - If the user is asking for information (or a REFORMATTING like an OUTLINE) that CAN BE GATHERED from the "LONG-TERM MEMORY" or "CONVERSATION HISTORY", select **NONE**.
+        - If the history contains the FACTUAL CONTENT needed but the user wants a new structure (e.g. "Create an outline for the above"), select **NONE**.
         - **CRITICAL EXCEPTION:** If the user asks for **REASONS**, **DRIVERS**, **CAUSES**, or **"WHY"** something happened (and the text history contains only numbers/stats but not the *explanation*), **DO NOT** select NONE. Proceed to Priority #2.
 
     2. **CHECK CREATIVE INTENT (Priority #2):**
-        - If the user asks you to **DRAFT**, **CREATE**, or **WRITE** content for an entity that is clearly **INVENTED** in the prompt (e.g., phrases like "a company called X", "a new brand named Y", "a character named Z"), select **NONE**.
-        - **CRITICAL EXCEPTION:** If the entity is a **REAL-WORLD ENTITY** (e.g., "Google", "Nike", "The Beatles"), DO NOT select NONE. Select **WEB** or **SIMPLE** to ensure the draft is grounded in reality.
+        - If the user asks you to **DRAFT**, **CREATE**, or **WRITE** content for an entity that is clearly **INVENTED** or defined in history, select **NONE**.
 
     3. **NEW RESEARCH (Priority #3):**
         - If the user wants you to gather NEW information not in history, use a tool below.
-        - If the user wants you to explain a trend (and the history contains only numbers/stats but not the *explanation*), DO NOT select NONE. Select a tool below.
+        - If the user wants you to explain a trend (and the history contains only numbers/stats but not the *explanation*), select a tool below.
 
     ### AVAILABLE TOOLS:
-    - WEB: For deep analysis of web results, knowledge graphs, AI Overviews, and top stories related to the topic.
-        Also, select this if the user asks about:
-        1. RECENT events, news, or stories (e.g. "top stories", "today", "current").
-        2. Specific FACTS that might be outdated in my training data.
-        3. Entities I might not know (e.g. specific companies, people).
-    - IMAGES: If the user explicitly asks for images, pictures, or visual inspiration.
-    - VIDEOS: If the user explicitly asks for videos, clips, or tutorials.
-    - SCHOLAR: If the user is asking for academic papers, research, studies, or highly credible sources.
-    - TRENDS: Use this ONLY for general "Trending Now" or "Viral Now" searches for a region (e.g., "What's trending in US?"). 
-        * WARNING: This tool ignores the user's specific topic and returns general viral topics. 
-        * Format: "TRENDS:CODE" (e.g., "TRENDS:NG" for Nigeria). 
-        * Default: "TRENDS:US".
-    - ANALYSIS: For topic-specific "interest over time", "growth", "history", or "how has X trended?". 
-        * Use this when the user asks about a SPECIFIC topic's popularity curve or historical trend.
-        * Format: "ANALYSIS:CODE" (e.g., "ANALYSIS:US"). 
-    - SIMPLE: For all other general web searches.
-    - NONE: Select this if:
-        1. The answer is a CORRECTION or REFINEMENT (e.g., "I said strategy not cluster").
-        2. The answer can be derived from CONVERSATION HISTORY or LONG-TERM MEMORY.
-        3. The user has PROVIDED the source material (e.g., "Summarize this text", "Create a strategy from these points") and just wants you to process/organize it.
-        4. The user asks for an OPINION, EVALUATION, or LOGICAL DISPUTE based on known facts (e.g., "Do you agree?", "Critique this", "Validate my point").
-        5. The user asks for **CREATIVE WRITING** regarding a hypothetical or user-defined entity (e.g., "Draft a short story", "Create a brand voice").
+    - WEB: Use this whenever the request requires **Factual Discovery** or **External Grounding** not available in history.
+        *   Examples: "Research X", "Find data on Y", "Ground this in technical specifics", "Use latest signals".
+    - IMAGES: For visual inspiration.
+    - VIDEOS: For tutorials/clips.
+    - SCHOLAR: For academic research.
+    - TRENDS: For viral awareness. Select ONLY for measuring "What is trending" or "Viral topics" in a specific region.
+    - ANALYSIS: For historical trajectory. Select ONLY for "Interest over time" or "Growth metrics".
+    - SIMPLE: General web searches for broad definitions.
+    - NONE: Select this for **Composition**, **Formatting**, or **Incremental Refinement** using information already established in the conversation.
+        *   Examples: "Write a draft", "Create an outline", "Summarize our notes", "Refine the tone", "Include more detail on [Topic A]", write about a hypothetical or user-defined entity.
 
-    Which tools are most appropriate? You may select multiple tools if the query has multiple distinct parts. 
+    ### DECISION REASONING:
+    - If a request combines **Drafting** with **Research Intent** (e.g. "Draft a deep-dive based on new research"), the priority is to select **WEB** + any other necessary tools.
+    - If a request is purely about **Execution/Form** based on existing knowledge, select **NONE**.
+
     Respond ONLY with the tool selection(s), comma-separated (e.g., "WEB, ANALYSIS:US" or "IMAGES" or "NONE").
     
     """
@@ -697,6 +716,22 @@ def find_trending_keywords(raw_topic, history_context=""):
     if any("NONE" in choice for choice in selected_tools):
         return {"context": context_snippets, "tool_logs": tool_logs}
 
+    # --- CATEGORICAL SHARED EXTRACTION (Efficiency + Verbose Debugging) ---
+    distilled_seo_query = None
+    distilled_trend_term = None
+
+    # Step A: Distill SEO query if needed (WEB, IMAGES, etc.)
+    if any(t in ["WEB", "IMAGES", "VIDEOS", "SCHOLAR", "SIMPLE"] for t in selected_tools):
+        print(f"Sensory Router: Category [SEO] active. Distilling high-precision query...")
+        distilled_seo_query = extract_core_topic(raw_topic, history=history_context)
+        print(f"  -> SEO Query: '{distilled_seo_query}'")
+
+    # Step B: Distill Trend Term if needed (ANALYSIS)
+    if any("ANALYSIS" in t for t in selected_tools):
+        print(f"Sensory Router: Category [TREND] active. Distilling trend entity...")
+        distilled_trend_term = extract_trend_term(raw_topic, history=history_context)
+        print(f"  -> Trend Entity: '{distilled_trend_term}'")
+    
     # Iterate through each selected tool
     for tool_selection in selected_tools:
         try:
@@ -709,57 +744,41 @@ def find_trending_keywords(raw_topic, history_context=""):
 
         print(f"Executing Sensory Tool: '{choice}' (Geo: '{geo_code}')")
 
-        search_query = raw_topic 
         research_context = None
         tool_name = "unknown"
 
-        # --- 1. VIRAL DISCOVERY (No specific query needed) ---
+        # --- 1. VIRAL DISCOVERY ---
         if "TRENDS" in choice:
-            print(f"Entering TRENDS logic for {geo_code}...") 
             research_context = search_google_trends(geo=geo_code)
             tool_name = "serpapi_trends_search"
 
-        # --- 2. TREND ANALYSIS (The "Double-Tap" Upgrade) ---
+        # --- 2. TREND ANALYSIS ---
         elif "ANALYSIS" in choice:
-            # A. Extract the specific entity (e.g., "Tinubu")
-            search_query = extract_trend_term(raw_topic, history=history_context)
-            print(f"Entering TREND ANALYSIS logic for '{search_query}' in {geo_code}...")
-            
-            # B. TAP 1: Quantitative Data (The Graph/Stats)
+            search_query = distilled_trend_term
+            print(f"  + Fetching Quantitative Trend Stats for '{search_query}'...")
             stats_context = analyze_trend_history(search_query, geo=geo_code)
             
-            # C. TAP 2: Qualitative Data (The News - NEW FIX)
+            # C. TAP 2: Qualitative Data (Consolidated Logic)
+            has_web_tool = any(t in ["WEB", "SIMPLE"] for t in selected_tools)
             try:
-                print(f"  + Fetching Qualitative News Context for '{search_query}'...")
-                news_params = {
-                    "engine": "google",
-                    "q": search_query,
-                    "gl": geo_code,
-                    "tbm": "nws", # Force News Tab
-                    "num": 3,     # Top 3 stories are enough for context
-                    "api_key": SERPAPI_API_KEY
-                }
-                news_search = GoogleSearch(news_params) 
-                news_results = news_search.get_dict().get("news_results", [])
-                
-                news_text = ""
-                if news_results:
-                    news_text = "\n[NEWS CONTEXT - DRIVERS OF TREND]:\n"
-                    for n in news_results:
-                        news_text += f"- {n.get('title')} (Source: {n.get('source')})\n"
-                
-                # Merge Stats + News
-                research_context = f"{stats_context}\n{news_text}"
-                
-            except Exception as e:
-                print(f"  ! News fetch failed (Non-Critical): {e}")
-                research_context = stats_context # Fallback to just stats if news fails
+                if not has_web_tool:
+                    print(f"  + Fetching Qualitative News Context for '{search_query}'...")
+                    news_params = {"engine": "google", "q": search_query, "gl": geo_code, "tbm": "nws", "num": 3, "api_key": SERPAPI_API_KEY}
+                    news_search = GoogleSearch(news_params) 
+                    news_results = news_search.get_dict().get("news_results", [])
+                    news_text = "\n[NEWS CONTEXT]:\n" + "\n".join([f"- {n.get('title')}" for n in news_results]) if news_results else ""
+                    research_context = f"{stats_context}\n{news_text}"
+                else:
+                    print(f"  - Skipping Supplemental News context (WEB search will provide it).")
+                    research_context = stats_context
+            except Exception as news_err: 
+                print(f"  ! News fetch error: {news_err}")
+                research_context = stats_context
+            tool_name = "serpapi_trend_analysis"
 
-            tool_name = "serpapi_trend_analysis_with_news"
-
-        # --- 3. STANDARD SEARCH TOOLS (Use complex SEO extractor) ---
+        # --- 3. STANDARD SEARCH TOOLS ---
         elif choice in ["WEB", "IMAGES", "VIDEOS", "SCHOLAR", "SIMPLE"]:
-            search_query = extract_core_topic(raw_topic, history=history_context)
+            search_query = distilled_seo_query # Category [SEO]
             if choice == "WEB":
                 research_context = search_google_web(search_query)
                 tool_name = "serpapi_web_search"
@@ -775,47 +794,25 @@ def find_trending_keywords(raw_topic, history_context=""):
             elif choice == "SIMPLE":
                 pass 
                 
-        # --- 4. FALLBACK / SIMPLE SEARCH ---
+        # --- 4. FALLBACK / SIMPLE SEARCH (Optimized) ---
         if not research_context:
-            print(f"Primary tool failed or SIMPLE selected. Initiating fallback search...")
-            
-            # 1. Remove strict operators that restrict results
-            relaxed_query = search_query.replace('"', '').replace('(', '').replace(')', '')
-            
-            # 2. Remove Exclusions (e.g., -guide) as they often cause 0 results
-            relaxed_query = re.sub(r'\s-\S+', '', relaxed_query)
-            
-            # 3. Clean up the boolean words left behind
-            relaxed_query = re.sub(r'\b(OR|AND)\b', '', relaxed_query)
-            
-            # 4. Collapse whitespace
-            fallback_query = " ".join(relaxed_query.split())
-
-            print(f"Relaxed Query: '{search_query}' \n       -> '{fallback_query}'")
-            
+            fallback_query = distilled_seo_query or distilled_trend_term or raw_topic
+            print(f"  ? Primary research failed. Initiating CSE fallback for: '{fallback_query}'")
             try:
-                # 1. Powerful Web Search (With Relaxed Query)
-                research_context = search_google_web(fallback_query)
-                if research_context:
-                    tool_name = "serpapi_web_search"
-                
-                # 2. Simple Search Safety Net
-                if not research_context:
-                    api_key = get_search_api_key()
-                    service = build("customsearch", "v1", developerKey=api_key)
-                    res = service.cse().list(q=search_query, cx=SEARCH_ENGINE_ID, num=5).execute()
-                    google_snippets = [item.get('snippet', '') for item in res.get('items', [])]
-                    if google_snippets:
-                        research_context = "[FALLBACK CONTEXT]:\n" + "\n".join(google_snippets)
-                        tool_name = "google_simple_search"
-                        # tool_logs.append({"event_type": "tool_call", "tool_name": "google_simple_search", "input": fallback_query})
-
+                # Use Google Custom Search API (CSE) for fallback
+                api_key = get_search_api_key()
+                service = build("customsearch", "v1", developerKey=api_key)
+                res = service.cse().list(q=fallback_query, cx=SEARCH_ENGINE_ID, num=5).execute()
+                google_snippets = [item.get('snippet', '') for item in res.get('items', [])]
+                if google_snippets:
+                    research_context = "[GROUNDING_CONTENT (Fallback)]:\n" + "\n".join(google_snippets)
+                    tool_name = "google_simple_search"
             except Exception as e:
                 print(f"Fallback search failed: {e}")
 
         if research_context:
             context_snippets.append(research_context)
-            tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": search_query, "status": "success", "content": research_context})
+            tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": raw_topic, "status": "success"})
 
     return { "context": context_snippets, "tool_logs": tool_logs }
 
@@ -924,30 +921,46 @@ def generate_seo_metadata(article_html, topic):
             "tags": ["AI", "Tech"]
         }
 
-#13. The Comprehensive Answer Generator
+#13. The Comprehensive Answer Generator (AEO-AWARE CONTENT STRATEGIST)
 def generate_comprehensive_answer(topic, context, history=""):
     global model
     is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
+    
+    # UNIFIED PERSONA: The AEO-Aware Content Strategist
+    # This persona intelligently adjusts its formatting based on the intent of the request.
+    persona_instruction = """
+    You are the 'Sonnet & Prose' Senior Content Strategist. 
+    You excel at Answer Engine Optimization (AEO) and Conversational Synthesis.
+    
+    CORE OPERATING PRINCIPLES:
+    1. **Dual-Intent Synthesis**: Connect external 'Research Context' with the specific artifacts, case studies, and nuances found in the SLACK HISTORY. Don't just list search results; bridge them with the user's internal context.
+    2. **Contextual Formatting (AEO vs. Dialogue)**: 
+       - **Production/Draft Mode**: If the user is asking for a **DRAFT**, **OUTLINE**, **PLAN**, or **STRATEGY** (content intended for publication), strictly apply AEO Principles: Lead with an "Inverted Pyramid" structure (40-60 word extraction-ready leads), use modular H2/H3 headers, listicles, and structural tables.
+       - **Dialogue/Research Mode**: If the user is asking a direct question, exploring a trend (e.g., "What is trending?"), or simply chatting, provide a **Simple, Natural, and Empathetic** response. Avoid rigid AEO headers or extraction summaries to keep the conversation fluid.
+    3. **Sonnet & Prose Balance**: Wrap technical depth (Prose) in a human-centric, philosophical intro and a reflective conclusion (Sonnet).
+    """
+
     if is_grounded:
-        temperature = 0.0
-        system_instruction = "CRITICAL INSTRUCTION: You are in READING MODE. Base answer PRIMARILY on 'GROUNDING_CONTENT'."
+        temp = 0.0
+        instruction = f"CRITICAL: Base answer PRIMARILY on 'GROUNDING_CONTENT', but SYNTHESIZE it with Slack History (Internal Artifacts). {persona_instruction}"
     else:
-        temperature = 0.7
-        system_instruction = "You are an expert AI assistant. Use the research context to provide accurate answers."
-    prompt = f"""
-        {system_instruction}
+        temp = 0.7
+        instruction = f"You are a strategic partner and content architect. {persona_instruction}"
         
-        Conversation History:
+    prompt = f"""
+        {instruction}
+        
+        CONVERSATION HISTORY (FOR SYNTHESIS):
         {history}
         
-        Current Request: "{topic}"
+        CURRENT REQUEST: "{topic}"
         
-        Research Context:
+        RESEARCH CONTEXT (IF AVAILABLE):
         {context}
         
-        Answer:
+        RESPONSE:
         """
-    return model.generate_content(prompt, generation_config={"temperature": temperature}).text.strip()
+    return model.generate_content(prompt, generation_config={"temperature": temp}).text.strip()
 
 # 14. The Dedicated pSEO Article Generator (High Trust & Transparency)
 def generate_pseo_article(topic, context, history=""):
@@ -1002,6 +1015,89 @@ def generate_pseo_article(topic, context, history=""):
     
     return model.generate_content(prompt, generation_config={"temperature": 0.3}).text.strip()
 
+# 14.5 The Recursive Deep-Dive Generator (Dynamic Room-by-Room Construction)
+def generate_deep_dive_article(topic, context, history="", target_length=1500):
+    global model
+    print(f"Tool: Initiating Recursive Deep-Dive for '{topic}' (Target: {target_length} words)")
+    
+    is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
+    
+    # Calculate architecture: Aim for ~300 words per section
+    num_sections = max(3, target_length // 300)
+    words_per_section = target_length // (num_sections + 1) # Plus one for intro
+    
+    # PHASE 1: Generate the Blueprint
+    blueprint_prompt = f"""
+    Create a strategic {target_length} word article blueprint for: "{topic}".
+    STRUCTURE: Provide exactly {num_sections} thematic sections (H2) for the body.
+    Return ONLY a JSON list of objects:
+    [ {{"title": "Section Title", "focus": "What specific data or analogies to use here"}} ]
+    
+    RESEARCH CONTEXT: {context}
+    HISTORY: {history}
+    """
+    
+    try:
+        blueprint_raw = model.generate_content(blueprint_prompt).text.strip()
+        if "```json" in blueprint_raw: blueprint_raw = blueprint_raw.split("```json")[1].split("```")[0].strip()
+        sections = json.loads(blueprint_raw)
+    except Exception:
+        return generate_pseo_article(topic, context, history)
+
+    # PHASE 2: Recursive Room Building
+    article_parts = []
+    
+    # Intro
+    print(f"  + Drafting Architectural Intro...")
+    intro_prompt = f"Write a compelling {words_per_section}-word philosophical intro for: '{topic}'. History: {history}"
+    article_parts.append(f'<section class="intro">\n{model.generate_content(intro_prompt).text.strip()}\n</section>')
+    
+    for i, section in enumerate(sections):
+        print(f"  + Constructing Room {i+1}/{len(sections)}: {section['title']}...")
+        
+        # CONTEXT STITCHING: Strip HTML and pass the tail of the previous part
+        last_plain = strip_html_tags(article_parts[-1])
+        prev_context = ". ".join(last_plain.split(". ")[-3:]) if ". " in last_plain else last_plain[-150:]
+        
+        room_prompt = f"""
+        Write a {words_per_section}-word deep-dive section for: "{topic}".
+        
+        CHAPTER: {section['title']}
+        FOCUS: {section['focus']}
+        TONE: Authoritative, architectural, visionary.
+        TRANSITION FROM: "...{prev_context}"
+        
+        GROUNDING DATA: {context if is_grounded else "Internal Knowledge base"}
+        CONVERSATIONAL HISTORY: {history}
+        
+        OUTPUT: Provide the content wrapped in <h2> if there's a title, with clean 1-2 paragraph structure.
+        """
+        room_content = model.generate_content(room_prompt).text.strip()
+        article_parts.append(f'<section class="body-part">\n{room_content}\n</section>')
+
+    # PHASE 3: Methodology
+    print("  + Finalizing Methodology & Transparency...")
+    
+    # Clean source extraction for the footer
+    if is_grounded:
+        found_urls = list(set(re.findall(r'https?://[^\s<>"]+', str(context))))
+        source_text = ", ".join(found_urls[:5]) if found_urls else "Verified research sources."
+    else:
+        source_text = "AEO Synthesis from Knowledge Base."
+
+    methodology_text = f"""
+    <section class="methodology">
+    <h2>Methodology & Transparency</h2>
+    This {target_length}-word deep-dive was architected recursively to ensure narrative depth.
+    Sources included: {source_text}
+    </section>
+    """
+    article_parts.append(methodology_text)
+
+    full_html = "\n\n".join(article_parts)
+    print(f"  -> Deep-Dive Complete. Est words: {len(full_html.split())}")
+    return full_html
+
 #15. The Euphemistic 'Then vs Now' Linker
 def create_euphemistic_links(keyword_context):
     global model
@@ -1035,12 +1131,14 @@ def process_story_logic(request):
     global model, flash_model, db
     if model is None:
         model = UnifiedModel(MODEL_PROVIDER, MODEL_NAME)
-        
-        # 2. Initialize Vertex AI explicitly for the Flash Model (Triage)
-        # We do this separately because Flash is likely still a Gemini model
+    
+    if flash_model is None:
+        # Initialize Vertex AI explicitly for the Flash Model (Triage)
         vertexai.init(project=PROJECT_ID, location=LOCATION)
         flash_model = GenerativeModel(FLASH_MODEL_NAME)
-        db = firestore.Client()
+        
+    if db is None:
+        db = firestore.Client(project=PROJECT_ID)
 
     req = request.get_json(silent=True)
     session_id, original_topic, slack_context = req['session_id'], req['topic'], req['slack_context']
@@ -1055,27 +1153,25 @@ def process_story_logic(request):
     history_events = []
     history_text = ""
     if session_doc.exists:
-        # NEW FIX: Query the subcollection instead of the 'event_log' array
-        # We limit to the last 20 turns to keep the context window focused and cheap
+        # MEMORY EXPANSION: Removed .limit(20) to ensure deep context recall
         events_ref = doc_ref.collection('events')
         
-        # 1. Sort DESCENDING (Newest first) and get the top 20
-        query = events_ref.order_by('timestamp', direction=firestore.Query.DESCENDING).limit(20)
+        # Sort DESCENDING (Newest first)
+        query = events_ref.order_by('timestamp', direction=firestore.Query.DESCENDING)
         
-        # Stream, convert to dict, and REVERSE to get chronological order (Old -> New)
+        # Chronological order (Old -> New)
         history_events = [doc.to_dict() for doc in query.stream()][::-1]
 
 
-    # START: MEMORY EXPANSION & PHOTOGRAPHIC RECALL ---
+    # MEMORY EXPANSION: Removed [-10:] slice to see the WHOLE conversation
     formatted_history = []
-    for i, e in enumerate(history_events[-10:]):
+    for i, e in enumerate(history_events):
         if e.get('event_type') == 'tool_call':
-            # FIX: Explicitly read the 'content' field to remember previous search results
-            # Cap at 5000 chars to save tokens while keeping rich context
-            entry = f"Turn {i+1} (System Search Results): {e.get('content', '')[:5000]}" 
+            # MEMORY EXPANSION: Removed char limits to keep full data context
+            entry = f"Turn {i+1} (System Search Results): {e.get('content', '')}" 
         else:
-            # FIX: Increased limit from 200 to 5000 chars so clusters/long prompts aren't lobotomized
-            entry = f"Turn {i+1} ({e.get('event_type')}): {e.get('text', '')[:5000]}"
+            # MEMORY EXPANSION: Removed char limits for full conversational fidelity
+            entry = f"Turn {i+1} ({e.get('event_type')}): {e.get('text', '')}"
         formatted_history.append(entry)
 
     history_text = "\n".join(formatted_history)
@@ -1086,48 +1182,36 @@ def process_story_logic(request):
         # --- STEP 3: TRIAGE (Now includes SOCIAL category) ---
         # Note: We triage BEFORE distilling or researching to save cost/latency.
         
-        # --- KEYWORD SAFEGUARD (Force DIRECT_ANSWER for non-article requests) ---
-        direct_convo_keywords = ["lesson plan", "plan", "outline", "summarize", "research", "strategy", "brief"]
-        if any(kw in sanitized_topic.lower() for kw in direct_convo_keywords):
-            print(f"Keyword Safeguard: Direct conversation intent detected. Forcing DIRECT_ANSWER.")
-            intent = "DIRECT_ANSWER"
-        else:
-            triage_prompt = f"""
+        triage_prompt = f"""
             Analyze the user's latest message in the context of the conversation history.
             Classify the PRIMARY GOAL into one of five categories:
 
-            1.  **SOCIAL_CONVERSATION**: The user is engaging in "obvious" small talks, greetings, expressing gratitude, or meta-comments, or comments that DOES NOT require external information or research.
-                *Examples:* "Thanks!", "Great job.", "I have to go now.", "You are funny.", "Okay.", "Good Morning."
+            1.  **SOCIAL_CONVERSATION**: Greetings, small talk, or simple feedback (e.g. "Okay", "Thanks").
 
-            2.  **TOPIC_CLUSTER_PROPOSAL**: The user specifically wants you to GENERATE a NEW list of topics, topic clusters, pillar page and/or supporting pages outline, or a hierarchical content structure.
-                *   **CRITICAL EXCLUSION:** If the user asks for a "Strategy", "Plan", or "Brief" regarding *existing or user-provided* clusters, select DIRECT_ANSWER.
+            2.  **DEEP_DIVE**: **LONG-FORM ARCHITECTURE.** Select this if the user asks for a specific word count OR uses major drafting keywords.
+                *   *Triggers:* "800 words", "1500 words", "Deep dive", "Draft an article", "Write a post", "Detailed draft", "Comprehensive article".
+                *   *Priority:* If a word count is mentioned, ALWAYS pick this over TOPIC_CLUSTER.
 
-            3.  **THEN_VS_NOW_PROPOSAL**: The user EXPLICITLY asks for a "Then vs Now" story, draft, or structured comparison.
+            3.  **TOPIC_CLUSTER_PROPOSAL**: **SEMANTIC ARCHITECTURE.** The user specifically wants to generate a hierarchical map of keywords to establish topical authority. 
+                *   Use this for: **Keyword fanning out** from a seed topic, mapping primary/secondary clusters.
+                *   *CRITICAL:* If the user asks to "Write", "Draft", or "Expand" into a full piece, this is NOT a cluster.
 
-            4.  **PSEO_ARTICLE**: The user intent is to PRODUCE a COMPLETE, PUBLICATION-READY ASSET (Full Article, Guide, or Blog Post) intended for publication in a CMS.
-                * **CRITICAL EXCLUSIONS (Force DIRECT_ANSWER):** 
-                    - If the user asks for an **Outline**, **Summary**, **Research**, **Strategy**, **Brief**, or **Lesson Plan**.
-                    - If the user asks for **planning or structuring frameworks** (e.g., SEO Brief, Content Strategy).
-                * **Semantics:** The user is asking for the *final end-product* (The Blog Post itself) to be written.
-                * **Constraint:** Only select this if the user wants the ACTUAL FINAL DRAFT created in the CMS.
+            4.  **THEN_VS_NOW_PROPOSAL**: Specifically asking for a human-centric 'Then vs Now' structured comparison.
 
-            5.  **DIRECT_ANSWER**: This is the default for ALL research, planning, reasoning, logic, and CREATIVITY tasks.
-                * **Select this for:** **Outlines**, **Summaries**, **Research Answers**, **Planningh**, or general questions about news, facts, or strategies.
-                * **Even if:** The user is polite or casual (e.g., "I was just wondering...", "Can you check...", "Do you know...").
+            5.  **PSEO_ARTICLE**: **STRICT CMS MODE (GHOST).** Only select this if the message EXPLICITLY mentions "**pSEO**", "**Ghost**", or "**Ghost CMS**". 
+
+            6.  **DIRECT_ANSWER**: The "Collaborative Workspace" mode. Select this for EVERYTHING ELSE.
+                *   Use this for: **Outlines**, **Strategies**, **Drafts**, **Lesson Plans**, **Research Queries**, and **Synthesis**.
+                *   This is the high-quality synthesis mode for Slack interaction.
 
             CONVERSATION HISTORY:
             {history_text}
 
-            USER REQUEST: "{sanitized_topic}"
+            USER REQUEST: "{original_topic}"
 
-            THOUGHT PROCESS:
-            1. Is this a request for an outline, summary, research, or lesson plan? (Yes -> DIRECT_ANSWER)
-            2. Is this just a strategy or planning task? (Yes -> DIRECT_ANSWER)
-            3. Is it a request for a final, published blog post in the CMS? (Yes -> PSEO_ARTICLE)
-
-            CRITICAL: Respond with ONLY the category name.
+            CRITICAL: Respect the 'PSEO_ARTICLE' keyword rule. Handle TOPIC_CLUSTER as a technical semantic task. Respond with ONLY the category name.
             """
-            intent = flash_model.generate_content(triage_prompt).text.strip()
+        intent = flash_model.generate_content(triage_prompt).text.strip()
         print(f"Smart Triage V5.4 classified intent as: {intent}")
 
         # Initialize variables for the response
@@ -1177,11 +1261,15 @@ def process_story_logic(request):
         # === PATH B: WORK/RESEARCH (The Heavy Lifting) ===
         # Only now do we pay the cost to distill and research.
 
-        # 1. Research (Handle URL or Keywords)
-        url = extract_url_from_text(sanitized_topic)
-        if url:
-            article_text = fetch_article_content(url)
-            research_data = {"context": [f"GROUNDING_CONTENT:\n{article_text}"], "tool_logs": []}
+        # 1. Research (Handle URLs or Keywords)
+        urls = extract_urls_from_text(sanitized_topic)
+        if urls:
+            print(f"Detected {len(urls)} URLs. Processing sequentially (Browserless Tier Safety)...")
+            combined_context = []
+            for url in urls:
+                article_text = fetch_article_content(url)
+                combined_context.append(f"GROUNDING_CONTENT (Source: {url}):\n{article_text}")
+            research_data = {"context": combined_context, "tool_logs": []}
         else:
             research_data = find_trending_keywords(sanitized_topic, history_context=history_text)
         
@@ -1212,6 +1300,38 @@ def process_story_logic(request):
             })
             requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts']}, verify=True)
             return jsonify({"msg": "Answer sent"}), 200
+
+        elif intent == "DEEP_DIVE":
+            target_count = extract_target_word_count(original_topic)
+            print(f"Executing Dynamic Deep-Dive Recursive Expansion (Target: {target_count})...")
+            article_html = generate_deep_dive_article(original_topic, research_data['context'], history=history_text, target_length=target_count)
+            
+            # Use Claude for metadata even for deep dives
+            seo_data = generate_seo_metadata(article_html, original_topic)
+            
+            new_events.append({"event_type": "agent_answer", "proposal_type": "deep_dive_article", "data": article_html})
+            
+            session_ref = db.collection('agent_sessions').document(session_id)
+            events_ref = session_ref.collection('events')
+            for event in new_events:
+                if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
+                events_ref.add(event)
+
+            session_ref.update({
+                "status": "awaiting_feedback", 
+                "type": "work_proposal", 
+                "topic": seo_data.get('title', clean_topic),
+                "slack_context": slack_context,
+                "last_updated": expire_time
+            })
+            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                "session_id": session_id, 
+                "type": "social", 
+                "message": convert_html_to_markdown(article_html), 
+                "channel_id": slack_context['channel'], 
+                "thread_ts": slack_context['ts']
+            }, verify=True)
+            return jsonify({"msg": "Deep-Dive article sent"}), 200
 
         elif intent == "TOPIC_CLUSTER_PROPOSAL":
             cluster_data = generate_topic_cluster(clean_topic, research_data['context'], history=history_text)
@@ -1358,7 +1478,7 @@ def process_story_logic(request):
 @functions_framework.http
 def ingest_knowledge(request):
     global db, model
-    if db is None: db = firestore.Client()
+    if db is None: db = firestore.Client(project=PROJECT_ID)
     vertexai.init(project=PROJECT_ID, location=LOCATION)
     embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
 

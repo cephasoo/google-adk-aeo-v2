@@ -104,26 +104,36 @@ def process_feedback_logic(request):
     # FIX: Read from 'events' subcollection instead of 'event_log' array
     events_ref = doc_ref.collection('events')
     
-    # 1. Sort DESCENDING (Newest first) and get the top 5
-    recent_events_query = events_ref.order_by('timestamp', direction=firestore.Query.DESCENDING).limit(5)
+    # MEMORY EXPANSION: Removed .limit(5) to ensure context isn't lost during feedback loops
+    recent_events_query = events_ref.order_by('timestamp', direction=firestore.Query.DESCENDING)
 
 
     # 2. Stream and then REVERSE the list to get chronological order (Oldest -> Newest)
     recent_events = [doc.to_dict() for doc in recent_events_query.stream()][::-1]
     
-    history_text = "\n".join([f"Turn ({e.get('event_type')}): {e.get('text', '')[:200]}" for e in recent_events])
+    # MEMORY EXPANSION: Removed char limits (was 500) to ensure full context for triage
+    formatted_history = []
+    for e in recent_events:
+        etype = e.get('event_type', 'unknown')
+        # Try all possible content fields
+        content = e.get('text') or e.get('content') or e.get('payload') or str(e.get('data', ''))
+        formatted_history.append(f"Turn ({etype}): {str(content)}")
+    
+    history_text = "\n".join(formatted_history)
 
     feedback_triage_prompt = f"""
     Analyze the user's latest message in the context of the conversation history. Classify the user's INTENT into one of three categories:
 
-    1.  **APPROVE**: The user is giving explicit approval to finalize the last output.
-        *Examples:* "Looks good", "Perfect, proceed", "Yes, finalize this."
+    1.  **APPROVE**: The user is giving EXPLICIT approval to FINALIZE the research and generate the FINAL ASSET (Article/Story).
+        *   **CRITICAL EXCLUSION:** If the user is simply saying "Yes" or "Proceed" to a question about further research or next steps (e.g., "Would you like to focus on X?"), select **DELEGATE**.
+        *   *Examples:* "Looks good", "Perfect, proceed", "Yes, finalize this."
 
-    2.  **REFINE**: The user is asking for a change to the agent's last structured proposal (e.g., a 'Then vs Now' draft).
-        *Examples:* "Make it shorter", "Can you change the tone?", "Add a point about X."
+    2.  **REFINE**: The user is asking for a change to the agent's current strategy or last structured proposal (e.g., a 'Then vs Now' draft).
+        *   *Examples:* "Make it shorter", "Can you change the tone?", "Add a point about X."
 
-    3.  **DELEGATE**: The user is asking a new factual question, a "meta" question about the agent's behavior, or a request that requires new research. This requires handing off to the specialist research agent.
-        *Examples:* "What's trending in social media?", "Does that explain [feature X]?", "You hallucinated earlier.", "Can you summarize this job posting?", "Thanks!"
+    3.  **DELEGATE**: The user is asking a new factual question, confirming a proposed research direction, or asking a "meta" question about the agent's behavior. This category is for anything that requires the research agent to keep working.
+        *   **CRITICAL INCLUSION:** If the user is saying "Yes" or confirming a suggestion for further research or development, select **DELEGATE**.
+        *   *Examples:* "What's trending in social media?", "Yes, please do that research.", "Demystify job impact.", "Thanks!"
 
     CONVERSATION HISTORY:
     {history_text}
@@ -158,8 +168,8 @@ def process_feedback_logic(request):
             if event.get('event_type') == 'adk_request_confirmation':
                 target_content = tell_then_and_now_story(event['payload'], tool_confirmation={"confirmed": True})
                 break
-            elif event.get('event_type') == 'agent_answer':
-                target_content = event.get('text')
+            elif event.get('event_type') in ['agent_answer', 'agent_proposal', 'agent_reply']:
+                target_content = event.get('text') or event.get('content') or str(event.get('data', ''))
                 break
         
         if not target_content:
