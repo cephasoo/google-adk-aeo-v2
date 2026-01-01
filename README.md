@@ -94,4 +94,3 @@ gcloud functions deploy process-story-logic `
 
 ---
 
-*Designed for the Advanced Agentic Coding Workflow by Google Deepmind.*
