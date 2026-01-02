@@ -121,28 +121,34 @@ def process_feedback_logic(request):
     
     history_text = "\n".join(formatted_history)
 
-    feedback_triage_prompt = f"""
-    Analyze the user's latest message in the context of the conversation history. Classify the user's INTENT into one of three categories:
+    # --- ADK FIX 3: STRICT VERBATIM APPROVAL ---
+    # We strip common formatting and check for the literal "approved" (case-insensitive)
+    sanitized_feedback = user_feedback.strip().strip('*_~').lower()
+    is_strict_approval = sanitized_feedback == "approved"
 
-    1.  **APPROVE**: The user is giving EXPLICIT approval to FINALIZE the research and generate the FINAL ASSET (Article/Story).
-        *   **CRITICAL EXCLUSION:** If the user is simply saying "Yes" or "Proceed" to a question about further research or next steps (e.g., "Would you like to focus on X?"), select **DELEGATE**.
-        *   *Examples:* "Looks good", "Perfect, proceed", "Yes, finalize this."
+    if is_strict_approval:
+        intent = "APPROVE"
+        print("Literal 'approved' detected. Forcing APPROVE intent.")
+    else:
+        feedback_triage_prompt = f"""
+        Analyze the user's latest message in the context of the conversation history. Classify the user's INTENT into one of two categories:
 
-    2.  **REFINE**: The user is asking for a change to the agent's current strategy or last structured proposal (e.g., a 'Then vs Now' draft).
-        *   *Examples:* "Make it shorter", "Can you change the tone?", "Add a point about X."
+        1.  **REFINE**: The user is asking for a change to the agent's current strategy or last structured proposal (e.g., a 'Then vs Now' draft).
+            *   *Examples:* "Make it shorter", "Can you change the tone?", "Add a point about X, Why does X look like X when it should look like Y?"
 
-    3.  **DELEGATE**: The user is asking a new factual question, confirming a proposed research direction, or asking a "meta" question about the agent's behavior. This category is for anything that requires the research agent to keep working.
-        *   **CRITICAL INCLUSION:** If the user is saying "Yes" or confirming a suggestion for further research or development, select **DELEGATE**.
-        *   *Examples:* "What's trending in social media?", "Yes, please do that research.", "Demystify job impact.", "Thanks!"
+        2.  **DELEGATE**: The user is asking a new factual question, confirming a proposed research direction, or asking a "meta" question about the agent's behavior. This category is for anything that requires the research agent to keep working.
+            *   **CRITICAL INCLUSION:** If the user is saying "Yes", "Proceed", "Looks good", or confirming a suggestion for further research or development, select **DELEGATE**.
+            *   *Examples:* "What's trending in social media?", "Yes, please do that research.", "Demystify job impact.", "Thanks!", "Makes sense."
 
-    CONVERSATION HISTORY:
-    {history_text}
+        CONVERSATION HISTORY:
+        {history_text}
 
-    USER'S LATEST MESSAGE: "{user_feedback}"
+        USER'S LATEST MESSAGE: "{user_feedback}"
 
-    Respond with ONLY the category name (APPROVE, REFINE, or DELEGATE).
-    """
-    intent = model.generate_content(feedback_triage_prompt).text.strip().upper()
+        Respond with ONLY the category name (REFINE or DELEGATE).
+        """
+        intent = model.generate_content(feedback_triage_prompt).text.strip().upper()
+    
     print(f"Feedback Triage classified intent as: {intent}")
     
     # --- 3. STATE-AWARE ROUTING LOGIC ---
@@ -157,6 +163,12 @@ def process_feedback_logic(request):
         return jsonify({"msg": "Delegated to Research Worker"}), 200
         
     elif intent == "APPROVE":
+        # Final safety check: We ONLY proceed with finalization/ingestion if it was a strict literal approval
+        if not is_strict_approval:
+            print("Internal Error: APPROVE intent reached without strict literal match. Falling back to DELEGATE.")
+            dispatch_task({"session_id": session_id, "topic": user_feedback, "slack_context": slack_context}, STORY_WORKER_URL)
+            return jsonify({"msg": "Fallback to research (non-verbatim approval)"}), 200
+
         ts = datetime.datetime.now(datetime.timezone.utc)
         user_event = {"event_type": "user_feedback", "text": user_feedback, "intent": "APPROVE", "timestamp": ts}
 
@@ -188,7 +200,7 @@ def process_feedback_logic(request):
         events_ref.add(user_event)
         events_ref.add({"event_type": "final_output", "content": target_content, "timestamp": datetime.datetime.now(datetime.timezone.utc)})
         
-        requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "proposal": [{"link": target_content}], "thread_ts": slack_context.get('ts'), "channel_id": slack_context.get('channel'), "is_final_story": True }, verify=True)
+        requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "proposal": [{"link": target_content}], "thread_ts": slack_context.get('ts'), "channel_id": slack_context.get('channel'), "is_final_story": True }, verify=certifi.where())
         return jsonify({"msg": "Approved and Ingested"}), 200
 
     elif intent == "REFINE":
@@ -219,6 +231,6 @@ def process_feedback_logic(request):
             "thread_ts": slack_context.get('ts'), 
             "channel_id": slack_context.get('channel'),
             "is_final_story": False 
-        }, verify=True)
+        }, verify=certifi.where())
 
     return jsonify({"message": "Refinement processed."}), 200

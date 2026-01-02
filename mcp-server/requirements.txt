@@ -1,0 +1,14 @@
+# MCP Server Dependencies
+mcp
+fastapi
+uvicorn
+google-cloud-secret-manager
+google-cloud-firestore
+google-cloud-aiplatform
+requests
+beautifulsoup4
+google-search-results
+litellm
+vertexai
+certifi
+google-api-python-client

@@ -2,7 +2,7 @@
 
 **Sonnet & Prose** is a production-grade, multi-agent AI system designed for **Answer Engine Optimization (AEO)** and strategic content synthesis. It transforms simple user inquiries into rich, data-grounded narratives, research reports, and deep-dive articles.
 
-Built as a capstone for the *Google AI Agents Intensive*, it represents the cutting edge of autonomous research and conversational synthesis.
+Built as an **ADK-Compliant** modular architecture, it leverages a centralized "Sensory Hub" via the **Model Context Protocol (MCP)** to provide specialized, high-fidelity research capabilities.
 
 ---
 
@@ -11,14 +11,15 @@ In a world of Answer Engines (Perplexity, SearchGPT, Gemini), standard SEO isn't
 
 ### The Value Loop
 1.  **Conversational Triage (Hearing Restoration)**: Distinguishes between casual banter, discovery research, and recursive drafting by analyzing raw user intent in context.
-2.  **Autonomous Research**: Operates an intent-driven "Sensory Array Router" to select specialized tools (Web, Scholar, Trends, Analysis) based on discovery vs. composition needs.
-3.  **Recursive Deep-Dive Engine**: Architecturally generates long-form content (e.g., 800+ words) through a multi-room "blueprint" approach to ensure depth and coherence.
-4.  **Long-Term Memory (Hippocampus)**: Ingests every interaction into a vectorized knowledge base (Firestore RAG) to ensure the agent maintains cross-thread continuity.
+2.  **Centralized Sensory Hub (MCP)**: Separates "Sensory Tools" from "Orchestration Logic." A dedicated Hub handles multi-region searches, web scraping, and RAG retrieval.
+3.  **Multi-Region Intelligence**: Automatically detects and searches across multiple geographic locations simultaneously for comparative research.
+4.  **Action-Oriented Deliverables**: Detects intent for specialized formats like **Timelines** and **Comparison Tables**, delivering them immediately in a structured AEO-ready format.
+5.  **Long-Term Memory (Hippocampus)**: Ingests every interaction into a vectorized knowledge base (Firestore RAG) to ensure the agent maintains cross-thread continuity.
 
 ---
 
 ## 🏗️ 2. High-Level Architecture
-The system is an event-driven microservice architecture deployed on **Google Cloud Functions (2nd Gen)**.
+The system follows a modular "Hub-and-Spoke" architecture built on **Google Cloud Functions (2nd Gen)** and **Cloud Run**.
 
 ```mermaid
 graph TD
@@ -27,31 +28,32 @@ graph TD
     C --> D[Cloud Tasks Queue]
     D --> E[Worker: Research & Synthesis]
     
-    subgraph "The Sensory Array Router"
-        E --> F{Router}
+    subgraph "The Sensory Hub (MCP)"
+        E <--> F[MCP Hub Server]
         F --> G[SerpAPI: Web/News]
         F --> H[Google Scholar: Academic]
         F --> I[Google Trends: Stats]
-        F --> J[Jina: Markdown Reader]
+        F --> J[Browserless: Scraper]
+        F --> L[Deep Search Signals: Geo & Intent]
     end
 
     subgraph "The Brain"
         E --> K[Unified Model: Multi-Provider]
-        K --> L[Firestore: Vector/Session Memory]
+        K --> M[Firestore: Vector/Session Memory]
     end
     
-    E --> M[Slack Output: Premium Markdown]
+    E --> N[Slack Output: Premium Markdown]
 ```
 
 ---
 
 ## 🧠 3. Advanced Agentic Features
 
-### 📡 Intent-Driven Sensory Router
-Instead of rigid keyword triggers, the agent evaluates **Discovery Intent**:
-- **WEB/SEO**: Distills high-precision Google Advanced Search operators.
-- **ANALYSIS**: Performs a "Double-Tap" (Trends Stats + Supplemental News) for historical trajectory.
-- **NONE**: Bypasses search automatically if the request is purely editorial or information exists in history.
+### 📡 MCP-Modular Sensory Hub
+Instead of hardcoding APIs into the worker, all "sensory" capability is centralized in the MCP Server:
+- **detect_geo**: Identifies ISO country codes for up to 3 regions simultaneously, minimizing "Default US" bias.
+- **detect_intent**: Identifies requested deliverables (Direct Answer vs. Timeline vs. Table) for automated formatting.
+- **Unified Proxy**: All research tools (Web, Trends, Scholar, Images) are unified under a single MCP interface.
 
 ### 🏛️ Recursive Expansion (Deep Dives)
 To solve the "One-Shot Trap," the system implements a **Recursive Workflow**:
@@ -59,38 +61,43 @@ To solve the "One-Shot Trap," the system implements a **Recursive Workflow**:
 - **Architectural Blueprinting**: Designs a multi-section structure before writing a single word.
 - **Context Stitching**: Seamlessly links sections together using "tail-end" context from previous chapters.
 
-### 🛡️ Resilience & Performance
-- **Timeout Buffer**: 60s LiteLLM timeouts and 540s Cloud Function timeouts to handle computationally heavy drafting.
-- **Self-Healing Fallback**: Automated transition to Google Custom Search (CSE) if primary tools fail or credits are preserved.
-- **Premium Slack View**: Real-time conversion of complex HTML drafts into clean, readable Markdown for a native Slack experience.
+### 🎭 Refined "Sonnet & Prose" Persona
+- **Strategic Synthesis**: Connects external trends with internal RAG memory.
+- **Natural Language**: Prohibits robotic structural labels (e.g., "H2 - Intro"). Structure is implied through natural headers and bolding.
+- **AEO-First**: Utilizes "Inverted Pyramid" leads and modular headers to ensure content is optimized for snippets and LLM extraction.
 
 ---
 
 ## 🛠️ 4. Setup & Deployment
 
 ### Prerequisites
-- **Google Cloud Platform** (Project, SDK, Secret Manager)
-- **n8n** (Self-hosted or Cloud)
+- **Google Cloud Platform** (Firestore, Secret Manager, Cloud Run)
+- **n8n** (Webhook orchestration)
 - **Slack App** (Bot Token, Events API)
 - **API Keys**: SerpAPI, OpenAI/Anthropic (Optional), Search Engine ID (CSE).
 
-### Quick Deploy
-Deploy the core worker from the `worker-story` directory:
-```powershell
-gcloud functions deploy process-story-logic `
-     --gen2 --region=$LOCATION --source=. `
-     --entry-point=process_story_logic `
-     --runtime=python312 `
-     --timeout=540s
+### 1. Deploy the MCP Hub (Cloud Run)
+```bash
+gcloud run deploy mcp-server --source . --no-allow-unauthenticated
+```
+
+### 2. Deploy the Story Worker (Cloud Functions)
+```bash
+gcloud functions deploy process-story-logic \
+     --gen2 --region=$LOCATION --source=. \
+     --entry-point=process_story_logic \
+     --runtime=python312 \
+     --timeout=540s \
+     --set-env-vars MCP_SERVER_URL=[YOUR_CLOUD_RUN_URL]
 ```
 
 ---
 
 ## 📖 5. How to Use
-1.  **Direct Answer**: Mention `@SonnetProse "What is the history of X?"`
-2.  **Long-Form Deep Dive**: `"Write an 800-word deep-dive on [Topic] using latest 2025 data."`
-3.  **Refinement**: Reply in-thread to refine specific sections: `"Expand the methodology to include [Metric]."` (Recognized instantly via Triage).
-4.  **Trend History**: `"How has interest in sustainable fashion changed in the US?"`
+1.  **Multi-Region Trends**: `"Compare tech adoption trends in Nigeria versus Kenya."` (Signals detected: `NG, KE`).
+2.  **Structured Timeline**: `"Create a timeline of AI developments in 2024."` (Deliverable detected: `TIMELINE`).
+3.  **Long-Form Article**: `"Write an 800-word deep-dive on [Topic] for my Ghost CMS."`
+4.  **Conversational Banter**: `"Hey, how are you today?"` (Intent detected: `SOCIAL` - zero research cost).
 
 ---
 

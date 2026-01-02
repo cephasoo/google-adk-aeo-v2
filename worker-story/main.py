@@ -11,15 +11,13 @@ import os
 import json
 import re
 import uuid
-import certifi
-import requests
-from bs4 import BeautifulSoup
-from google.cloud import secretmanager, firestore
-from google.cloud.firestore_v1.vector import Vector
-from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
-from googleapiclient.discovery import build
-from serpapi import GoogleSearch
 import datetime
+import requests
+import certifi # Explicitly kept to avert legacy SSL issues
+import google.auth
+import google.auth.transport.requests
+from google.oauth2 import id_token
+from google.cloud import firestore
 
 # --- Configuration ---
 PROJECT_ID = os.environ.get("PROJECT_ID")
@@ -27,9 +25,6 @@ LOCATION = os.environ.get("LOCATION")
 MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.5-pro") 
 MODEL_PROVIDER = os.environ.get("MODEL_PROVIDER", "vertex_ai")
 FLASH_MODEL_NAME = os.environ.get("FLASH_MODEL_NAME", "gemini-2.5-flash-lite")
-SEARCH_ENGINE_ID = os.environ.get("SEARCH_ENGINE_ID")
-BROWSERLESS_API_KEY = os.environ.get("BROWSERLESS_API_KEY")
-SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL") 
@@ -40,6 +35,69 @@ model = None
 flash_model = None
 search_api_key = None
 db = None
+mcp_client = None
+
+# --- MCP CLIENT ---
+class RemoteTools:
+    """
+    Acts as a bridge to the MCP Sensory Tools Server.
+    """
+    def __init__(self, server_url="http://localhost:8080"):
+        self.server_url = server_url.rstrip("/")
+        # Automatically detect if we need authentication (Cloud Run or Cloud Functions)
+        self.is_gcp = "run.app" in server_url or "cloudfunctions.net" in server_url
+
+    def _get_id_token(self):
+        """Fetches an OIDC ID token from the metadata server (only works on GCP)."""
+        try:
+            auth_req = google.auth.transport.requests.Request()
+            # The audience must be the service URL
+            return id_token.fetch_id_token(auth_req, self.server_url)
+        except Exception as e:
+            print(f"Auth Hint: If local, ensure you are authenticated. Error: {e}")
+            return None
+
+    def call(self, tool_name, arguments):
+        print(f"MCP: Calling remote tool '{tool_name}' with args {arguments}")
+        
+        headers = {}
+        if self.is_gcp:
+            token = self._get_id_token()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+
+        try:
+            # We use a simple POST to our FastAPI MCP wrapper
+            response = requests.post(
+                f"{self.server_url}/messages", 
+                json={
+                    "method": "tools/call",
+                    "params": {
+                        "name": tool_name,
+                        "arguments": arguments
+                    }
+                },
+                headers=headers,
+                timeout=60,
+                verify=certifi.where()
+            )
+            if response.status_code != 200:
+                return f"Error: MCP Server returned {response.status_code}"
+            
+            data = response.json()
+            # Extract text from MCP response format
+            content = data.get("result", {}).get("content", [])
+            if content:
+                return content[0].get("text", "No text returned.")
+            return "Empty response from tool."
+        except Exception as e:
+            return f"MCP Error: {str(e)}"
+
+def get_mcp_client():
+    global mcp_client
+    if mcp_client is None:
+        mcp_client = RemoteTools(os.environ.get("MCP_SERVER_URL", "http://localhost:8080"))
+    return mcp_client
 
 # --- UNIFIED MODEL ADAPTER (The Brain Switch) ---
 class UnifiedModel:
@@ -227,6 +285,14 @@ def extract_trend_term(user_prompt, history=""):
         print(f"Entity Extraction Failed: {e}")
         return user_prompt # Fallback
 
+def mcp_detect_geo(query, history=""):
+    """MCP Refactored: Calls the sensory hub to detect regional focus."""
+    return get_mcp_client().call("detect_geo", {"query": query, "history": history})
+
+def mcp_detect_intent(query):
+    """MCP Refactored: Calls the sensory hub to detect research intent."""
+    return get_mcp_client().call("detect_intent", {"query": query})
+
 def get_search_api_key():
     global search_api_key
     if search_api_key is None:
@@ -255,377 +321,43 @@ def chunk_text(text, chunk_size=1500, overlap=300):
     return [c for c in chunks if c]
 
 # --- Tools ---
-#1. The Specialist Web Scraper Tool
+#1. The Specialist Web Scraper Tool (MCP Refactored)
 def fetch_article_content(url):
-    print(f"Tool: Reading URL via Browserless: {url}")
-    if not BROWSERLESS_API_KEY: return "Error: Browserless API Key is missing."
-    endpoint = f"https://production-sfo.browserless.io/content?token={BROWSERLESS_API_KEY}&stealth=true"
-    payload = {"url": url, "rejectResourceTypes": ["image", "media", "font"], "gotoOptions": {"timeout": 15000, "waitUntil": "networkidle2"}}
-    headers = {"Cache-Control": "no-cache", "Content-Type": "application/json"}
-    try:
-        response = requests.post(endpoint, json=payload, headers=headers, timeout=20)
-        if response.status_code != 200: return f"Failed to read content. (Status: {response.status_code})"
-        soup = BeautifulSoup(response.content, 'html.parser')
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "ad"]): tag.decompose()
-        text = soup.get_text(separator='\n\n')
-        clean_text = re.sub(r'\n\s*\n', '\n\n', text).strip()
-        if len(clean_text) < 200: return "Content appears to be behind a login wall or empty."
-        return clean_text[:20000]
-    except Exception as e:
-        print(f"Scraper Exception: {e}")
-        return "Error: Could not read page."
+    return get_mcp_client().call("scrape_article", {"url": url})
     
-#2. The Internal Knowledge Retrieval Tool
+#2. The Internal Knowledge Retrieval Tool (MCP Refactored)
 def search_long_term_memory(query):
-    global db
-    if db is None: db = firestore.Client(project=PROJECT_ID)
-    
-    print(f"Tool: Accessing Hippocampus (Vector Search) for: '{query}'")
-    
-    # 1. Embed
-    vertexai.init(project=PROJECT_ID, location=LOCATION)
-    embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
-    # FIX: Enforce Token Limit (Approx 1500 words / 6000 chars is safe)
-    safe_query = query[:6000] 
-    query_embedding = embedding_model.get_embeddings([safe_query])[0].values
-    
-    # 2. Search
-    collection = db.collection('knowledge_base')
-    
-    # Prepare the query (This is the instruction)
-    vector_query = collection.find_nearest(
-        vector_field="embedding",
-        query_vector=Vector(query_embedding),
-        distance_measure=DistanceMeasure.COSINE, # <--- Use Enum, not string
-        limit=3
-    )
-    
-    # --- THE FIX: EXECUTE THE QUERY ---
-    try:
-        results = vector_query.get() # <--- This pulls the trigger
-    except Exception as e:
-        print(f"Vector Search failed (Index might be building or collection empty): {e}")
-        return []
+    return get_mcp_client().call("rag_search", {"query": query})
 
-    # 3. Format
-    memories = []
-    for res in results:
-        data = res.to_dict()
-        # Safety check in case data is partial
-        if data and 'content' in data:
-            trigger = data.get('topic_trigger', 'Unknown Topic')
-            memories.append(f"PAST SUCCESSFUL OUTPUT (Trigger: '{trigger}'):\n{data.get('content')}")
-        
-    return memories
+# --- [Removed unused local parser _parse_serp_features (now handled by MCP Server)] ---
 
-# --- 3. FIXED PARSER (Includes Organic Results Always) ---
-def _parse_serp_features(results):
-    extracted_features = []
-    # 1. AI Overview
-    if "ai_overview" in results:
-        aio = results["ai_overview"]
-        if "text_blocks" in aio:
-            aio_parts = ["**Google AI Overview:**"]
-            for block in aio["text_blocks"]:
-                snippet = block.get("snippet", "")
-                if block.get("type") == "heading": aio_parts.append(f"*{snippet}*")
-                elif block.get("type") == "paragraph": aio_parts.append(snippet)
-                elif block.get("type") == "list" and "list" in block:
-                    aio_parts.append("\n".join([f" - {i.get('snippet')}" for i in block["list"]]))
-            if len(aio_parts) > 1: extracted_features.append("\n\n".join(aio_parts))
-
-    # 2. Knowledge Graph
-    if "knowledge_graph" in results:
-        kg = results["knowledge_graph"]
-        title = kg.get("title", "Knowledge Graph")
-        desc = kg.get("description", "")
-        if not desc and "see_results_about" in kg:
-             item = kg["see_results_about"][0]
-             desc = f"{item.get('name')} - {', '.join(item.get('extensions', []))}"
-        extracted_features.append(f"**Knowledge Graph ({title}):**\n{desc}")
-
-    # 3. Top Stories
-    if "top_stories" in results:
-        stories = results["top_stories"]
-        story_list = [f"- {s.get('title', 'N/A')} ({s.get('source', 'N/A')})" for s in stories[:5]]
-        if story_list: extracted_features.append("**Top Stories:**\n" + "\n".join(story_list))
-
-    # 4. Related Questions
-    if "related_questions" in results:
-        questions = results["related_questions"]
-        qa_list = [f"- Q: {q.get('question')} \n  A: {q.get('snippet', '')}" for q in questions[:3]]
-        if qa_list: extracted_features.append("**People Also Ask:**\n" + "\n".join(qa_list))
-
-    # 5. Organic Results (Always included now)
-    if "organic_results" in results:
-        organic = results["organic_results"][:5]
-        organic_list = [f"- {res.get('title', 'Untitled')}: {res.get('snippet', '')} ({res.get('link')})" for res in organic]
-        if organic_list:
-            extracted_features.append("**Web Results:**\n" + "\n".join(organic_list))
-
-    # Add Grounding Tag to fallback results too
-    if extracted_features:
-        return "[GROUNDING_CONTENT]\n" + "\n\n---\n\n".join(extracted_features)
-    return None
-
-#4. The Specialist Google Web Search Tool (Stability + Full Parsing + Grounded)
+#4. The Specialist Google Web Search Tool (MCP Refactored)
 def search_google_web(query):
-    """
-    Specialist tool for deep analysis of the main web SERP.
-    Includes robust logic to 'hydrate' lazy-loaded AI Overviews.
-    """
-    print(f"Tool: Executing WEB search for: '{query}'")
-    try:
-        
-        
-        # 1. Primary Search (The Standard 'google' Engine)
-        params = {"api_key": SERPAPI_API_KEY, "engine": "google", "q": query, "no_cache": True}
-        search = GoogleSearch(params)
-        results = search.get_dict()
+    return get_mcp_client().call("google_web_search", {"query": query})
 
-        # 2. AI Overview Hydration Logic (The Corrected Logic)
-        ai_overview = results.get("ai_overview", {})
-        
-        # Condition: We have a token (indicating lazy loading) but no text blocks
-        if ai_overview and "page_token" in ai_overview and "text_blocks" not in ai_overview:
-            print("Tool: AI Overview is lazy-loaded. Fetching full content via secondary call...")
-            try:
-                token = ai_overview['page_token']
-                aio_params = {
-                    "api_key": SERPAPI_API_KEY,
-                    "engine": "google_ai_overview",
-                    "page_token": token,
-                    #  "q": query 
-                }
-                
-                aio_search = GoogleSearch(aio_params)
-                aio_results = aio_search.get_dict()
-                
-                # --- THE FIX: Robustly checking for data ---
-                if "ai_overview" in aio_results and aio_results["ai_overview"]:
-                     # Case A: It's nested under 'ai_overview'
-                    results["ai_overview"] = aio_results["ai_overview"]
-                    print("Tool: AI Overview successfully hydrated (Nested).")
-                elif "text_blocks" in aio_results:
-                     # Case B: The root object IS the overview (common for this engine)
-                    results["ai_overview"] = aio_results
-                    print("Tool: AI Overview successfully hydrated (Root).")
-                else:
-                    # Case C: Google returned no data for the token (common anti-bot measure)
-                    print("Tool: Secondary AI Overview call returned no content. Proceeding with partial data.")
-                    # We do NOT return None. We proceed with the other rich results (Top Stories, etc.)
-                    
-            except Exception as e:
-                print(f"Tool: Error fetching expanded AI Overview: {e}")
-                # We do not crash; we just proceed with the other rich results
-        
-        # 3. Parse and Return
-        # Even if AI Overview failed, we still want the Top Stories and PAA!
-        # The previous code might have been returning None if ANY part failed.
-        # _parse_serp_features is robust enough to handle missing keys.
-        return _parse_serp_features(results) 
-
-    except Exception as e:
-        print(f"SerpApi Web Search failed: {e}")
-        return None
-
-#5. The Specialist Google Trends Tool (Stability + Full Parsing + Grounded + Breakdown) ---
+#5. The Specialist Google Trends Tool (MCP Refactored)
 def search_google_trends(geo="US"):
-    """
-    Specialist tool for fetching 'Trending Now' searches via SerpApi.
-    Refined for production: Clean logs, additive context, and strict parameters.
-    """
-    print(f"Tool: Executing TRENDS search for geo: '{geo}'")
-    try:
-        
-        
-        # 1. Configuration (Hours as string, No Cache for freshness)
-        params = {
-            "api_key": SERPAPI_API_KEY,
-            "engine": "google_trends_trending_now",
-            "geo": geo,
-            "hours": "24", 
-            "no_cache": "true"
-        }
-        
-        search = GoogleSearch(params)
-        results = search.get_dict()
-        
-        trending_list = []
-
-        # 2. Greedy Parsing (Check all potential keys)
-        if "trending_searches" in results:
-            trending_list = results.get("trending_searches", [])
-        elif "daily_searches" in results:
-            daily = results.get("daily_searches", [])
-            if daily: trending_list = daily[0].get("searches", [])
-        elif "realtime_searches" in results:
-            trending_list = results.get("realtime_searches", [])
-            
-        if not trending_list:
-            print(f"Tool: No trending data found for {geo}. Keys: {list(results.keys())}")
-            return None 
-
-        # 3. Formatting with [GROUNDING_CONTENT]
-        formatted_trends = [f"[GROUNDING_CONTENT]\n**Google Trends (Viral Now in {geo}):**"]
-        
-        for item in trending_list[:15]: 
-            # A. Identity
-            query = item.get("query") or item.get("title") or "Unknown Topic"
-            
-            # B. Metadata (Categories)
-            categories = item.get("categories", [])
-            cat_label = ""
-            if categories:
-                cat_names = [c.get("name") for c in categories if c.get("name")]
-                if cat_names: cat_label = f" *({', '.join(cat_names)})*"
-
-            # C. Metrics (Traffic + Velocity)
-            traffic = item.get("formatted_traffic") or item.get("search_volume")
-            growth = item.get("increase_percentage")
-            
-            metrics_str = ""
-            if traffic:
-                metrics_str = f" [{traffic} searches"
-                if growth: metrics_str += f", +{growth}% growth"
-                metrics_str += "]"
-
-            # D. Additive Context (News + Related Topics)
-            context_snippet = ""
-            
-            # Try Articles
-            articles = item.get("articles", [])
-            if articles:
-                first = articles[0]
-                title = first.get("title") or first.get("article_title") or "News"
-                source = first.get("source") or "Source"
-                context_snippet += f"\n  - *News:* {title} ({source})"
-            
-            # Try Breakdown (Add this EVEN if we have articles, for maximum context)
-            if "trend_breakdown" in item:
-                breakdown = item.get("trend_breakdown", [])
-                if breakdown:
-                    related = ", ".join(breakdown[:4])
-                    context_snippet += f"\n  - *Related:* {related}"
-            
-            formatted_trends.append(f"- **{query}**{cat_label}{metrics_str}{context_snippet}")
-            
-        return "\n".join(formatted_trends)
-
-    except Exception as e:
-        print(f"SerpApi Trends Search failed: {e}")
-        return None
+    return get_mcp_client().call("google_trends", {"geo": geo})
     
-# --- 6. ANALYSIS TOOL: Trend History (For enhancing SEO keywords and semantic landscape) ---
+# --- 6. ANALYSIS TOOL: Trend History (MCP Refactored) ---
 def analyze_trend_history(query, geo="US"):
-    """
-    Analysis Tool: Fetches 'Interest Over Time' for a specific topic.
-    Returns: 12-month trajectory, Peak Date, and Current Status (Rising/Falling).
-    """
-    print(f"Tool: Executing TREND HISTORY analysis for: '{query}' in '{geo}'")
-    try:  
-        
-        params = {
-            "api_key": SERPAPI_API_KEY,
-            "engine": "google_trends",
-            "q": query,
-            "geo": geo,
-            "data_type": "TIMESERIES",
-            "date": "today 12-m", # Standard 1-year lookback
-            "no_cache": "true"
-        }
-        
-        search = GoogleSearch(params)
-        results = search.get_dict()
-        
-        interest_over_time = results.get("interest_over_time", {})
-        timeline_data = interest_over_time.get("timeline_data", [])
-        
-        if not timeline_data:
-            return f"No historical trend data found for '{query}' in {geo}."
+    return get_mcp_client().call("trend_analysis", {"query": query, "geo": geo})
 
-        # --- SMART ANALYSIS ---
-        # 1. Extract values
-        values = [int(point.get("values", [{}])[0].get("value", 0)) for point in timeline_data]
-        dates = [point.get("date", "") for point in timeline_data]
-        
-        if not values: return "Data found but contained no values."
-
-        # 2. Calculate Key Metrics
-        peak_value = max(values)
-        peak_index = values.index(peak_value)
-        peak_date = dates[peak_index]
-        
-        current_value = values[-1]
-        start_value = values[0]
-        
-        # 3. Determine Trajectory
-        trend_status = "Stable"
-        if current_value > start_value * 1.5: trend_status = "Growing significantly 📈"
-        elif current_value > start_value * 1.1: trend_status = "Rising slightly ↗️"
-        elif current_value < start_value * 0.5: trend_status = "Declining sharply 📉"
-        elif current_value < start_value * 0.9: trend_status = "Falling slightly ↘️"
-        
-        # 4. Generate Report
-        report = [
-            f"[GROUNDING_CONTENT]",
-            f"**Trend Analysis for '{query}' ({geo} - Last 12 Months):**",
-            f"- **Status:** {trend_status}",
-            f"- **Current Interest:** {current_value}/100",
-            f"- **Peak Popularity:** {peak_value}/100 on {peak_date}",
-            f"- **Trajectory:** Started at {start_value}, currently at {current_value}."
-        ]
-        
-        return "\n".join(report)
-
-    except Exception as e:
-        print(f"Trend Analysis failed: {e}")
-        return f"Error analyzing trend history: {e}"
-
-#7. The Specialist Image Search Tool
+#7. The Specialist Image Search Tool (MCP Refactored)
 def search_google_images(query, num_results=5):
-    """Specialist tool for analyzing image search results."""
-    print(f"Tool: Executing IMAGE search for: '{query}'")
-    try:
-        
-        params = {"api_key": SERPAPI_API_KEY, "engine": "google_images", "q": query}
-        results = GoogleSearch(params).get_dict().get("images_results", [])[:num_results]
-        if not results: return None
-        image_descriptions = [f"- Title: {img.get('title', 'N/A')}, Source: {img.get('source', 'N/A')}" for img in results]
-        return "**Image Search Results (Visual Trends):**\n" + "\n".join(image_descriptions)
-    except Exception as e:
-        print(f"SerpApi Image Search failed: {e}")
-        return None
-    
-#8. The Specialist Video Search Tool
-def search_google_videos(query, num_results=5):
-    """Specialist tool for analyzing video search results."""
-    print(f"Tool: Executing VIDEO search for: '{query}'")
-    try:
-        
-        params = {"api_key": SERPAPI_API_KEY, "engine": "google_videos", "q": query}
-        results = GoogleSearch(params).get_dict().get("video_results", [])[:num_results]
-        if not results: return None
-        video_descriptions = [f"- Title: {vid.get('title', 'N/A')}, Source: {vid.get('source', 'N/A')}, Length: {vid.get('duration', 'N/A')}" for vid in results]
-        return "**Video Search Results (Top Videos):**\n" + "\n".join(video_descriptions)
-    except Exception as e:
-        print(f"SerpApi Video Search failed: {e}")
-        return None
+    return get_mcp_client().call("google_images_search", {"query": query})
 
-#9. The Specialist Scholar Search Tool
+#8. The Specialist Video Search Tool (MCP Refactored)
+def search_google_videos(query, num_results=5):
+    return get_mcp_client().call("google_videos_search", {"query": query})
+
+#9. The Specialist Scholar Search Tool (MCP Refactored)
 def search_google_scholar(query, num_results=3):
-    """Specialist tool for finding academic papers and research."""
-    print(f"Tool: Executing SCHOLAR search for: '{query}'")
-    try:
-        
-        params = {"api_key": SERPAPI_API_KEY, "engine": "google_scholar", "q": query}
-        results = GoogleSearch(params).get_dict().get("organic_results", [])[:num_results]
-        if not results: return None
-        scholar_summaries = [f"- Title: {res.get('title')}\n  - Publication: {res.get('publication_info', {}).get('summary')}\n  - Snippet: {res.get('snippet', 'N/A')}" for res in results]
-        return "**Scholarly Articles (Academic Research):**\n" + "\n".join(scholar_summaries)
-    except Exception as e:
-        print(f"SerpApi Scholar Search failed: {e}")
-        return None
+    return get_mcp_client().call("google_scholar_search", {"query": query})
+
+# Fallback Search (MCP Refactored)
+def google_simple_search(query):
+    return get_mcp_client().call("google_simple_search", {"query": query})
 
 # 10. The Router (Updated with "Double-Tap" Analysis)
 def find_trending_keywords(raw_topic, history_context=""):
@@ -657,7 +389,13 @@ def find_trending_keywords(raw_topic, history_context=""):
         context_snippets.append(internal_context)
         tool_logs.append({"event_type": "tool_call", "tool_name": "internal_knowledge_retrieval", "status": "success"})
 
-    # 2. Sensory Array Router (Decides based on RAW input)
+    # 2. Automated Signal Detection (MCP Refactored)
+    print("Sensory Router: Detecting Signals (Geo & Intent) via MCP Hub...")
+    detected_geo = mcp_detect_geo(raw_topic, history=history_context)
+    research_intent = mcp_detect_intent(raw_topic)
+    print(f"  -> Signal Detected | Geo: '{detected_geo}' | Intent: '{research_intent}'")
+    
+    # 3. Sensory Array Router (Decides based on RAW input)
     tool_choice_prompt = f"""
     Analyze the user's query to select the most appropriate research tool(s).
 
@@ -668,15 +406,19 @@ def find_trending_keywords(raw_topic, history_context=""):
     {rag_text}
 
     USER'S CORE QUERY: '{raw_topic}'
+    
+    ### DETECTED CONTEXT (MCP Hub Signals):
+    - PRIMARY GEO TARGET: '{detected_geo}' (System will default to '{detected_geo}')
+    - REQUESTED INTENT: '{research_intent}'
 
     ### DECISION PROTOCOL (CHECK IN ORDER):
     1. **CHECK HISTORY (Priority #1):**
         - If the user is asking for information (or a REFORMATTING like an OUTLINE) that CAN BE GATHERED from the "LONG-TERM MEMORY" or "CONVERSATION HISTORY", select **NONE**.
         - If the history contains the FACTUAL CONTENT needed but the user wants a new structure (e.g. "Create an outline for the above"), select **NONE**.
-        - **CRITICAL EXCEPTION:** If the user asks for **REASONS**, **DRIVERS**, **CAUSES**, or **"WHY"** something happened (and the text history contains only numbers/stats but not the *explanation*), **DO NOT** select NONE. Proceed to Priority #2.
+        - **INTERPRETIVE EXCEPTION:** If the user asks for **REASONS**, **DRIVERS**, **CAUSES**, or **"WHY"** (and the history only contains stats/numbers), **DO NOT** select NONE. Proceed to research.
 
     2. **CHECK CREATIVE INTENT (Priority #2):**
-        - If the user asks you to **DRAFT**, **CREATE**, or **WRITE** content for an entity that is clearly **INVENTED** or defined in history, select **NONE**.
+        - If the user asks you to **DRAFT**, **CREATE**, or **WRITE** content for an entity that is clearly **INVENTED**, **FICTIONAL**, or defined in history, select **NONE**.
 
     3. **NEW RESEARCH (Priority #3):**
         - If the user wants you to gather NEW information not in history, use a tool below.
@@ -698,17 +440,16 @@ def find_trending_keywords(raw_topic, history_context=""):
     - If a request combines **Drafting** with **Research Intent** (e.g. "Draft a deep-dive based on new research"), the priority is to select **WEB** + any other necessary tools.
     - If a request is purely about **Execution/Form** based on existing knowledge, select **NONE**.
 
-    Respond ONLY with the tool selection(s), comma-separated (e.g., "WEB, ANALYSIS:US" or "IMAGES" or "NONE").
-    
+    Respond ONLY with the tool selection(s), comma-separated (e.g., "WEB, ANALYSIS" or "IMAGES" or "NONE").
+    Do not add country codes; the system handles locations via the MCP signals.
     """
-    # 3. Robust Parsing Logic
+    # 4. Robust Parsing Logic
     try:
         raw_response = flash_model.generate_content(tool_choice_prompt).text.strip().upper()
         clean_response = raw_response.replace("*", "").replace("`", "").replace("'", "").replace('"', "").rstrip(".")
         
-        # Support for multi-tool selection (comma-separated)
         selected_tools = [t.strip() for t in clean_response.split(',')]
-        print(f"Sensory Array decided on tools: {selected_tools}")
+        print(f"Sensory Array decided on tools: {selected_tools} (Detected Geo: {detected_geo})")
     except Exception as e:
         print(f"Router Parse Error: {e}. Defaulting to SIMPLE.")
         selected_tools = ["SIMPLE"]
@@ -720,99 +461,87 @@ def find_trending_keywords(raw_topic, history_context=""):
     distilled_seo_query = None
     distilled_trend_term = None
 
-    # Step A: Distill SEO query if needed (WEB, IMAGES, etc.)
     if any(t in ["WEB", "IMAGES", "VIDEOS", "SCHOLAR", "SIMPLE"] for t in selected_tools):
-        print(f"Sensory Router: Category [SEO] active. Distilling high-precision query...")
+        print("Sensory Router: Category [SEO] active. Distilling high-precision query...")
         distilled_seo_query = extract_core_topic(raw_topic, history=history_context)
         print(f"  -> SEO Query: '{distilled_seo_query}'")
 
-    # Step B: Distill Trend Term if needed (ANALYSIS)
     if any("ANALYSIS" in t for t in selected_tools):
-        print(f"Sensory Router: Category [TREND] active. Distilling trend entity...")
+        print("Sensory Router: Category [TREND] active. Distilling trend entity...")
         distilled_trend_term = extract_trend_term(raw_topic, history=history_context)
         print(f"  -> Trend Entity: '{distilled_trend_term}'")
     
-    # Iterate through each selected tool
-    for tool_selection in selected_tools:
-        try:
-            parts = tool_selection.split(':')
-            choice = parts[0].strip()       
-            geo_code = parts[1].strip() if len(parts) > 1 else "US" 
-        except Exception:
-            choice = "SIMPLE"
-            geo_code = "US"
+    # --- MULTI-SIGNAL EXECUTION LOOP ---
+    # We split detected_geo (e.g., "NG, KE") and iterate.
+    # To avoid combinatorial explosion, we limit to 3 geos max.
+    target_geos = [g.strip() for g in detected_geo.split(',')][:3]
+    
+    for geo_code in target_geos:
+        print(f"--- Processing Region: '{geo_code}' ---")
+        
+        # Iterate through each selected tool
+        for tool_selection in selected_tools:
+            choice = tool_selection.split(':')[0].strip() # Handle legacy format just in case
+            print(f"Executing Sensory Tool: '{choice}' (Geo: '{geo_code}')")
 
-        print(f"Executing Sensory Tool: '{choice}' (Geo: '{geo_code}')")
+            research_context = None
+            tool_name = "unknown"
 
-        research_context = None
-        tool_name = "unknown"
+            # --- 1. VIRAL DISCOVERY ---
+            if "TRENDS" in choice:
+                research_context = search_google_trends(geo=geo_code)
+                tool_name = f"serpapi_trends_search_{geo_code}"
 
-        # --- 1. VIRAL DISCOVERY ---
-        if "TRENDS" in choice:
-            research_context = search_google_trends(geo=geo_code)
-            tool_name = "serpapi_trends_search"
-
-        # --- 2. TREND ANALYSIS ---
-        elif "ANALYSIS" in choice:
-            search_query = distilled_trend_term
-            print(f"  + Fetching Quantitative Trend Stats for '{search_query}'...")
-            stats_context = analyze_trend_history(search_query, geo=geo_code)
-            
-            # C. TAP 2: Qualitative Data (Consolidated Logic)
-            has_web_tool = any(t in ["WEB", "SIMPLE"] for t in selected_tools)
-            try:
-                if not has_web_tool:
-                    print(f"  + Fetching Qualitative News Context for '{search_query}'...")
-                    news_params = {"engine": "google", "q": search_query, "gl": geo_code, "tbm": "nws", "num": 3, "api_key": SERPAPI_API_KEY}
-                    news_search = GoogleSearch(news_params) 
-                    news_results = news_search.get_dict().get("news_results", [])
-                    news_text = "\n[NEWS CONTEXT]:\n" + "\n".join([f"- {n.get('title')}" for n in news_results]) if news_results else ""
-                    research_context = f"{stats_context}\n{news_text}"
-                else:
-                    print(f"  - Skipping Supplemental News context (WEB search will provide it).")
-                    research_context = stats_context
-            except Exception as news_err: 
-                print(f"  ! News fetch error: {news_err}")
-                research_context = stats_context
-            tool_name = "serpapi_trend_analysis"
-
-        # --- 3. STANDARD SEARCH TOOLS ---
-        elif choice in ["WEB", "IMAGES", "VIDEOS", "SCHOLAR", "SIMPLE"]:
-            search_query = distilled_seo_query # Category [SEO]
-            if choice == "WEB":
-                research_context = search_google_web(search_query)
-                tool_name = "serpapi_web_search"
-            elif choice == "IMAGES":
-                research_context = search_google_images(search_query)
-                tool_name = "serpapi_image_search"
-            elif choice == "VIDEOS":
-                research_context = search_google_videos(search_query)
-                tool_name = "serpapi_video_search"
-            elif choice == "SCHOLAR":
-                research_context = search_google_scholar(search_query)
-                tool_name = "serpapi_scholar_search"
-            elif choice == "SIMPLE":
-                pass 
+            # --- 2. TREND ANALYSIS ---
+            elif "ANALYSIS" in choice:
+                search_query = distilled_trend_term
+                print(f"  + Fetching Quantitative Trend Stats for '{search_query}' in '{geo_code}'...")
+                stats_context = analyze_trend_history(search_query, geo=geo_code)
                 
-        # --- 4. FALLBACK / SIMPLE SEARCH (Optimized) ---
-        if not research_context:
-            fallback_query = distilled_seo_query or distilled_trend_term or raw_topic
-            print(f"  ? Primary research failed. Initiating CSE fallback for: '{fallback_query}'")
-            try:
-                # Use Google Custom Search API (CSE) for fallback
-                api_key = get_search_api_key()
-                service = build("customsearch", "v1", developerKey=api_key)
-                res = service.cse().list(q=fallback_query, cx=SEARCH_ENGINE_ID, num=5).execute()
-                google_snippets = [item.get('snippet', '') for item in res.get('items', [])]
-                if google_snippets:
-                    research_context = "[GROUNDING_CONTENT (Fallback)]:\n" + "\n".join(google_snippets)
-                    tool_name = "google_simple_search"
-            except Exception as e:
-                print(f"Fallback search failed: {e}")
+                # C. TAP 2: Qualitative Data
+                has_web_tool = any(t in ["WEB", "SIMPLE"] for t in selected_tools)
+                try:
+                    if not has_web_tool:
+                        print(f"  + Fetching Qualitative News Context for '{search_query}' in '{geo_code}' via MCP...")
+                        news_text = get_mcp_client().call("google_news_search", {"query": search_query, "geo": geo_code})
+                        research_context = f"[Region: {geo_code} Stats]:\n{stats_context}\n{news_text}"
+                    else:
+                        print(f"  - Skipping Supplemental News context (WEB search will provide it) for '{geo_code}'.")
+                        research_context = f"[Region: {geo_code} Stats]:\n{stats_context}"
+                except Exception as news_err: 
+                    print(f"  ! News fetch error for '{geo_code}': {news_err}")
+                    research_context = stats_context
+                tool_name = f"serpapi_trend_analysis_{geo_code}"
 
-        if research_context:
-            context_snippets.append(research_context)
-            tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": raw_topic, "status": "success"})
+            # --- 3. STANDARD SEARCH TOOLS ---
+            elif choice in ["WEB", "IMAGES", "VIDEOS", "SCHOLAR", "SIMPLE"]:
+                search_query = distilled_seo_query
+                if choice == "WEB":
+                    results = search_google_web(search_query)
+                    research_context = f"[Region: {geo_code} Results]:\n{results}"
+                    tool_name = f"serpapi_web_search_{geo_code}"
+                elif choice == "IMAGES":
+                    research_context = search_google_images(search_query)
+                    tool_name = "serpapi_image_search"
+                elif choice == "VIDEOS":
+                    research_context = search_google_videos(search_query)
+                    tool_name = "serpapi_video_search"
+                elif choice == "SCHOLAR":
+                    research_context = search_google_scholar(search_query)
+                    tool_name = "serpapi_scholar_search"
+                elif choice == "SIMPLE":
+                    pass 
+                
+            # --- 4. FALLBACK / SIMPLE SEARCH ---
+            if not research_context and choice not in ["IMAGES", "VIDEOS", "SCHOLAR"]:
+                fallback_query = distilled_seo_query or distilled_trend_term or raw_topic
+                print(f"  ? Primary research failed for '{geo_code}'. Initiating fallback.")
+                research_context = google_simple_search(fallback_query)
+                tool_name = "google_simple_search"
+
+            if research_context:
+                context_snippets.append(research_context)
+                tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": raw_topic, "status": "success"})
 
     return { "context": context_snippets, "tool_logs": tool_logs }
 
@@ -923,26 +652,49 @@ def generate_seo_metadata(article_html, topic):
 
 #13. The Comprehensive Answer Generator (AEO-AWARE CONTENT STRATEGIST)
 def generate_comprehensive_answer(topic, context, history=""):
+    """
+    Standardizes the logic for generating a direct answer.
+    Uses 'detect_research_intent' signal to adjust formatting (Tables/Lists).
+    """
     global model
+    print(f"Tool: generate_comprehensive_answer for topic: '{topic}'")
     is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
     
+    if is_grounded:
+        print(f"  -> Context is GROUNDED. Enforcing STRICT ACTION MODE.")
+    else:
+        print(f"  -> Context is NOT grounded. Using strategic dialogue mode.")
+    
     # UNIFIED PERSONA: The AEO-Aware Content Strategist
-    # This persona intelligently adjusts its formatting based on the intent of the request.
     persona_instruction = """
     You are the 'Sonnet & Prose' Senior Content Strategist. 
     You excel at Answer Engine Optimization (AEO) and Conversational Synthesis.
     
     CORE OPERATING PRINCIPLES:
-    1. **Dual-Intent Synthesis**: Connect external 'Research Context' with the specific artifacts, case studies, and nuances found in the SLACK HISTORY. Don't just list search results; bridge them with the user's internal context.
-    2. **Contextual Formatting (AEO vs. Dialogue)**: 
-       - **Production/Draft Mode**: If the user is asking for a **DRAFT**, **OUTLINE**, **PLAN**, or **STRATEGY** (content intended for publication), strictly apply AEO Principles: Lead with an "Inverted Pyramid" structure (40-60 word extraction-ready leads), use modular H2/H3 headers, listicles, and structural tables.
-       - **Dialogue/Research Mode**: If the user is asking a direct question, exploring a trend (e.g., "What is trending?"), or simply chatting, provide a **Simple, Natural, and Empathetic** response. Avoid rigid AEO headers or extraction summaries to keep the conversation fluid.
-    3. **Sonnet & Prose Balance**: Wrap technical depth (Prose) in a human-centric, philosophical intro and a reflective conclusion (Sonnet).
+    1. **Dual-Intent Synthesis**: Connect external 'Research Context' with the specific artifacts and nuances found in the SLACK HISTORY. 
+    2. **STRICT ACTION MODE**: If research data is provided (GROUNDING_CONTENT), **DO NOT ASK FOR PERMISSION**. Provide the data immediately in the requested format.
+    3. **Contextual Formatting (AEO vs. Dialogue)**: 
+       - **Production/Draft Mode**: If the user is asking for a **DRAFT**, **OUTLINE**, **TIMELINE**, **TABLE**, **PLAN**, or **STRATEGY**, strictly apply AEO Principles: Lead with an "Inverted Pyramid" structure (40-60 word extraction-ready leads), use modular H2/H3 headers, listicles, and structural tables.
+       - **Dialogue/Research Mode**: If the user is asking a direct question or exploring a trend, provide a **Simple, Natural, and Empathetic** response.
+    4. **Deliverables Over Dialog**: If the user asks for a 'Timeline', produce a clear table or list with dates and events. If they ask for 'Trends', list them clearly.
+    5. **Sonnet & Prose Balance**: Wrap technical depth (Prose) in a human-centric, philosophical intro and a reflective conclusion (Sonnet).
+    
+    CRITICAL: Do NOT include structural labels like 'Lead', 'Summary', 'H2', 'H3', 'Prose', or 'Sonnetal close' in your response. Use natural headers (##) and bolding to establish structure implicitly.
     """
+
+    # Signal Detection (MCP Refactored)
+    research_intent = mcp_detect_intent(topic)
 
     if is_grounded:
         temp = 0.0
-        instruction = f"CRITICAL: Base answer PRIMARILY on 'GROUNDING_CONTENT', but SYNTHESIZE it with Slack History (Internal Artifacts). {persona_instruction}"
+        # Incorporate Intent into formatting instruction
+        intent_instruction = ""
+        if research_intent == "TIMELINE":
+            intent_instruction = "CRITICAL: The user wants a TIMELINE. Provide a structured table with 'Date', 'Event', and 'Description'."
+        elif research_intent == "TABLE":
+            intent_instruction = "CRITICAL: Response MUST include a structured Markdown table. Do not include extra horizontal lines (---) beyond the standard Markdown header separator to ensure clean data extraction."
+        
+        instruction = f"CRITICAL: Base answer PRIMARILY on 'GROUNDING_CONTENT'. {intent_instruction} {persona_instruction}"
     else:
         temp = 0.7
         instruction = f"You are a strategic partner and content architect. {persona_instruction}"
@@ -950,12 +702,12 @@ def generate_comprehensive_answer(topic, context, history=""):
     prompt = f"""
         {instruction}
         
-        CONVERSATION HISTORY (FOR SYNTHESIS):
+        CONVERSATION HISTORY:
         {history}
         
         CURRENT REQUEST: "{topic}"
         
-        RESEARCH CONTEXT (IF AVAILABLE):
+        RESEARCH CONTEXT:
         {context}
         
         RESPONSE:
@@ -999,6 +751,7 @@ def generate_pseo_article(topic, context, history=""):
     CRITICAL RULES:
     - Do NOT hallucinate. If the context is empty, admit it.
     - Return ONLY the HTML content (no ```html``` markdown wrappers).
+    - Do NOT include labels like 'Intro', 'Body', or 'Methodology' as text; use the provided HTML class structure for organization.
     - Ensure it is ready for Ghost CMS.
 
     CONTEXTUAL DATA:
@@ -1463,7 +1216,7 @@ def process_story_logic(request):
                 },
                 "channel_id": slack_context['channel'], 
                 "thread_ts": slack_context['ts']
-            }, verify=True)
+            }, verify=certifi.where())
 
             return jsonify({"msg": "pSEO Draft (Enhanced) sent to N8N"}), 200
 

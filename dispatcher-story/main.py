@@ -133,7 +133,7 @@ def start_story_workflow(request):
         batch.commit()
         
         # Send Reply via Webhook
-        requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": reply, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts']}, verify=True)
+        requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": reply, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts']}, verify=certifi.where())
         return jsonify({"msg": "Social reply sent", "session_id": session_id}), 200
     else:
         # Dispatch to Worker
