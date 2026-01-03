@@ -227,23 +227,33 @@ def handle_tool_call(name, arguments):
         query = arguments.get("query")
         model = get_flash_model()
         prompt = f"""
-        Analyze the user's request to identify the specific deliverable or research depth requested.
+        Analyze the user's request to identify the primary structural goal or specific deliverable requested.
         
         CATEGORIES:
-        - TIMELINE: Requesting historical dates/progression.
-        - TABLE: Requesting structured comparison or lists.
-        - CSV: Explicit mention of spreadsheet format.
-        - NONE: General conversation or drafting without specific structural requirements.
+        - TIMELINE: Progression of events over time.
+        - TABLE: Comparative data or technical specs.
+        - CHART: Visual representations (Bar charts, Pie charts, Flow diagrams, Sequence diagrams, Mindmaps).
+        - LISTICLE: High-impact numbered/bulleted lists (e.g., "Top 5 reasons", "Steps to X").
+        - CSV: Specific mention of spreadsheet/exportable data.
+        - NONE: General drafting or information without a rigid structural request.
+        
+        TASK:
+        Return a JSON string with two fields:
+        1. "intent": One of the CATEGORIES above.
+        2. "directive": A 1-sentence instruction on the exact visual or structural style. 
+           (Examples: "A Mermaid.js pie chart for market share", "A witty numbered list with emojis", "A Mermaid.js flow diagram of the process").
         
         USER INPUT: "{query}"
         
-        CATEGORY:
+        JSON:
         """
         try:
-            intent = model.generate_content(prompt).text.strip().upper()
-            return intent if intent in ["TIMELINE", "TABLE", "CSV"] else "NONE"
+            raw_response = model.generate_content(prompt).text.strip()
+            # Basic cleanup in case the model adds markdown code blocks
+            clean_response = re.sub(r'```json|```', '', raw_response).strip()
+            return clean_response
         except Exception:
-            return "NONE"
+            return '{"intent": "NONE", "directive": ""}'
 
     return f"Error: Tool '{name}' not found."
 

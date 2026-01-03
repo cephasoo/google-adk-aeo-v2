@@ -683,7 +683,14 @@ def generate_comprehensive_answer(topic, context, history=""):
     """
 
     # Signal Detection (MCP Refactored)
-    research_intent = mcp_detect_intent(topic)
+    hybrid_signal_raw = mcp_detect_intent(topic)
+    try:
+        signal_data = json.loads(hybrid_signal_raw)
+        research_intent = signal_data.get("intent", "NONE")
+        formatting_directive = signal_data.get("directive", "")
+    except Exception:
+        research_intent = "NONE"
+        formatting_directive = ""
 
     if is_grounded:
         temp = 0.0
@@ -693,11 +700,26 @@ def generate_comprehensive_answer(topic, context, history=""):
             intent_instruction = "CRITICAL: The user wants a TIMELINE. Provide a structured table with 'Date', 'Event', and 'Description'."
         elif research_intent == "TABLE":
             intent_instruction = "CRITICAL: Response MUST include a structured Markdown table. Do not include extra horizontal lines (---) beyond the standard Markdown header separator to ensure clean data extraction."
+        elif research_intent == "CHART":
+            intent_instruction = f"CRITICAL: The user wants a CHART. You MUST output data using Mermaid.js syntax (e.g., pie, graph TD, sequenceDiagram, mindmap). Do not add conversational filler around the code block. {formatting_directive}"
+        elif research_intent == "LISTICLE":
+            intent_instruction = f"CRITICAL: The user wants a LISTICLE. Use high-impact headers, numbered lists, and bolding for key terms. {formatting_directive}"
+        elif formatting_directive:
+            intent_instruction = f"FORMATTING DIRECTIVE: {formatting_directive}"
         
-        instruction = f"CRITICAL: Base answer PRIMARILY on 'GROUNDING_CONTENT'. {intent_instruction} {persona_instruction}"
+        if research_intent in ["CHART", "CSV"]:
+            # Visual-Only Mode: Suppress long persona filler but allow a brief summary
+            # We allow 2-3 sentences of analytical context to clarify the data.
+            instruction = f"CRITICAL: You are in VISUAL MODE. {intent_instruction} DO NOT provide Python code, Google Sheets instructions, or standard conversational filler. Provide a brief analytical summary (2-3 sentences max), followed ONLY by the Mermaid.js or CSV content."
+        else:
+            instruction = f"CRITICAL: Base answer PRIMARILY on 'GROUNDING_CONTENT'. {intent_instruction} {persona_instruction}"
     else:
         temp = 0.7
-        instruction = f"You are a strategic partner and content architect. {persona_instruction}"
+        if research_intent == "CHART":
+             # Even without grounding, the user wants a visualization
+             instruction = f"CRITICAL: You are in VISUAL MODE. {intent_instruction} Use your internal knowledge. Provide a brief analytical summary (2-3 sentences max), then ONLY the Mermaid.js content."
+        else:
+             instruction = f"You are a strategic partner and content architect. {persona_instruction}"
         
     prompt = f"""
         {instruction}
@@ -712,7 +734,11 @@ def generate_comprehensive_answer(topic, context, history=""):
         
         RESPONSE:
         """
-    return model.generate_content(prompt, generation_config={"temperature": temp}).text.strip()
+    return {
+        "text": model.generate_content(prompt, generation_config={"temperature": temp}).text.strip(),
+        "intent": research_intent,
+        "directive": formatting_directive
+    }
 
 # 14. The Dedicated pSEO Article Generator (High Trust & Transparency)
 def generate_pseo_article(topic, context, history=""):
@@ -1033,8 +1059,12 @@ def process_story_logic(request):
 
         # 3. Generate Output based on Intent
         if intent == "DIRECT_ANSWER":
-            answer_text = generate_comprehensive_answer(original_topic, research_data['context'], history=history_text)
-            new_events.append({"event_type": "agent_answer", "text": answer_text})
+            answer_data = generate_comprehensive_answer(original_topic, research_data['context'], history=history_text)
+            answer_text = answer_data['text']
+            research_intent = answer_data['intent']
+            formatting_directive = answer_data['directive']
+            
+            new_events.append({"event_type": "agent_answer", "text": answer_text, "intent": research_intent})
             
             # Writing to a Sub-collection
             session_ref = db.collection('agent_sessions').document(session_id)
@@ -1051,7 +1081,15 @@ def process_story_logic(request):
                 "slack_context": slack_context,
                 "last_updated": expire_time
             })
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts']}, verify=True)
+            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                "session_id": session_id, 
+                "type": "social", 
+                "message": answer_text, 
+                "intent": research_intent,
+                "directive": formatting_directive,
+                "channel_id": slack_context['channel'], 
+                "thread_ts": slack_context['ts']
+            }, verify=True)
             return jsonify({"msg": "Answer sent"}), 200
 
         elif intent == "DEEP_DIVE":
