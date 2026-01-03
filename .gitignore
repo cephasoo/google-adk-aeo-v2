@@ -21,3 +21,8 @@ desktop.ini
 *.userosscache
 *.sln.docstates
 *.sqlite
+
+# Packaging & Build Artifacts
+*.egg-info/
+build/
+dist/
