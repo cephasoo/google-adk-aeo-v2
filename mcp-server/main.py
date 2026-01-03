@@ -11,7 +11,7 @@ from google.cloud import secretmanager, firestore
 from google.cloud.firestore_v1.vector import Vector
 from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
 from vertexai.language_models import TextEmbeddingModel
-from vertexai.generative_models import GenerativeModel
+from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
 from serpapi import GoogleSearch
 from googleapiclient.discovery import build
 
@@ -19,8 +19,9 @@ from googleapiclient.discovery import build
 PROJECT_ID = os.environ.get("PROJECT_ID")
 LOCATION = os.environ.get("LOCATION", "us-central1")
 SEARCH_ENGINE_ID = os.environ.get("SEARCH_ENGINE_ID")
-SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY")
-BROWSERLESS_API_KEY = os.environ.get("BROWSERLESS_API_KEY")
+# These will be fetched from Secret Manager in production
+SERPAPI_API_KEY = None
+BROWSERLESS_API_KEY = None
 FLASH_MODEL_NAME = os.environ.get("FLASH_MODEL_NAME", "gemini-2.0-flash-exp")
 DEFAULT_GEO = os.environ.get("DEFAULT_GEO", "NG") # Default to Nigeria as primary operating region, but configurable
 
@@ -31,6 +32,14 @@ app = FastAPI(title="Sensory-Tools-Server")
 db = None
 secret_client = None
 flash_model = None
+
+# --- Safety Configuration (ADK/RAI Compliant) ---
+safety_settings = {
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+}
 
 def get_db():
     global db
@@ -44,18 +53,33 @@ def get_secret_client():
         secret_client = secretmanager.SecretManagerServiceClient()
     return secret_client
 
-def get_search_api_key():
+def get_secret(secret_id):
+    """Retrieves a secret from Google Cloud Secret Manager."""
     client = get_secret_client()
-    response = client.access_secret_version(name=f"projects/{PROJECT_ID}/secrets/google-search-api-key/versions/latest")
-    return response.payload.data.decode("UTF-8")
+    try:
+        response = client.access_secret_version(name=f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest")
+        return response.payload.data.decode("UTF-8")
+    except Exception as e:
+        print(f"Error retrieving secret '{secret_id}': {e}")
+        return None
+
+def initialize_secrets():
+    global SERPAPI_API_KEY, BROWSERLESS_API_KEY
+    SERPAPI_API_KEY = get_secret("serpapi-api-key")
+    BROWSERLESS_API_KEY = get_secret("browserless-api-key")
 
 # --- Initialize Vertex AI ---
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 
+@app.on_event("startup")
+async def startup_event():
+    """Initializes external services and secrets on startup."""
+    initialize_secrets()
+
 def get_flash_model():
     global flash_model
     if flash_model is None:
-        flash_model = GenerativeModel(FLASH_MODEL_NAME)
+        flash_model = GenerativeModel(FLASH_MODEL_NAME, safety_settings=safety_settings)
     return flash_model
 
 # --- Shared Helper: SERP Parser ---
@@ -103,20 +127,46 @@ def _parse_serp_features(results):
     return "No significant results found."
 
 # --- Unified Tool Routing ---
+def scrub_pii(text):
+    """Simple PII scrubbing for tool outputs."""
+    if not isinstance(text, str): return text
+    # Mask emails
+    text = re.sub(r'[\w\.-]+@[\w\.-]+\.\w+', '[EMAIL_MASKED]', text)
+    # Mask common phone formats (simple regex)
+    text = re.sub(r'\+?\d{1,3}[-.\s]?\d{3}[-.\s]?\d{3}[-.\s]?\d{4}', '[PHONE_MASKED]', text)
+    return text
+
 def handle_tool_call(name, arguments):
     """
     Central dispatcher for all sensory tools.
-    Logs every call for real-time debugging.
+    Logs every call for real-time debugging and enforces validation/scrubbing.
     """
     print(f"MCP Hub: Handling tool call '{name}' with args: {arguments}")
     
+    # Tool-Level Input Validation (Architectural Safety)
+    if not name or not isinstance(arguments, dict):
+        return "Error: Invalid tool call format."
+
+    # Namespacing / Allowed List check
+    allowed_tools = [
+        "google_web_search", "scrape_article", "rag_search", "google_trends", 
+        "trend_analysis", "google_images_search", "google_videos_search", 
+        "google_scholar_search", "google_news_search", "google_simple_search",
+        "detect_geo", "detect_intent"
+    ]
+    if name not in allowed_tools:
+        return f"Error: Tool '{name}' is not in the allowed list."
+
+    result = ""
     if name == "google_web_search":
+        if not arguments.get("query"): return "Error: Missing query."
         params = {"api_key": SERPAPI_API_KEY, "engine": "google", "q": arguments.get("query"), "no_cache": True}
         results = GoogleSearch(params).get_dict()
-        return _parse_serp_features(results)
+        result = _parse_serp_features(results)
 
     elif name == "scrape_article":
         url = arguments.get("url")
+        if not url or not url.startswith("http"): return "Error: Invalid URL."
         endpoint = f"https://production-sfo.browserless.io/content?token={BROWSERLESS_API_KEY}&stealth=true"
         payload = {"url": url, "rejectResourceTypes": ["image", "media", "font"], "gotoOptions": {"timeout": 15000, "waitUntil": "networkidle2"}}
         response = requests.post(endpoint, json=payload, timeout=20, verify=certifi.where())
@@ -124,80 +174,93 @@ def handle_tool_call(name, arguments):
         for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "ad"]): tag.decompose()
         text = soup.get_text(separator='\n\n')
         clean_text = re.sub(r'\n\s*\n', '\n\n', text).strip()
-        return clean_text[:20000]
+        result = clean_text[:20000]
 
     elif name == "rag_search":
         query = arguments.get("query")
+        session_id = arguments.get("session_id")
+        if not query: return "Error: Missing query."
+        if not session_id: return "Error: Missing session_id for isolated memory search."
+        
         db = get_db()
         embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
         query_embedding = embedding_model.get_embeddings([query[:6000]])[0].values
+        
+        # Enforce Session-Level Isolation (ADK Principle)
         collection = db.collection('knowledge_base')
-        results = collection.find_nearest(
+        results = collection.where("source_session", "==", session_id).find_nearest(
             vector_field="embedding",
             query_vector=Vector(query_embedding),
             distance_measure=DistanceMeasure.COSINE,
             limit=3
         ).get()
+        
         memories = []
         for res in results:
             data = res.to_dict()
             if data and 'content' in data:
                 trigger = data.get('topic_trigger', 'Unknown Topic')
                 memories.append(f"PAST SUCCESSFUL OUTPUT (Trigger: '{trigger}'):\n{data.get('content')}")
-        return "\n".join(memories) if memories else "No relevant memories found."
+        result = "\n".join(memories) if memories else "No relevant memories found."
 
     elif name == "google_trends":
         geo = arguments.get("geo", "US")
         params = {"api_key": SERPAPI_API_KEY, "engine": "google_trends_trending_now", "geo": geo, "hours": "24"}
         results = GoogleSearch(params).get_dict()
-        return json.dumps(results, indent=2)[:5000]
+        result = json.dumps(results, indent=2)[:5000]
 
     elif name == "trend_analysis":
         query = arguments.get("query")
+        if not query: return "Error: Missing query."
         geo = arguments.get("geo", "US")
         params = {"api_key": SERPAPI_API_KEY, "engine": "google_trends", "q": query, "geo": geo, "data_type": "TIMESERIES", "date": "today 12-m"}
         results = GoogleSearch(params).get_dict()
-        return json.dumps(results, indent=2)[:5000]
+        result = json.dumps(results, indent=2)[:5000]
 
     elif name == "google_images_search":
         query = arguments.get("query")
+        if not query: return "Error: Missing query."
         params = {"api_key": SERPAPI_API_KEY, "engine": "google_images", "q": query}
         results = GoogleSearch(params).get_dict().get("images_results", [])[:5]
         image_descriptions = [f"- Title: {img.get('title', 'N/A')}, Source: {img.get('source', 'N/A')}" for img in results]
-        return "**Image Search Results:**\n" + "\n".join(image_descriptions)
+        result = "**Image Search Results:**\n" + "\n".join(image_descriptions)
 
     elif name == "google_videos_search":
         query = arguments.get("query")
+        if not query: return "Error: Missing query."
         params = {"api_key": SERPAPI_API_KEY, "engine": "google_videos", "q": query}
         results = GoogleSearch(params).get_dict().get("video_results", [])[:5]
         video_descriptions = [f"- Title: {vid.get('title', 'N/A')}, Source: {vid.get('source', 'N/A')}, Length: {vid.get('duration', 'N/A')}" for vid in results]
-        return "**Video Search Results:**\n" + "\n".join(video_descriptions)
+        result = "**Video Search Results:**\n" + "\n".join(video_descriptions)
 
     elif name == "google_scholar_search":
         query = arguments.get("query")
+        if not query: return "Error: Missing query."
         params = {"api_key": SERPAPI_API_KEY, "engine": "google_scholar", "q": query}
         results = GoogleSearch(params).get_dict().get("organic_results", [])[:3]
         scholar_summaries = [f"- Title: {res.get('title')}\n  - Publication: {res.get('publication_info', {}).get('summary')}\n  - Snippet: {res.get('snippet', 'N/A')}" for res in results]
-        return "**Scholarly Articles:**\n" + "\n".join(scholar_summaries)
+        result = "**Scholarly Articles:**\n" + "\n".join(scholar_summaries)
 
     elif name == "google_news_search":
         query = arguments.get("query")
+        if not query: return "Error: Missing query."
         geo = arguments.get("geo", "US")
         params = {"engine": "google", "q": query, "gl": geo, "tbm": "nws", "num": 3, "api_key": SERPAPI_API_KEY}
         results = GoogleSearch(params).get_dict().get("news_results", [])
-        news_text = "\n[NEWS CONTEXT]:\n" + "\n".join([f"- {n.get('title')}" for n in results]) if results else "No news found."
-        return news_text
+        result = "\n[NEWS CONTEXT]:\n" + "\n".join([f"- {n.get('title')}" for n in results]) if results else "No news found."
 
     elif name == "google_simple_search":
         query = arguments.get("query")
-        api_key = get_search_api_key()
+        if not query: return "Error: Missing query."
+        api_key = get_secret("google-search-api-key")
         service = build("customsearch", "v1", developerKey=api_key)
         res = service.cse().list(q=query, cx=SEARCH_ENGINE_ID, num=5).execute()
         google_snippets = [item.get('snippet', '') for item in res.get('items', [])]
-        return "[GROUNDING_CONTENT (Fallback)]:\n" + "\n".join(google_snippets) if google_snippets else "No fallback results found."
+        result = "[GROUNDING_CONTENT (Fallback)]:\n" + "\n".join(google_snippets) if google_snippets else "No fallback results found."
 
     elif name == "detect_geo":
         query = arguments.get("query")
+        if not query: return "Error: Missing query."
         history = arguments.get("history", "")
         model = get_flash_model()
         prompt = f"""
@@ -219,12 +282,13 @@ def handle_tool_call(name, arguments):
             # We remove spaces and non-alphanumeric characters (except commas) to ensure clean codes
             raw_geo = model.generate_content(prompt).text.strip().upper()
             clean_geo = re.sub(r'[^A-Z,]', '', raw_geo)
-            return clean_geo if clean_geo else DEFAULT_GEO
+            result = clean_geo if clean_geo else DEFAULT_GEO
         except Exception:
-            return DEFAULT_GEO
+            result = DEFAULT_GEO
 
     elif name == "detect_intent":
         query = arguments.get("query")
+        if not query: return "Error: Missing query."
         model = get_flash_model()
         prompt = f"""
         Analyze the user's request to identify the primary structural goal or specific deliverable requested.
@@ -235,6 +299,7 @@ def handle_tool_call(name, arguments):
         - CHART: Visual representations (Bar charts, Pie charts, Flow diagrams, Sequence diagrams, Mindmaps).
         - LISTICLE: High-impact numbered/bulleted lists (e.g., "Top 5 reasons", "Steps to X").
         - CSV: Specific mention of spreadsheet/exportable data.
+        - VIOLATION: Prompts that are harmful, illegal, sexual, or violate safety policies. Encourage the user to seek help by calling any of the numbers on this page (https://www.nigerianmentalhealth.org/helplines) if in Nigeria
         - NONE: General drafting or information without a rigid structural request.
         
         TASK:
@@ -251,11 +316,15 @@ def handle_tool_call(name, arguments):
             raw_response = model.generate_content(prompt).text.strip()
             # Basic cleanup in case the model adds markdown code blocks
             clean_response = re.sub(r'```json|```', '', raw_response).strip()
-            return clean_response
+            result = clean_response
         except Exception:
-            return '{"intent": "NONE", "directive": ""}'
+            result = '{"intent": "NONE", "directive": ""}'
 
-    return f"Error: Tool '{name}' not found."
+    else:
+        return f"Error: Tool '{name}' implementation logic not found."
+
+    # Post-Processing: PII Scrubbing (Privacy Safety)
+    return scrub_pii(result)
 
 # --- The Lightweight MCP Messenger ---
 @app.post("/messages")
@@ -295,5 +364,6 @@ def health():
     return {"status": "ok"}
 
 if __name__ == "__main__":
+    initialize_secrets()
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)

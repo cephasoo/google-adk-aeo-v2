@@ -2,9 +2,10 @@
 import functions_framework
 from flask import jsonify
 import vertexai
-from vertexai.generative_models import GenerativeModel
 import litellm
 from litellm import completion
+from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
+import google.cloud.logging
 litellm.drop_params = True  # CRITICAL: Handle unsupported params for new models (like gpt-5)
 from vertexai.language_models import TextEmbeddingModel
 import os
@@ -29,6 +30,14 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL") 
 MAX_LOOP_ITERATIONS = 2
+
+# --- Safety Configuration (ADK/RAI Compliant) ---
+safety_settings = {
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+}
 
 # --- Global Clients ---
 model = None
@@ -111,16 +120,34 @@ class UnifiedModel:
         # Native Vertex Initialization (Only if using Google)
         if provider == "vertex_ai":
             vertexai.init(project=PROJECT_ID, location=LOCATION)
-            self._native_model = GenerativeModel(model_name)
-            print(f"✅ Loaded Native Vertex Model: {model_name}", flush=True)
+            self._native_model = GenerativeModel(model_name, safety_settings=safety_settings)
+            print(f"✅ Loaded Native Vertex Model: {model_name} (Safety Active)", flush=True)
 
     def generate_content(self, prompt, generation_config=None):
         """
-        Universal generation function.
+        Universal generation function with safety catching.
         """
         # PATH A: Native Vertex AI
         if self.provider == "vertex_ai":
-            return self._native_model.generate_content(prompt, generation_config=generation_config)
+            try:
+                response = self._native_model.generate_content(prompt, generation_config=generation_config)
+                
+                # Robust Safety Check: Some SDK versions throw exceptions, others return empty candidates
+                if not response.candidates or response.candidates[0].finish_reason == 3: # 3 = SAFETY
+                     raise ValueError("Safety Block via FinishReason")
+                
+                return response
+            except Exception as e:
+                # Catch both the ValueError we raised above AND any SDK-specific exceptions
+                print(f"⚠️ Vertex AI Safety/SDK Block: {e}")
+                log_safety_event("safety_block", {"prompt": prompt, "error": str(e)})
+                
+                # Create a Fake Vertex Response Object for fallback
+                class MockResponse:
+                    def __init__(self, content):
+                        self.text = content
+                
+                return MockResponse("I'm sorry, I cannot fulfill this request as it conflicts with my safety guardrails. Let's try rephrasing.")
 
         # PATH B: Universal Route (OpenAI / Anthropic via LiteLLM)
         else:
@@ -155,6 +182,29 @@ class UnifiedModel:
             except Exception as e:
                 print(f"❌ LiteLLM Error: {e}", flush=True)
                 raise e
+
+# --- Safety Utils ---
+def scrub_pii(text):
+    """Simple PII scrubbing for memory and logs."""
+    if not isinstance(text, str): return text
+    # Mask emails
+    text = re.sub(r'[\w\.-]+@[\w\.-]+\.\w+', '[EMAIL_MASKED]', text)
+    # Mask common phone formats
+    text = re.sub(r'\+?\d{1,3}[-.\s]?\d{3}[-.\s]?\d{3}[-.\s]?\d{4}', '[PHONE_MASKED]', text)
+    return text
+
+def log_safety_event(event_name, data):
+    """Logs safety events to Google Cloud Logging for audit traces."""
+    try:
+        logging_client = google.cloud.logging.Client()
+        logger = logging_client.logger("safety_audit")
+        logger.log_struct({
+            "event": event_name,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            **data
+        }, severity="WARNING")
+    except Exception as e:
+        print(f"Logging Block: {e}")
 
 # --- Utils ---
 # --- Input Santitation Utility ---
@@ -326,8 +376,8 @@ def fetch_article_content(url):
     return get_mcp_client().call("scrape_article", {"url": url})
     
 #2. The Internal Knowledge Retrieval Tool (MCP Refactored)
-def search_long_term_memory(query):
-    return get_mcp_client().call("rag_search", {"query": query})
+def search_long_term_memory(query, session_id):
+    return get_mcp_client().call("rag_search", {"query": query, "session_id": session_id})
 
 # --- [Removed unused local parser _parse_serp_features (now handled by MCP Server)] ---
 
@@ -360,7 +410,7 @@ def google_simple_search(query):
     return get_mcp_client().call("google_simple_search", {"query": query})
 
 # 10. The Router (Updated with "Double-Tap" Analysis)
-def find_trending_keywords(raw_topic, history_context=""):
+def find_trending_keywords(raw_topic, history_context="", session_id=None):
     """
     An intelligent meta-tool that routes a query to the best specialized search tool.
     Uses 'raw_topic' for routing to allow for "NONE" selection on conversational turns.
@@ -377,7 +427,7 @@ def find_trending_keywords(raw_topic, history_context=""):
     context_snippets = []
     
     # 1. Internal RAG (We can use raw_topic here; semantic search handles sentences well)
-    internal_context = search_long_term_memory(raw_topic)
+    internal_context = search_long_term_memory(raw_topic, session_id) if session_id else "No session_id provided for memory search."
 
     # Prepare RAG text for the prompt
     rag_text = "No relevant long-term memories found."
@@ -455,7 +505,7 @@ def find_trending_keywords(raw_topic, history_context=""):
         selected_tools = ["SIMPLE"]
 
     if any("NONE" in choice for choice in selected_tools):
-        return {"context": context_snippets, "tool_logs": tool_logs}
+        return {"context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent}
 
     # --- CATEGORICAL SHARED EXTRACTION (Efficiency + Verbose Debugging) ---
     distilled_seo_query = None
@@ -543,7 +593,7 @@ def find_trending_keywords(raw_topic, history_context=""):
                 context_snippets.append(research_context)
                 tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": raw_topic, "status": "success"})
 
-    return { "context": context_snippets, "tool_logs": tool_logs }
+    return { "context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent }
 
 
 #11. The Topic Cluster Generator
@@ -914,7 +964,7 @@ def process_story_logic(request):
     if flash_model is None:
         # Initialize Vertex AI explicitly for the Flash Model (Triage)
         vertexai.init(project=PROJECT_ID, location=LOCATION)
-        flash_model = GenerativeModel(FLASH_MODEL_NAME)
+        flash_model = GenerativeModel(FLASH_MODEL_NAME, safety_settings=safety_settings)
         
     if db is None:
         db = firestore.Client(project=PROJECT_ID)
@@ -1048,10 +1098,60 @@ def process_story_logic(request):
             for url in urls:
                 article_text = fetch_article_content(url)
                 combined_context.append(f"GROUNDING_CONTENT (Source: {url}):\n{article_text}")
-            research_data = {"context": combined_context, "tool_logs": []}
+            research_data = {"context": combined_context, "tool_logs": [], "research_intent": "URL_PROCESSING"}
         else:
-            research_data = find_trending_keywords(sanitized_topic, history_context=history_text)
+            research_data = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id)
         
+        # --- SAFETY KILL SWITCH (Hardening) ---
+        intent_metadata = research_data.get("research_intent", "")
+        is_blocked = False
+        reply_text = "I'm sorry, I cannot fulfill this request due to safety guardrails."
+        
+        if isinstance(intent_metadata, str):
+            meta_lower = intent_metadata.lower()
+            # 1. Check for the new explicit VIOLATION intent
+            if '"intent": "violation"' in meta_lower:
+                is_blocked = True
+            
+            # 2. Check for broad refusal keywords
+            refusal_keywords = ["cannot fulfill", "illegal", "refuse", "harm", "violence", "sensitive", "prohibited", "violate"]
+            if any(kw in meta_lower for kw in refusal_keywords):
+                is_blocked = True
+
+        if is_blocked:
+            print(f"🛑 Safety Kill Switch activated: {intent_metadata}")
+            log_safety_event("kill_switch_activated", {"query": original_topic, "signal": intent_metadata})
+            
+            # Try to extract a specific directive if available
+            try:
+                msg_json = json.loads(intent_metadata)
+                reply_text = msg_json.get("directive", reply_text)
+            except:
+                pass
+                
+            new_events.append({"event_type": "safety_kill", "text": reply_text})
+            
+            # Finalize Session (Same logic as Social PATH)
+            session_ref = db.collection('agent_sessions').document(session_id)
+            events_ref = session_ref.collection('events')
+            for event in new_events:
+                if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
+                events_ref.add(event)
+
+            session_ref.update({
+                "status": "blocked",
+                "type": "safety_violation",
+                "last_updated": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+            })
+            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                "session_id": session_id, 
+                "type": "social", 
+                "message": reply_text, 
+                "channel_id": slack_context['channel'], 
+                "thread_ts": slack_context['ts']
+            }, verify=True)
+            return jsonify({"msg": "Safety block applied"}), 200
+
         if "tool_logs" in research_data: new_events.extend(research_data["tool_logs"])
 
         # CHANGE: Ensure downstream functions use the raw topic too, so they see the full request
@@ -1292,11 +1392,11 @@ def ingest_knowledge(request):
     for i, (text_segment, embedding_obj) in enumerate(zip(chunks, embeddings)):
         doc_ref = db.collection('knowledge_base').document(f"{session_id}_{i}")
         
-        # 1. Set the data (Add to batch)
+        # 1. Set the data (Add to batch) - WITH PII SCRUBBING
         batch.set(doc_ref, {
-            "content": text_segment,
+            "content": scrub_pii(text_segment),
             "embedding": Vector(embedding_obj.values),
-            "topic_trigger": topic, 
+            "topic_trigger": scrub_pii(topic), 
             "source_session": session_id,
             "chunk_index": i,
             "created_at": datetime.datetime.now(datetime.timezone.utc)
