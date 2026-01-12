@@ -98,13 +98,14 @@ class EvalRunner:
             "metrics": metrics,
             "is_human_verified": False,
             "intent_evaluated": intent,
-            "evaluated_at": firestore.SERVER_TIMESTAMP
+            "evaluated_at": firestore.SERVER_TIMESTAMP,
+            "last_updated": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
         }
         
-        self.db.collection('evaluations').add(eval_data)
+        self.db.collection('evaluations').document(session_id).set(eval_data)
         
         # 5. Proactive Alerting
-        if self._should_alert(scores):
+        if self._should_alert(scores, intent):
             # We send the alert to a DEDICATED internal channel, NOT the user thread.
             self._trigger_n8n_alert(session_id, scores, source_channel, source_ts)
 
@@ -164,10 +165,14 @@ class EvalRunner:
             print(f"Scoring Error: {e}")
             return {"grounding": 0, "aeo_alignment": 0, "trajectory_integrity": 0, "tone": 0, "reasoning": f"Error during scoring: {str(e)}"}
 
-    def _should_alert(self, scores):
+    def _should_alert(self, scores, intent):
         """
-        Alerting threshold logic.
+        Alerting threshold logic. 
+        Ignores low trajectory scores for social intents.
         """
+        if intent == 'social':
+            return scores.get('grounding', 5) < 3 # Only alert if social greeting is hallucinating
+            
         if scores.get('grounding', 5) < 3 or scores.get('trajectory_integrity', 5) < 2:
             return True
         return False
@@ -247,15 +252,14 @@ class EvalRunner:
                 "elements": [
                     {
                         "type": "button",
-                        "text": {"type": "plain_text", "text": "View in Firestore", "emoji": True},
-                        "url": f"https://console.firebase.google.com/project/{PROJECT_ID}/firestore/data/~2Fevaluations~2F{session_id}",
+                        "text": {"type": "plain_text", "text": "View Evaluation", "emoji": True},
+                        "url": f"https://console.cloud.google.com/firestore/databases/-default-/data/panel/evaluations/{session_id}?project={PROJECT_ID}",
                         "style": "primary"
                     },
                     {
                         "type": "button",
                         "text": {"type": "plain_text", "text": "Session Tracker", "emoji": True},
-                        "value": session_id,
-                        "action_id": "session_id_tracker"
+                        "url": f"https://console.cloud.google.com/firestore/databases/-default-/data/panel/agent_sessions/{session_id}?project={PROJECT_ID}"
                     }
                 ]
             }

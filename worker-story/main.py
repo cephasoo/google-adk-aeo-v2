@@ -701,7 +701,7 @@ def generate_seo_metadata(article_html, topic):
         }
 
 #13. The Comprehensive Answer Generator (AEO-AWARE CONTENT STRATEGIST)
-def generate_comprehensive_answer(topic, context, history=""):
+def generate_comprehensive_answer(topic, context, history="", intent_hint="DIRECT_ANSWER"):
     """
     Standardizes the logic for generating a direct answer.
     Uses 'detect_research_intent' signal to adjust formatting (Tables/Lists).
@@ -761,6 +761,9 @@ def generate_comprehensive_answer(topic, context, history=""):
             # Visual-Only Mode: Suppress long persona filler but allow a brief summary
             # We allow 2-3 sentences of analytical context to clarify the data.
             instruction = f"CRITICAL: You are in VISUAL MODE. {intent_instruction} DO NOT provide Python code, Google Sheets instructions, or standard conversational filler. Provide a brief analytical summary (2-3 sentences max), followed ONLY by the Mermaid.js or CSV content."
+        elif intent_hint == "SIMPLE_QUESTION":
+             # NO PERSONA WRAP for simple questions.
+             instruction = "Provide a Simple, Natural, and Empathetic response based on the context. Do not use structural headers, intros, or conclusions. Just a direct answer."
         else:
             instruction = f"CRITICAL: Base answer PRIMARILY on 'GROUNDING_CONTENT'. {intent_instruction} {persona_instruction}"
     else:
@@ -768,6 +771,9 @@ def generate_comprehensive_answer(topic, context, history=""):
         if research_intent == "CHART":
              # Even without grounding, the user wants a visualization
              instruction = f"CRITICAL: You are in VISUAL MODE. {intent_instruction} Use your internal knowledge. Provide a brief analytical summary (2-3 sentences max), then ONLY the Mermaid.js content."
+        elif intent_hint == "SIMPLE_QUESTION":
+             # NO PERSONA WRAP for simple questions.
+             instruction = "Provide a Simple, Natural, and Empathetic response based on the context. Do not use structural headers, intros, or conclusions. Just a direct answer."
         else:
              instruction = f"You are a strategic partner and content architect. {persona_instruction}"
         
@@ -786,7 +792,7 @@ def generate_comprehensive_answer(topic, context, history=""):
         """
     return {
         "text": model.generate_content(prompt, generation_config={"temperature": temp}).text.strip(),
-        "intent": research_intent,
+        "intent": research_intent if intent_hint != "SIMPLE_QUESTION" else "SIMPLE_QUESTION",
         "directive": formatting_directive
     }
 
@@ -1029,7 +1035,10 @@ def process_story_logic(request):
 
             5.  **PSEO_ARTICLE**: **STRICT CMS MODE (GHOST).** Only select this if the message EXPLICITLY mentions "**pSEO**", "**Ghost**", or "**Ghost CMS**". 
 
-            6.  **DIRECT_ANSWER**: The "Collaborative Workspace" mode. Select this for EVERYTHING ELSE.
+            6.  **SIMPLE_QUESTION**: For straightforward fact-checks, definitions, or simple inquiries (e.g., "What is...", "Is it true that...", "How many..."). 
+                *   Use this when the user wants a direct, natural answer without structural headers or deep-dive analysis.
+
+            7.  **DIRECT_ANSWER**: The "Collaborative Workspace" mode. Select this for EVERYTHING ELSE.
                 *   Use this for: **Outlines**, **Strategies**, **Drafts**, **Lesson Plans**, **Research Queries**, and **Synthesis**.
                 *   This is the high-quality synthesis mode for Slack interaction.
 
@@ -1158,8 +1167,8 @@ def process_story_logic(request):
         clean_topic = sanitized_topic
 
         # 3. Generate Output based on Intent
-        if intent == "DIRECT_ANSWER":
-            answer_data = generate_comprehensive_answer(original_topic, research_data['context'], history=history_text)
+        if intent in ["DIRECT_ANSWER", "SIMPLE_QUESTION"]:
+            answer_data = generate_comprehensive_answer(original_topic, research_data['context'], history=history_text, intent_hint=intent)
             answer_text = answer_data['text']
             research_intent = answer_data['intent']
             formatting_directive = answer_data['directive']
