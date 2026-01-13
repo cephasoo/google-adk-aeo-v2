@@ -31,6 +31,15 @@ def dispatch_task(payload, target_url):
 @functions_framework.http
 def handle_feedback_workflow(request):
     req = request.get_json(silent=True)
-    # Simple pass-through
-    dispatch_task({"session_id": req['session_id'], "feedback": req['feedback']}, FEEDBACK_WORKER_URL)
+    if isinstance(req, list): req = req[0]
+    
+    # NORMALIZE: Ensure worker-compatible context exists without stripping original payload
+    if 'slack_context' not in req:
+        req['slack_context'] = {
+            "ts": req.get('slack_ts'),
+            "thread_ts": req.get('slack_thread_ts'),
+            "channel": req.get('slack_channel')
+        }
+        
+    dispatch_task(req, FEEDBACK_WORKER_URL)
     return jsonify({"msg": "Feedback accepted"}), 202

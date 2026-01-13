@@ -77,8 +77,12 @@ def process_feedback_logic(request):
         db = firestore.Client()
 
     req = request.get_json(silent=True)
-    session_id = req['session_id']
-    user_feedback = req['feedback']
+    if isinstance(req, list): req = req[0] # Add safety for n8n list payloads
+    print(f"DEBUG: Feedback Worker received payload keys: {list(req.keys()) if req else 'None'}")
+    session_id = req.get('session_id')
+    user_feedback = req.get('feedback', '')
+    images = req.get('images', []) # New sensory input array
+    print(f"DEBUG: Feedback Worker images count: {len(images)}")
     
     doc_ref = db.collection('agent_sessions').document(session_id)
     session_doc = doc_ref.get()
@@ -97,7 +101,7 @@ def process_feedback_logic(request):
             "status": "delegating_research",
             "last_updated": expire_time
             })
-        dispatch_task({"session_id": session_id, "topic": user_feedback, "slack_context": slack_context}, STORY_WORKER_URL)
+        dispatch_task({"session_id": session_id, "topic": user_feedback, "slack_context": slack_context, "images": images}, STORY_WORKER_URL)
         return jsonify({"msg": "Delegated (URL detected)"}), 200
 
     # --- ADK FIX 2: CONTEXTUAL LLM TRIAGE ---
@@ -159,14 +163,20 @@ def process_feedback_logic(request):
             "status": "delegating_research",
             "last_updated": expire_time
             })
-        dispatch_task({"session_id": session_id, "topic": user_feedback, "slack_context": slack_context}, STORY_WORKER_URL)
+        # No-Strip: Pass full payload forward
+        payload = req.copy()
+        payload.update({"topic": user_feedback})
+        dispatch_task(payload, STORY_WORKER_URL)
         return jsonify({"msg": "Delegated to Research Worker"}), 200
         
     elif intent == "APPROVE":
         # Final safety check: We ONLY proceed with finalization/ingestion if it was a strict literal approval
         if not is_strict_approval:
             print("Internal Error: APPROVE intent reached without strict literal match. Falling back to DELEGATE.")
-            dispatch_task({"session_id": session_id, "topic": user_feedback, "slack_context": slack_context}, STORY_WORKER_URL)
+            # No-Strip: Pass full payload forward
+            payload = req.copy()
+            payload.update({"topic": user_feedback})
+            dispatch_task(payload, STORY_WORKER_URL)
             return jsonify({"msg": "Fallback to research (non-verbatim approval)"}), 200
 
         ts = datetime.datetime.now(datetime.timezone.utc)
@@ -210,7 +220,10 @@ def process_feedback_logic(request):
         
         if not last_prop:
             print("Refine intent found, but no proposal exists. Delegating to story worker for clarification.")
-            dispatch_task({"session_id": session_id, "topic": user_feedback, "slack_context": slack_context}, STORY_WORKER_URL)
+            # No-Strip: Pass full payload forward
+            payload = req.copy()
+            payload.update({"topic": user_feedback})
+            dispatch_task(payload, STORY_WORKER_URL)
             return jsonify({"msg": "Delegated (Refine Fallback)"}), 200
 
         new_prop = refine_proposal(session_data.get('topic'), last_prop['proposal_data'], user_feedback)

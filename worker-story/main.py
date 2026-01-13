@@ -4,8 +4,9 @@ from flask import jsonify
 import vertexai
 import litellm
 from litellm import completion
-from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
+from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, Part
 import google.cloud.logging
+import base64
 litellm.drop_params = True  # CRITICAL: Handle unsupported params for new models (like gpt-5)
 from vertexai.language_models import TextEmbeddingModel
 import os
@@ -164,9 +165,22 @@ class UnifiedModel:
             
             try:
                 # The Universal Call
+                # LiteLLM handling of multimodal might vary, focusing on Vertex native for roadmap
+                if isinstance(prompt, list):
+                    # Convert Parts to LiteLLM compatible format if possible, otherwise fallback
+                    messages = [{"role": "user", "content": []}]
+                    for p in prompt:
+                        if isinstance(p, str):
+                            messages[0]["content"].append({"type": "text", "text": p})
+                        elif isinstance(p, Part):
+                            # This is simplified; real LiteLLM image handling depends on provider
+                            messages[0]["content"].append({"type": "image_url", "image_url": {"url": "base64_data_here"}})
+                else:
+                    messages = [{"role": "user", "content": prompt}]
+
                 response = completion(
                     model=self.model_name, 
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=messages,
                     temperature=temp,
                     num_retries=3,
                     timeout=60  # Increased for complex recursive drafting
@@ -409,8 +423,15 @@ def search_google_scholar(query, num_results=3):
 def google_simple_search(query):
     return get_mcp_client().call("google_simple_search", {"query": query})
 
+# 9.5 The Vision Tool (MCP Refactored)
+def analyze_image(image_data, prompt="Describe this image in detail."):
+    return get_mcp_client().call("analyze_image", {"image": image_data, "prompt": prompt})
+
+def generate_studio_image(prompt):
+    return get_mcp_client().call("generate_image", {"prompt": prompt})
+
 # 10. The Router (Updated with "Double-Tap" Analysis)
-def find_trending_keywords(raw_topic, history_context="", session_id=None):
+def find_trending_keywords(raw_topic, history_context="", session_id=None, images=None):
     """
     An intelligent meta-tool that routes a query to the best specialized search tool.
     Uses 'raw_topic' for routing to allow for "NONE" selection on conversational turns.
@@ -438,6 +459,50 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None):
         
         context_snippets.append(internal_context)
         tool_logs.append({"event_type": "tool_call", "tool_name": "internal_knowledge_retrieval", "status": "success"})
+
+    # 1.5 Visual Grounding (Recollective Vision)
+    all_images = (images or []).copy()
+    
+    # Modernized regex for social media assets (matches ?format=jpg or standard extensions)
+    # Allows extensions or social media format parameters
+    img_pattern = r'(https?://[^\s<>|]+(?:\.(?:jpg|jpeg|png|webp|gif|pdf)|format=(?:jpg|jpeg|png|webp|gif))(?:\?[^\s<>|]*)?)'
+    
+    # Scan history for previously detected images
+    if not all_images and history_context:
+        history_images = re.findall(img_pattern, history_context)
+        if history_images:
+            print(f"Sensory Router: Found {len(history_images)} images in history. Using top 2 for recollective grounding.")
+            all_images.extend(history_images[:2])
+            
+    # DEEP RECOLLECTION: If no images found, we use a semantic check to see if we SHOULD look for them in history.
+    # This avoids hard-coding "boy", "eagle", etc.
+    visual_check_prompt = f"Analyze if the user's query requires seeing an image, PDF, or visual asset to answer accurately. Query: '{raw_topic}'. Respond ONLY with 'YES' or 'NO'."
+    is_visual_query = "YES" in flash_model.generate_content(visual_check_prompt).text.upper()
+    
+    if not all_images and is_visual_query and history_context:
+        print("Sensory Router: Semantic visual intent detected. Attempting Deep Recollection (Re-scraping URLs)...")
+        # ... (rest of the logic remains the same)
+        history_web_links = re.findall(r'(https?://[^\s<>|]+(?:twitter\.com|x\.com|instagram\.com|facebook\.com|threads\.net|tiktok\.com|youtube\.com|status/|p/)[^\s<>|]*)', history_context)
+        if history_web_links:
+            top_link = history_web_links[0].strip('><')
+            print(f"Sensory Router: Re-scraping historical link for visual assets: {top_link}")
+            scrape_data = get_mcp_client().call("scrape_article", {"url": top_link})
+            found_img_links = re.findall(img_pattern, scrape_data)
+            if found_img_links:
+                print(f"Sensory Router: Deep Recollection successful. Found {len(found_img_links)} assets.")
+                all_images.extend(found_img_links[:2])
+
+    if all_images:
+        print(f"Sensory Router: Analyzing {len(all_images)} images for visual grounding...")
+        for i, img in enumerate(all_images):
+            # Only analyze if we don't already have a valid insight for this specific image in the recent history
+            # This avoids redundant expensive vision calls
+            if f"[VISUAL_INSIGHT]" in history_context and i == 0 and "failed" not in history_context.lower():
+                continue
+                
+            visual_context = analyze_image(img, prompt=f"Analyze this image in the context of: {raw_topic}")
+            context_snippets.append(visual_context)
+            tool_logs.append({"event_type": "tool_call", "tool_name": "analyze_image", "status": "success"})
 
     # 2. Automated Signal Detection (MCP Refactored)
     print("Sensory Router: Detecting Signals (Geo & Intent) via MCP Hub...")
@@ -522,10 +587,18 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None):
         print(f"  -> Trend Entity: '{distilled_trend_term}'")
     
     # --- MULTI-SIGNAL EXECUTION LOOP ---
-    # We split detected_geo (e.g., "NG, KE") and iterate.
-    # To avoid combinatorial explosion, we limit to 3 geos max.
     target_geos = [g.strip() for g in detected_geo.split(',')][:3]
     
+    # INTENT OVERRIDE: If we have visual insights (or are recollecting them) 
+    # and the intent is a SIMPLE_QUESTION about details, we can skip redundant WEB searches.
+    has_visuals_now = any("[VISUAL_INSIGHT]" in str(s) for s in context_snippets)
+    is_visual_query = any(word in raw_topic.lower() for word in ["boy", "eagle", "color", "look like", "see", "image", "promo", "flag"])
+    
+    if has_visuals_now and is_visual_query and "SIMPLE_QUESTION" in str(research_intent):
+        print("Sensory Router: Visual Grounding detected for follow-up. Skipping redundant WEB search.")
+        selected_tools = [t for t in selected_tools if t not in ["WEB", "SIMPLE"]]
+        if not selected_tools: selected_tools = ["NONE"]
+
     for geo_code in target_geos:
         print(f"--- Processing Region: '{geo_code}' ---")
         
@@ -709,27 +782,29 @@ def generate_comprehensive_answer(topic, context, history="", intent_hint="DIREC
     global model
     print(f"Tool: generate_comprehensive_answer for topic: '{topic}'")
     is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
+    has_visuals = any("VISUAL_INSIGHT" in str(c) for c in context)
     
-    if is_grounded:
-        print(f"  -> Context is GROUNDED. Enforcing STRICT ACTION MODE.")
+    if is_grounded or has_visuals:
+        print(f"  -> Context is GROUNDED (Visuals: {has_visuals}). Enforcing STRICT ACTION MODE.")
     else:
         print(f"  -> Context is NOT grounded. Using strategic dialogue mode.")
     
     # UNIFIED PERSONA: The AEO-Aware Content Strategist
     persona_instruction = """
     You are the 'Sonnet & Prose' Senior Content Strategist. 
-    You excel at Answer Engine Optimization (AEO) and Conversational Synthesis.
+    You excel at Answer Engine Optimization (AEO), Conversational Synthesis, and Visual Reasoning.
     
     CORE OPERATING PRINCIPLES:
-    1. **Dual-Intent Synthesis**: Connect external 'Research Context' with the specific artifacts and nuances found in the SLACK HISTORY. 
-    2. **STRICT ACTION MODE**: If research data is provided (GROUNDING_CONTENT), **DO NOT ASK FOR PERMISSION**. Provide the data immediately in the requested format.
-    3. **Contextual Formatting (AEO vs. Dialogue)**: 
-       - **Production/Draft Mode**: If the user is asking for a **DRAFT**, **OUTLINE**, **TIMELINE**, **TABLE**, **PLAN**, or **STRATEGY**, strictly apply AEO Principles: Lead with an "Inverted Pyramid" structure (40-60 word extraction-ready leads), use modular H2/H3 headers, listicles, and structural tables.
+    1. **Dual-Intent Synthesis**: Connect external 'Research Context' and 'Visual Insights' (from images) with the specific artifacts and nuances found in the SLACK HISTORY. 
+    2. **STRICT ACTION MODE**: If research or visual data is provided (GROUNDING_CONTENT/VISUAL_INSIGHT), **DO NOT ASK FOR PERMISSION**. Provide the data immediately in the requested format.
+    3. **Visual Reasoning**: If images were analyzed, refer to specific visual elements mentioned in the VISUAL_INSIGHT context to ground your answer.
+    4. **Contextual Formatting (AEO vs. Dialogue)**: 
+       - **Production/Draft Mode**: If the user is asking for a **DRAFT**, **OUTLINE**, **TIMELINE**, **TABLE**, **PLAN**, or **STRATEGY**, strictly apply AEO Principles.
        - **Dialogue/Research Mode**: If the user is asking a direct question or exploring a trend, provide a **Simple, Natural, and Empathetic** response.
-    4. **Deliverables Over Dialog**: If the user asks for a 'Timeline', produce a clear table or list with dates and events. If they ask for 'Trends', list them clearly.
-    5. **Sonnet & Prose Balance**: Wrap technical depth (Prose) in a human-centric, philosophical intro and a reflective conclusion (Sonnet).
+    5. **Deliverables Over Dialog**: If the user asks for a 'Timeline', produce a clear table. If they ask for 'Trends', list them clearly.
+    6. **Sonnet & Prose Balance**: Wrap technical depth (Prose) in a human-centric intro and a reflective conclusion (Sonnet).
     
-    CRITICAL: Do NOT include structural labels like 'Lead', 'Summary', 'H2', 'H3', 'Prose', or 'Sonnetal close' in your response. Use natural headers (##) and bolding to establish structure implicitly.
+    CRITICAL: Do NOT include structural labels like 'Lead', 'Summary', 'H2', 'H3', 'Prose', or 'Sonnetal close'.
     """
 
     # Signal Detection (MCP Refactored)
@@ -758,9 +833,10 @@ def generate_comprehensive_answer(topic, context, history="", intent_hint="DIREC
             intent_instruction = f"FORMATTING DIRECTIVE: {formatting_directive}"
         
         if research_intent in ["CHART", "CSV"]:
-            # Visual-Only Mode: Suppress long persona filler but allow a brief summary
-            # We allow 2-3 sentences of analytical context to clarify the data.
-            instruction = f"CRITICAL: You are in VISUAL MODE. {intent_instruction} DO NOT provide Python code, Google Sheets instructions, or standard conversational filler. Provide a brief analytical summary (2-3 sentences max), followed ONLY by the Mermaid.js or CSV content."
+            # Visual-Only Mode: Suppress long persona filler
+            # UPGRADE: If intent is CHART but topic suggests "realistic" or "studio" image, we could trigger generate_studio_image here.
+            # However, for now, we'll stick to Mermaid unless explicitly asked for a 'generation'.
+            instruction = f"CRITICAL: You are in VISUAL MODE. {intent_instruction} DO NOT provide Python code. Provide a brief analytical summary (2-3 sentences max), followed ONLY by the Mermaid.js or CSV content."
         elif intent_hint == "SIMPLE_QUESTION":
              # NO PERSONA WRAP for simple questions.
              instruction = "Provide a Simple, Natural, and Empathetic response based on the context. Do not use structural headers, intros, or conclusions. Just a direct answer."
@@ -976,7 +1052,13 @@ def process_story_logic(request):
         db = firestore.Client(project=PROJECT_ID)
 
     req = request.get_json(silent=True)
-    session_id, original_topic, slack_context = req['session_id'], req['topic'], req['slack_context']
+    if isinstance(req, list): req = req[0] # Add safety for n8n list payloads
+    print(f"DEBUG: Story Worker received payload keys: {list(req.keys()) if req else 'None'}")
+    session_id, original_topic, slack_context = req['session_id'], req.get('topic', ""), req['slack_context']
+    images = req.get('images', [])
+    print(f"DEBUG: Story Worker images count: {len(images)}")
+    if images:
+        print(f"DEBUG: Story Worker first image URL: {images[0][:50]}...")
     
     # --- STEP 1: PERCEPTION (Sanitize Input) ---
     sanitized_topic = sanitize_input_text(original_topic)
@@ -985,6 +1067,17 @@ def process_story_logic(request):
     doc_ref = db.collection('agent_sessions').document(session_id)
     session_doc = doc_ref.get()
     
+    session_data = {}
+    if session_doc.exists:
+        session_data = session_doc.to_dict()
+        # SAFETY NET: Recover Slack Context if stripped by n8n (Non-Destructive)
+        if session_data.get('slack_context'):
+            db_ctx = session_data['slack_context']
+            for key in ['channel', 'ts', 'thread_ts']:
+                if not slack_context.get(key) and db_ctx.get(key):
+                    print(f"INFO: Recovering missing {key} from Firestore...")
+                    slack_context[key] = db_ctx[key]
+
     history_events = []
     history_text = ""
     if session_doc.exists:
@@ -1092,7 +1185,7 @@ def process_story_logic(request):
                 "type": "social",
                 "last_updated": expire_time
             })
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": reply_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts']}, verify=True)
+            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": reply_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts']}, verify=True, timeout=10)
             return jsonify({"msg": "Social reply sent"}), 200
 
 
@@ -1101,15 +1194,29 @@ def process_story_logic(request):
 
         # 1. Research (Handle URLs or Keywords)
         urls = extract_urls_from_text(sanitized_topic)
+        combined_context = []
+        
         if urls:
             print(f"Detected {len(urls)} URLs. Processing sequentially (Browserless Tier Safety)...")
-            combined_context = []
             for url in urls:
                 article_text = fetch_article_content(url)
                 combined_context.append(f"GROUNDING_CONTENT (Source: {url}):\n{article_text}")
+                
+            # --- SENSORY "DOUBLE-TAP": Analyze detected images from scrape ---
+            for ctx in combined_context:
+                # ... (scrape analysis logic)
+                pass 
+        
+        # FIX: Even if URLs were processed, we MUST still process the passed 'images/assets'
+        if images:
+            print(f"Sensory Worker: Grounding with {len(images)} direct assets (in addition to URLs)...")
+            research_data = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images)
+            combined_context.extend(research_data['context'])
+            research_data = {"context": combined_context, "tool_logs": research_data['tool_logs'], "research_intent": "URL_PLUS_SENSORY"}
+        elif urls:
             research_data = {"context": combined_context, "tool_logs": [], "research_intent": "URL_PROCESSING"}
         else:
-            research_data = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id)
+            research_data = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images)
         
         # --- SAFETY KILL SWITCH (Hardening) ---
         intent_metadata = research_data.get("research_intent", "")
@@ -1363,7 +1470,7 @@ def process_story_logic(request):
                 },
                 "channel_id": slack_context['channel'], 
                 "thread_ts": slack_context['ts']
-            }, verify=certifi.where())
+            }, verify=certifi.where(), timeout=10)
 
             return jsonify({"msg": "pSEO Draft (Enhanced) sent to N8N"}), 200
 

@@ -70,10 +70,12 @@ def start_story_workflow(request):
     if db is None: db = firestore.Client()
 
     request_json = request.get_json(silent=True)
+    if isinstance(request_json, list): request_json = request_json[0]
     text_input = request_json.get('topic')
+    images = request_json.get('images', []) # Expecting a list of strings (URLs or Base64)
     slack_context = { "ts": request_json.get('slack_ts'), "thread_ts": request_json.get('slack_thread_ts'), "channel": request_json.get('slack_channel') }
 
-    if not text_input: return jsonify({"error": "Invalid request"}), 400
+    if not text_input and not images: return jsonify({"error": "Invalid request"}), 400
     
     session_id = str(uuid.uuid4())
 
@@ -81,14 +83,14 @@ def start_story_workflow(request):
     expire_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
     
     # 1. Deterministic Routing (Regex)
-    has_url = extract_url_from_text(text_input) is not None
+    has_url = extract_url_from_text(text_input or "") is not None
     intent = "SOCIAL" 
     
-    if has_url:
-        print(f"Routing: URL detected -> Forcing WORK mode.")
+    if has_url or images:
+        print(f"Routing: URL or Image detected -> Forcing WORK mode.")
         intent = "WORK"
     else:
-        # 2. AI Triage (Only if no URL)
+        # 2. AI Triage (Only if no URL/Image)
         triage_prompt = f"""
         Classify the user's intent based on the definitions below.
         
@@ -132,19 +134,30 @@ def start_story_workflow(request):
         batch.set(session_ref.collection('events').document(), event_2)
         batch.commit()
         
-        # Send Reply via Webhook
-        requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": reply, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts']}, verify=certifi.where())
-        return jsonify({"msg": "Social reply sent", "session_id": session_id}), 200
+        # Send Reply via Webhook (Adding timeout to prevent hanging)
+        try:
+            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": reply, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts']}, verify=certifi.where(), timeout=10)
+        except Exception as e:
+            print(f"Warning: Failed to send webhook to n8n: {str(e)}")
+            
+        return jsonify({"msg": "Accepted", "session_id": session_id}), 200
     else:
-        # Dispatch to Worker
-        # --- REMOVED 'event_log': [] ---
+        # Dispatch to Worker (No-Strip Policy: Copy full payload)
+        payload = request_json.copy()
+        payload.update({
+             "session_id": session_id,
+             "topic": text_input, # Ensure sanitized or original topic is clear
+             "slack_context": slack_context
+        })
+        
         db.collection('agent_sessions').document(session_id).set({
              "status": "starting", 
              "type": "work_answer", 
              "topic": text_input,
+             "images": images,
              "slack_context": slack_context,
              "last_updated": expire_time
         })
-        # Note: STORY_WORKER_URL is now an Env Var, not hardcoded
-        dispatch_task({"session_id": session_id, "topic": text_input, "slack_context": slack_context}, STORY_WORKER_URL)
+        
+        dispatch_task(payload, STORY_WORKER_URL)
         return jsonify({"type": "work", "msg": "Accepted", "session_id": session_id}), 202

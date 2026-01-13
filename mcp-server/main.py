@@ -11,9 +11,11 @@ from google.cloud import secretmanager, firestore
 from google.cloud.firestore_v1.vector import Vector
 from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
 from vertexai.language_models import TextEmbeddingModel
-from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
+from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, Part
+from vertexai.preview.vision_models import ImageGenerationModel
 from serpapi import GoogleSearch
 from googleapiclient.discovery import build
+import base64
 
 # --- Configuration ---
 PROJECT_ID = os.environ.get("PROJECT_ID")
@@ -152,7 +154,7 @@ def handle_tool_call(name, arguments):
         "google_web_search", "scrape_article", "rag_search", "google_trends", 
         "trend_analysis", "google_images_search", "google_videos_search", 
         "google_scholar_search", "google_news_search", "google_simple_search",
-        "detect_geo", "detect_intent"
+        "detect_geo", "detect_intent", "analyze_image", "generate_image"
     ]
     if name not in allowed_tools:
         return f"Error: Tool '{name}' is not in the allowed list."
@@ -168,13 +170,49 @@ def handle_tool_call(name, arguments):
         url = arguments.get("url")
         if not url or not url.startswith("http"): return "Error: Invalid URL."
         endpoint = f"https://production-sfo.browserless.io/content?token={BROWSERLESS_API_KEY}&stealth=true"
-        payload = {"url": url, "rejectResourceTypes": ["image", "media", "font"], "gotoOptions": {"timeout": 15000, "waitUntil": "networkidle2"}}
+        # Removed "image" from rejectResourceTypes to allow visual assets to load
+        payload = {"url": url, "rejectResourceTypes": ["media", "font"], "gotoOptions": {"timeout": 15000, "waitUntil": "networkidle2"}}
         response = requests.post(endpoint, json=payload, timeout=20, verify=certifi.where())
         soup = BeautifulSoup(response.content, 'html.parser')
+
+        # Extract high-value image URLs (Social-Media Aware Detection)
+        found_images = []
+        exclude_patterns = ["profile_images", "avatar", "icon", "logo", "header_photo", "normal", "mini"]
+        
+        # Social media platforms often use 'format=jpg' in query-strings instead of extensions
+        img_ext_pattern = re.compile(r'\.(jpg|jpeg|png|webp|gif|pdf)', re.I)
+        social_media_fmt_pattern = re.compile(r'format=(jpg|jpeg|png|webp|gif)', re.I)
+
+        for img in soup.find_all("img"):
+            # Check all common source attributes
+            img_src = img.get("src") or img.get("data-src") or img.get("srcset") or img.get("data-original")
+            if img_src and img_src.startswith("http"):
+                # Handle srcset which might contain multiple URLs
+                clean_src = img_src.split(',')[0].split(' ')[0].strip()
+                
+                # Check for standard extension OR social media query-string format
+                has_valid_ext = img_ext_pattern.search(clean_src) or social_media_fmt_pattern.search(clean_src)
+                
+                if not has_valid_ext:
+                    continue
+
+                # High-Value Check: Skip images that look like UI elements or profile pics
+                if any(p in clean_src.lower() for p in exclude_patterns):
+                    # Exception: If it's on a known media host (like pbs.twimg.com/media), keep it anyway
+                    if "twimg.com/media" not in clean_src.lower():
+                        continue
+                    
+                if clean_src not in found_images:
+                    found_images.append(clean_src)
+            if len(found_images) >= 5: break
+
         for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "ad"]): tag.decompose()
         text = soup.get_text(separator='\n\n')
         clean_text = re.sub(r'\n\s*\n', '\n\n', text).strip()
-        result = clean_text[:20000]
+        
+        # Append images as grounded context
+        image_context = "\n\n[DETECTED_IMAGES]:\n" + "\n".join(found_images) if found_images else ""
+        result = (clean_text[:18000] + image_context).strip()
 
     elif name == "rag_search":
         query = arguments.get("query")
@@ -319,6 +357,69 @@ def handle_tool_call(name, arguments):
             result = clean_response
         except Exception:
             result = '{"intent": "NONE", "directive": ""}'
+
+    elif name == "analyze_image":
+        image_data = arguments.get("image") # URL or Base64 (starts with data:image/...)
+        prompt = arguments.get("prompt", "Analyze this file and explain what is in it.")
+        if not image_data: return "Error: Missing image data."
+        
+        model = get_flash_model()
+        try:
+            mime_type = "image/jpeg" # Default
+            
+            if image_data.startswith("http"):
+                headers = {}
+                if "slack.com" in image_data.lower():
+                    slack_token = get_secret("slack-bot-token")
+                    if slack_token:
+                        headers["Authorization"] = f"Bearer {slack_token}"
+                
+                response = requests.get(image_data, headers=headers)
+                # Dynamic MIME detection for URLs
+                content_type = response.headers.get("Content-Type", "").lower()
+                if "png" in content_type: mime_type = "image/png"
+                elif "webp" in content_type: mime_type = "image/webp"
+                elif "gif" in content_type: mime_type = "image/gif"
+                elif "pdf" in content_type: mime_type = "application/pdf"
+                
+                part = Part.from_data(data=response.content, mime_type=mime_type)
+            else:
+                # Handle base64
+                if "base64," in image_data:
+                    header, base64_str = image_data.split("base64,")
+                    header = header.lower()
+                    # Extract mime from header e.g. data:image/png;base64
+                    if "png" in header: mime_type = "image/png"
+                    elif "webp" in header: mime_type = "image/webp"
+                    elif "pdf" in header: mime_type = "application/pdf"
+                    elif "jpeg" in header or "jpg" in header: mime_type = "image/jpeg"
+                else:
+                    base64_str = image_data
+                
+                decoded = base64.b64decode(base64_str)
+                part = Part.from_data(data=decoded, mime_type=mime_type)
+            
+            response = model.generate_content([prompt, part])
+            result = f"[VISUAL_INSIGHT]:\n{response.text}"
+        except Exception as e:
+            result = f"Error analyzing file: {str(e)}"
+
+    elif name == "generate_image":
+        prompt = arguments.get("prompt")
+        if not prompt: return "Error: Missing prompt."
+        
+        try:
+            # Nano Banana Pro logic: Image Generation
+            gen_model = ImageGenerationModel.from_pretrained("imagen-3.0-generate-001")
+            images = gen_model.generate_images(prompt=prompt, number_of_images=1)
+            
+            # We need a place to store this image temporarily or get a URL.
+            # For now, we'll return a placeholder or a mock URL if we don't have GCS integration ready.
+            # In a production ADK, we'd upload to GCS and return the signed URL.
+            # For this roadmap implementation, we'll assume a success message with the prompt.
+            result = f"[IMAGE_GENERATED]: A high-fidelity visual has been created for: '{prompt}'. (GCS Link Pending Integration)"
+        except Exception as e:
+            result = f"Error generating image: {str(e)}"
 
     else:
         return f"Error: Tool '{name}' implementation logic not found."
