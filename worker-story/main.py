@@ -1114,7 +1114,9 @@ def process_story_logic(request):
             Analyze the user's latest message in the context of the conversation history.
             Classify the PRIMARY GOAL into one of five categories:
 
-            1.  **SOCIAL_CONVERSATION**: Greetings, small talk, or simple feedback (e.g. "Okay", "Thanks").
+            1.  **SOCIAL_CONVERSATION**: Greetings, small talk, simple feedback, or **casual replies to the agent's questions**.
+                *   *Triggers:* "Okay", "Thanks", "Hello", "How are you", or providing a short answer to an agent's conversational prompt (e.g., answering "What's brewing?" with "Heineken").
+                *   *Rule:* If the user is just continuing a friendly chat without asking for a draft, research, or a direct answer, pick this.
 
             2.  **DEEP_DIVE**: **LONG-FORM ARCHITECTURE.** Select this if the user asks for a specific word count OR uses major drafting keywords.
                 *   *Triggers:* "800 words", "1500 words", "Deep dive", "Draft an article", "Write a post", "Detailed draft", "Comprehensive article".
@@ -1133,7 +1135,7 @@ def process_story_logic(request):
 
             7.  **DIRECT_ANSWER**: The "Collaborative Workspace" mode. Select this for EVERYTHING ELSE.
                 *   Use this for: **Outlines**, **Strategies**, **Drafts**, **Lesson Plans**, **Research Queries**, and **Synthesis**.
-                *   This is the high-quality synthesis mode for Slack interaction.
+                *   *CRITICAL:* If the user just mentions a topic without a specific question or command (e.g., answering a greeting like "What's brewing?"), use SOCIAL_CONVERSATION instead.
 
             CONVERSATION HISTORY:
             {history_text}
