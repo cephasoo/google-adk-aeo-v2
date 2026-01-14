@@ -674,23 +674,32 @@ def generate_topic_cluster(topic, context, history=""):
     global model
     print("Tool: Topic Cluster Generator")
     prompt = f"""
-    You are a master Content Strategist.
+    You are a world-class SEO Strategist and Content Architect.
     
     Conversation History: {history}.
     
-    User wants pillar page on "{topic}".
+    Your task is to generate a comprehensive TOPIC CLUSTER PROPOSAL for a pillar page on: "{topic}".
     
+    EXPERT SEO PRINCIPLES:
+    1. **Semantic Ecosystems (Entities over Strings):** Do not just match keywords. Identify the core concepts and entities (vocabulary of authority) required to be seen as an expert.
+    2. **User Journey Maps:** Align clusters with the user's path from "Problem Awareness" (Informational/Top-of-funnel) to "Solution" (Transactional/Middle/Bottom-of-funnel).
+    3. **Topical Authority Graphs:** Cover the topic's "nooks and crannies" to prove comprehensive expertise and create a defensive moat.
+    4. **Information Architecture (The Library Model):** Ensure the structure follows a logical internal linking blueprint from the Master Pillar to supporting sub-topics.
+
     CONTEXT: {context}
 
     CRITICAL: Respond with a JSON object following this exact schema:
     {{
-    
-      "pillar_page_title": "[Topic]",
-
+      "pillar_page_title": "[The optimized H1 title for the pillar page]",
       "clusters": [
-        {{ "cluster_title": "...", "sub_topics": ["...", "..."] }}
+        {{ 
+          "cluster_title": "[Core Entity/Broad Category Title]", 
+          "sub_topics": [
+            "[Long-tail query / Specific concept - Stage: (Awareness/Comparison/Transactional)]", 
+            "..." 
+          ] 
+        }}
       ]
-
     }}
     """
     response = model.generate_content(prompt)
@@ -1122,16 +1131,23 @@ def process_story_logic(request):
                 *   *Triggers:* "800 words", "1500 words", "Deep dive", "Draft an article", "Write a post", "Detailed draft", "Comprehensive article".
                 *   *Priority:* If a word count is mentioned, ALWAYS pick this over TOPIC_CLUSTER.
 
-            3.  **TOPIC_CLUSTER_PROPOSAL**: **SEMANTIC ARCHITECTURE.** The user specifically wants to generate a hierarchical map of keywords to establish topical authority. 
-                *   Use this for: **Keyword fanning out** from a seed topic, mapping primary/secondary clusters.
-                *   *CRITICAL:* If the user asks to "Write", "Draft", or "Expand" into a full piece, this is NOT a cluster.
+            3.  **TOPIC_CLUSTER_PROPOSAL**: **SEMANTIC ARCHITECTURE GENERATION.** The user specifically wants to *create or generate* a new hierarchical map of keywords to establish topical authority. 
+                *   *CRITICAL:* If the user is asking to **analyze** a post against an existing cluster, evaluate if a post "satisfies" a cluster, or asks a question *about* a cluster, e.g. how could we enhance an existing cluster, this is **NOT** a proposal. 
+                *   *Rule:* Use this ONLY for the act of *fanning out* semantically related keyword structures from a seed topic.
+                *   *Expert SEO Lenses:*
+                    - **Semantic Architecture:** Take the broad term (topic) and branch it into specific long-tail queries determined by the user's implied intent(s) for the topic or stages of the buyer's journey.
+                    - **Semantic Ecosystems:** Identifying concepts and entities (vocabulary of authority), not just text strings.
+                    - **User Journey Maps:** Aligning sub-topics with the path from "Problem Awareness" (Top-of-funnel) to "Solution" (Bottom-of-funnel).
+                    - **Topical Authority Graphs:** Covering every "nook and cranny" to prove expertise and create a defensive moat.
+                    - **Information Architecture:** Providing a logical structure (Dewey Decimal System) for internal linking from the Master Pillar to supporting docs.
 
             4.  **THEN_VS_NOW_PROPOSAL**: Specifically asking for a human-centric 'Then vs Now' structured comparison.
 
             5.  **PSEO_ARTICLE**: **STRICT CMS MODE (GHOST).** Only select this if the message EXPLICITLY mentions "**pSEO**", "**Ghost**", or "**Ghost CMS**". 
 
-            6.  **SIMPLE_QUESTION**: For straightforward fact-checks, definitions, or simple inquiries (e.g., "What is...", "Is it true that...", "How many..."). 
-                *   Use this when the user wants a direct, natural answer without structural headers or deep-dive analysis.
+            6.  **SIMPLE_QUESTION**: For straightforward fact-checks, definitions, simple inquiries, or **direct analysis requests**.
+                *   *Triggers:* "Does this satisfy X?", "Evaluate this", "Compare this", or explicitly asking for a "direct response" or "direct answer".
+                *   *Rule:* If the user asks for a "direct response", choose this to bypass structured/hierarchical formats.
 
             7.  **DIRECT_ANSWER**: The "Collaborative Workspace" mode. Select this for EVERYTHING ELSE.
                 *   Use this for: **Outlines**, **Strategies**, **Drafts**, **Lesson Plans**, **Research Queries**, and **Synthesis**.
@@ -1142,7 +1158,8 @@ def process_story_logic(request):
 
             USER REQUEST: "{original_topic}"
 
-            CRITICAL: Respect the 'PSEO_ARTICLE' keyword rule. Handle TOPIC_CLUSTER as a technical semantic task. Respond with ONLY the category name.
+            CRITICAL: Respect the 'PSEO_ARTICLE' keyword rule. Handle TOPIC_CLUSTER only as a generation task. If the user asks for a "direct response" or is analyzing content, use SIMPLE_QUESTION. Respond with ONLY the category name.
+
             """
         intent = flash_model.generate_content(triage_prompt).text.strip()
         print(f"Smart Triage V5.4 classified intent as: {intent}")
@@ -1344,7 +1361,6 @@ def process_story_logic(request):
 
         elif intent == "TOPIC_CLUSTER_PROPOSAL":
             cluster_data = generate_topic_cluster(clean_topic, research_data['context'], history=history_text)
-            formatted_cluster = f"Here is the topic cluster you requested:\n```\n{json.dumps(cluster_data, indent=2)}\n```"
             new_events.append({"event_type": "agent_answer", "proposal_type": "topic_cluster", "data": cluster_data})
             
             # Writing to a Sub-collection
@@ -1362,7 +1378,15 @@ def process_story_logic(request):
                 "slack_context": slack_context,
                 "last_updated": expire_time
             })
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": formatted_cluster, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts']}, verify=True)
+            
+            # Use structured payload for N8N rendering
+            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                "session_id": session_id, 
+                "type": "topic_cluster", 
+                "payload": cluster_data,
+                "channel_id": slack_context['channel'], 
+                "thread_ts": slack_context['ts']
+            }, verify=True)
             return jsonify({"msg": "Topic cluster sent"}), 200
 
         elif intent == "THEN_VS_NOW_PROPOSAL":
