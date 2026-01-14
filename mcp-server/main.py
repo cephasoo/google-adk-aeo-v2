@@ -143,7 +143,7 @@ def handle_tool_call(name, arguments):
     Central dispatcher for all sensory tools.
     Logs every call for real-time debugging and enforces validation/scrubbing.
     """
-    print(f"MCP Hub: Handling tool call '{name}' with args: {arguments}")
+    print(f"MCP Hub: Calling Tool [{name}] | Args: {json.dumps(arguments)}")
     
     # Tool-Level Input Validation (Architectural Safety)
     if not name or not isinstance(arguments, dict):
@@ -332,13 +332,13 @@ def handle_tool_call(name, arguments):
         Analyze the user's request to identify the primary structural goal or specific deliverable requested.
         
         CATEGORIES:
-        - TIMELINE: Progression of events over time.
-        - TABLE: Comparative data or technical specs.
-        - CHART: Visual representations (Bar charts, Pie charts, Flow diagrams, Sequence diagrams, Mindmaps).
-        - LISTICLE: High-impact numbered/bulleted lists (e.g., "Top 5 reasons", "Steps to X").
-        - CSV: Specific mention of spreadsheet/exportable data.
-        - VIOLATION: Prompts that are harmful, illegal, sexual, or violate safety policies. Encourage the user to seek help by calling any of the numbers on this page (https://www.nigerianmentalhealth.org/helplines) if in Nigeria
-        - NONE: General drafting or information without a rigid structural request.
+        - FORMAT_TIMELINE: Progression of events over time.
+        - FORMAT_TABLE: Comparative data or technical specs.
+        - FORMAT_CHART: Visual representations (Bar charts, Pie charts, Flow diagrams, Sequence diagrams, Mindmaps).
+        - FORMAT_LISTICLE: High-impact numbered/bulleted lists (e.g., "Top 5 reasons", "Steps to X").
+        - FORMAT_CSV: Specific mention of spreadsheet/exportable data.
+        - SIGNAL_BLOCK: Prompts that are harmful, illegal, sexual, or violate safety policies. Encourage the user to seek help by calling any of the numbers on this page (https://www.nigerianmentalhealth.org/helplines) if in Nigeria
+        - FORMAT_GENERAL: General drafting or information without a rigid structural request.
         
         TASK:
         Return a JSON string with two fields:
@@ -356,7 +356,7 @@ def handle_tool_call(name, arguments):
             clean_response = re.sub(r'```json|```', '', raw_response).strip()
             result = clean_response
         except Exception:
-            result = '{"intent": "NONE", "directive": ""}'
+            result = '{"intent": "FORMAT_GENERAL", "directive": ""}'
 
     elif name == "analyze_image":
         image_data = arguments.get("image") # URL or Base64 (starts with data:image/...)
@@ -425,7 +425,9 @@ def handle_tool_call(name, arguments):
         return f"Error: Tool '{name}' implementation logic not found."
 
     # Post-Processing: PII Scrubbing (Privacy Safety)
-    return scrub_pii(result)
+    scrubbed_result = scrub_pii(result)
+    print(f"MCP Hub: Tool [{name}] execution complete. Output size: {len(str(scrubbed_result))} chars.")
+    return scrubbed_result
 
 # --- The Lightweight MCP Messenger ---
 @app.post("/messages")

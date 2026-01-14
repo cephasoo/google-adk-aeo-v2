@@ -207,6 +207,22 @@ def scrub_pii(text):
     text = re.sub(r'\+?\d{1,3}[-.\s]?\d{3}[-.\s]?\d{3}[-.\s]?\d{4}', '[PHONE_MASKED]', text)
     return text
 
+def detect_audience_context(history):
+    """
+    Search conversation history for tone or audience instructions (e.g., "8th-grader").
+    Returns a string describing the target audience.
+    """
+    default = "Senior Marketers, CTOs, and Founders. They value depth, nuance, and honesty over hype."
+    if not history: return default
+    
+    hist_lower = history.lower()
+    if "8-grader" in hist_lower or "8th grade" in hist_lower or "simple" in hist_lower:
+         return "An 8th-grader. Use extremely simple words, short sentences, and clear analogies. Avoid jargon."
+    elif "non-technical" in hist_lower:
+         return "Non-technical business owners. Focus on value and 'what it does' rather than 'how it works'."
+    
+    return default
+
 def log_safety_event(event_name, data):
     """Logs safety events to Google Cloud Logging for audit traces."""
     try:
@@ -434,7 +450,7 @@ def generate_studio_image(prompt):
 def find_trending_keywords(raw_topic, history_context="", session_id=None, images=None):
     """
     An intelligent meta-tool that routes a query to the best specialized search tool.
-    Uses 'raw_topic' for routing to allow for "NONE" selection on conversational turns.
+    Uses 'raw_topic' for routing to allow for "USE_CONVERSATIONAL_CONTEXT" selection on conversational turns.
     
     UPGRADE: The 'ANALYSIS' tool now performs a "Double-Tap":
     1. Fetches Trend Stats (Quant)
@@ -442,7 +458,9 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     This prevents "blind" statistical answers (e.g., seeing a spike but not knowing why).
     """
     global model, flash_model
-    print(f"Tool: find_trending_keywords (Sensory Array) for RAW topic: '{raw_topic}'")
+    # --- MONITORING: Router Invocation ---
+    print(f"DEBUG: find_trending_keywords invoked for topic: '{raw_topic}'")
+    if images: print(f"DEBUG: Grounding with {len(images)} images.")
     
     tool_logs = []
     context_snippets = []
@@ -507,8 +525,17 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     # 2. Automated Signal Detection (MCP Refactored)
     print("Sensory Router: Detecting Signals (Geo & Intent) via MCP Hub...")
     detected_geo = mcp_detect_geo(raw_topic, history=history_context)
-    research_intent = mcp_detect_intent(raw_topic)
-    print(f"  -> Signal Detected | Geo: '{detected_geo}' | Intent: '{research_intent}'")
+    research_intent_raw = mcp_detect_intent(raw_topic)
+    print(f"  -> Signal Detected | Geo: '{detected_geo}' | Intent: '{research_intent_raw}'")
+    
+    # Parse for the prompt context to avoid JSON clutter
+    try:
+        intent_json = json.loads(research_intent_raw)
+        detected_intent_key = intent_json.get("intent", "FORMAT_GENERAL")
+    except:
+        detected_intent_key = "FORMAT_GENERAL"
+        
+    print(f"  -> Signal Detected | Geo: '{detected_geo}' | Intent: '{detected_intent_key}'")
     
     # 3. Sensory Array Router (Decides based on RAW input)
     tool_choice_prompt = f"""
@@ -523,17 +550,17 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     USER'S CORE QUERY: '{raw_topic}'
     
     ### DETECTED CONTEXT (MCP Hub Signals):
-    - PRIMARY GEO TARGET: '{detected_geo}' (System will default to '{detected_geo}')
-    - REQUESTED INTENT: '{research_intent}'
+    - PRIMARY GEO TARGET: '{detected_geo}'
+    - REQUESTED FORMAT INTENT: '{detected_intent_key}'
 
     ### DECISION PROTOCOL (CHECK IN ORDER):
     1. **CHECK HISTORY (Priority #1):**
-        - If the user is asking for information (or a REFORMATTING like an OUTLINE) that CAN BE GATHERED from the "LONG-TERM MEMORY" or "CONVERSATION HISTORY", select **NONE**.
-        - If the history contains the FACTUAL CONTENT needed but the user wants a new structure (e.g. "Create an outline for the above"), select **NONE**.
-        - **INTERPRETIVE EXCEPTION:** If the user asks for **REASONS**, **DRIVERS**, **CAUSES**, or **"WHY"** (and the history only contains stats/numbers), **DO NOT** select NONE. Proceed to research.
+        - If the user is asking for information (or a REFORMATTING like an OUTLINE) that CAN BE GATHERED from the "LONG-TERM MEMORY" or "CONVERSATION HISTORY", select **USE_CONVERSATIONAL_CONTEXT**.
+        - If the history contains the FACTUAL CONTENT needed but the user wants a new structure (e.g. "Create an outline for the above"), select **USE_CONVERSATIONAL_CONTEXT**.
+        - **INTERPRETIVE EXCEPTION:** If the user asks for **REASONS**, **DRIVERS**, **CAUSES**, or **"WHY"** (and the history only contains stats/numbers), **DO NOT** select USE_CONVERSATIONAL_CONTEXT. Proceed to research.
 
     2. **CHECK CREATIVE INTENT (Priority #2):**
-        - If the user asks you to **DRAFT**, **CREATE**, or **WRITE** content for an entity that is clearly **INVENTED**, **FICTIONAL**, or defined in history, select **NONE**.
+        - If the user asks you to **DRAFT**, **CREATE**, or **WRITE** content for an entity that is clearly **INVENTED**, **FICTIONAL**, or defined in history, select **USE_CONVERSATIONAL_CONTEXT**.
 
     3. **NEW RESEARCH (Priority #3):**
         - If the user wants you to gather NEW information not in history, use a tool below.
@@ -548,14 +575,14 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     - TRENDS: For viral awareness. Select ONLY for measuring "What is trending" or "Viral topics" in a specific region.
     - ANALYSIS: For historical trajectory. Select ONLY for "Interest over time" or "Growth metrics".
     - SIMPLE: General web searches for broad definitions.
-    - NONE: Select this for **Composition**, **Formatting**, or **Incremental Refinement** using information already established in the conversation.
+    - USE_CONVERSATIONAL_CONTEXT: Select this for **Composition**, **Formatting**, or **Incremental Refinement** using information already established in the conversation.
         *   Examples: "Write a draft", "Create an outline", "Summarize our notes", "Refine the tone", "Include more detail on [Topic A]", write about a hypothetical or user-defined entity.
 
     ### DECISION REASONING:
     - If a request combines **Drafting** with **Research Intent** (e.g. "Draft a deep-dive based on new research"), the priority is to select **WEB** + any other necessary tools.
-    - If a request is purely about **Execution/Form** based on existing knowledge, select **NONE**.
+    - If a request is purely about **Execution/Form** based on existing knowledge, select **USE_CONVERSATIONAL_CONTEXT**.
 
-    Respond ONLY with the tool selection(s), comma-separated (e.g., "WEB, ANALYSIS" or "IMAGES" or "NONE").
+    Respond ONLY with the tool selection(s), comma-separated (e.g., "WEB, ANALYSIS" or "IMAGES" or "USE_CONVERSATIONAL_CONTEXT").
     Do not add country codes; the system handles locations via the MCP signals.
     """
     # 4. Robust Parsing Logic
@@ -564,13 +591,13 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
         clean_response = raw_response.replace("*", "").replace("`", "").replace("'", "").replace('"', "").rstrip(".")
         
         selected_tools = [t.strip() for t in clean_response.split(',')]
-        print(f"Sensory Array decided on tools: {selected_tools} (Detected Geo: {detected_geo})")
+        print(f"TELEMETRY: Router decided on Strategy: {selected_tools} | Target Geo: {detected_geo}")
     except Exception as e:
         print(f"Router Parse Error: {e}. Defaulting to SIMPLE.")
         selected_tools = ["SIMPLE"]
 
-    if any("NONE" in choice for choice in selected_tools):
-        return {"context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent}
+    if any("USE_CONVERSATIONAL_CONTEXT" in choice for choice in selected_tools):
+        return {"context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent_raw}
 
     # --- CATEGORICAL SHARED EXTRACTION (Efficiency + Verbose Debugging) ---
     distilled_seo_query = None
@@ -597,7 +624,7 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     if has_visuals_now and is_visual_query and "SIMPLE_QUESTION" in str(research_intent):
         print("Sensory Router: Visual Grounding detected for follow-up. Skipping redundant WEB search.")
         selected_tools = [t for t in selected_tools if t not in ["WEB", "SIMPLE"]]
-        if not selected_tools: selected_tools = ["NONE"]
+        if not selected_tools: selected_tools = ["USE_CONVERSATIONAL_CONTEXT"]
 
     for geo_code in target_geos:
         print(f"--- Processing Region: '{geo_code}' ---")
@@ -666,7 +693,7 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
                 context_snippets.append(research_context)
                 tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": raw_topic, "status": "success"})
 
-    return { "context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent }
+    return { "context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent_raw }
 
 
 #11. The Topic Cluster Generator
@@ -783,29 +810,35 @@ def generate_seo_metadata(article_html, topic):
         }
 
 #13. The Comprehensive Answer Generator (AEO-AWARE CONTENT STRATEGIST)
-def generate_comprehensive_answer(topic, context, history="", intent_hint="DIRECT_ANSWER"):
+def generate_comprehensive_answer(topic, context, history="", intent_hint="DIRECT_ANSWER", intent_metadata=None):
     """
     Standardizes the logic for generating a direct answer.
     Uses 'detect_research_intent' signal to adjust formatting (Tables/Lists).
     """
     global model
-    print(f"Tool: generate_comprehensive_answer for topic: '{topic}'")
+    print(f"DEBUG: generate_comprehensive_answer starting... [Topic: {topic[:50]}]")
     is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
     has_visuals = any("VISUAL_INSIGHT" in str(c) for c in context)
     
     if is_grounded or has_visuals:
-        print(f"  -> Context is GROUNDED (Visuals: {has_visuals}). Enforcing STRICT ACTION MODE.")
+        print(f"  -> Context is GROUNDED (Visuals: {has_visuals}). Enforcing Data-Lead Execution.")
     else:
         print(f"  -> Context is NOT grounded. Using strategic dialogue mode.")
     
+    # AUDIENCE DETECTION: Search history for tone instructions
+    audience_context = detect_audience_context(history)
+
     # UNIFIED PERSONA: The AEO-Aware Content Strategist
-    persona_instruction = """
+    persona_instruction = f"""
     You are the 'Sonnet & Prose' Senior Content Strategist. 
     You excel at Answer Engine Optimization (AEO), Conversational Synthesis, and Visual Reasoning.
     
+    AUDIENCE: 
+    {audience_context}
+    
     CORE OPERATING PRINCIPLES:
     1. **Dual-Intent Synthesis**: Connect external 'Research Context' and 'Visual Insights' (from images) with the specific artifacts and nuances found in the SLACK HISTORY. 
-    2. **STRICT ACTION MODE**: If research or visual data is provided (GROUNDING_CONTENT/VISUAL_INSIGHT), **DO NOT ASK FOR PERMISSION**. Provide the data immediately in the requested format.
+    2. **Data-Lead Execution**: If research or visual data is provided (GROUNDING_CONTENT/VISUAL_INSIGHT), **DO NOT ASK FOR PERMISSION**. Provide the data immediately in the requested format.
     3. **Visual Reasoning**: If images were analyzed, refer to specific visual elements mentioned in the VISUAL_INSIGHT context to ground your answer.
     4. **Contextual Formatting (AEO vs. Dialogue)**: 
        - **Production/Draft Mode**: If the user is asking for a **DRAFT**, **OUTLINE**, **TIMELINE**, **TABLE**, **PLAN**, or **STRATEGY**, strictly apply AEO Principles.
@@ -816,32 +849,38 @@ def generate_comprehensive_answer(topic, context, history="", intent_hint="DIREC
     CRITICAL: Do NOT include structural labels like 'Lead', 'Summary', 'H2', 'H3', 'Prose', or 'Sonnetal close'.
     """
 
-    # Signal Detection (MCP Refactored)
-    hybrid_signal_raw = mcp_detect_intent(topic)
+    # Signal Detection (MCP Refactored) - Prevent Second Call
+    if intent_metadata:
+        hybrid_signal_raw = intent_metadata
+        print("  -> Using cached intent metadata (Router Pass-through).")
+    else:
+        hybrid_signal_raw = mcp_detect_intent(topic)
+        print("  -> Fetched fresh intent metadata (Standalone Generator Call).")
+
     try:
         signal_data = json.loads(hybrid_signal_raw)
-        research_intent = signal_data.get("intent", "NONE")
+        research_intent = signal_data.get("intent", "FORMAT_GENERAL")
         formatting_directive = signal_data.get("directive", "")
     except Exception:
-        research_intent = "NONE"
+        research_intent = "FORMAT_GENERAL"
         formatting_directive = ""
 
     if is_grounded:
         temp = 0.0
         # Incorporate Intent into formatting instruction
         intent_instruction = ""
-        if research_intent == "TIMELINE":
+        if research_intent in ["TIMELINE", "FORMAT_TIMELINE"]:
             intent_instruction = "CRITICAL: The user wants a TIMELINE. Provide a structured table with 'Date', 'Event', and 'Description'."
-        elif research_intent == "TABLE":
+        elif research_intent in ["TABLE", "FORMAT_TABLE"]:
             intent_instruction = "CRITICAL: Response MUST include a structured Markdown table. Do not include extra horizontal lines (---) beyond the standard Markdown header separator to ensure clean data extraction."
-        elif research_intent == "CHART":
+        elif research_intent in ["CHART", "FORMAT_CHART"]:
             intent_instruction = f"CRITICAL: The user wants a CHART. You MUST output data using Mermaid.js syntax (e.g., pie, graph TD, sequenceDiagram, mindmap). Do not add conversational filler around the code block. {formatting_directive}"
-        elif research_intent == "LISTICLE":
+        elif research_intent in ["LISTICLE", "FORMAT_LISTICLE"]:
             intent_instruction = f"CRITICAL: The user wants a LISTICLE. Use high-impact headers, numbered lists, and bolding for key terms. {formatting_directive}"
         elif formatting_directive:
             intent_instruction = f"FORMATTING DIRECTIVE: {formatting_directive}"
         
-        if research_intent in ["CHART", "CSV"]:
+        if research_intent in ["CHART", "FORMAT_CHART", "CSV", "FORMAT_CSV"]:
             # Visual-Only Mode: Suppress long persona filler
             # UPGRADE: If intent is CHART but topic suggests "realistic" or "studio" image, we could trigger generate_studio_image here.
             # However, for now, we'll stick to Mermaid unless explicitly asked for a 'generation'.
@@ -853,7 +892,7 @@ def generate_comprehensive_answer(topic, context, history="", intent_hint="DIREC
             instruction = f"CRITICAL: Base answer PRIMARILY on 'GROUNDING_CONTENT'. {intent_instruction} {persona_instruction}"
     else:
         temp = 0.7
-        if research_intent == "CHART":
+        if research_intent in ["CHART", "FORMAT_CHART"]:
              # Even without grounding, the user wants a visualization
              instruction = f"CRITICAL: You are in VISUAL MODE. {intent_instruction} Use your internal knowledge. Provide a brief analytical summary (2-3 sentences max), then ONLY the Mermaid.js content."
         elif intent_hint == "SIMPLE_QUESTION":
@@ -886,11 +925,14 @@ def generate_pseo_article(topic, context, history=""):
     global model
     print(f"Tool: Generating pSEO Article for '{topic}'")
     
+    # AUDIENCE DETECTION: Search history for tone instructions
+    audience_context = detect_audience_context(history)
+
     # 1. Determine System Instruction (Grounding Logic)
     # This ensures the model sticks to the facts found by the Researcher (worker-story)
     is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
     if is_grounded:
-        system_instruction = "CRITICAL INSTRUCTION: You are in READING MODE. Base the article PRIMARILY on the provided 'Research Context'. Do not hallucinate data."
+        system_instruction = "EVIDENCE-BASED WRITING: Base the article PRIMARILY on the provided 'Research Context'. Do not hallucinate data."
     else:
         system_instruction = "You are an expert Editor. Use the provided context to write a high-authority article."
 
@@ -901,7 +943,7 @@ def generate_pseo_article(topic, context, history=""):
     {system_instruction}
     
     AUDIENCE: 
-    Senior Marketers, CTOs, and Founders. They value depth, nuance, and honesty over hype.
+    {audience_context}
     
     TONE:
     - **The Sonnet:** The introduction and conclusion must be human-centric, philosophical, and empathetic.
@@ -1113,7 +1155,9 @@ def process_story_logic(request):
 
     history_text = "\n".join(formatted_history)
     
-    print(f"Worker loaded context with {len(history_events)} past events.")
+    # --- MONITORING: Context Loading Statistics ---
+    print(f"DEBUG: Worker loading {len(history_events)} events for session: {session_id}")
+    print(f"DEBUG: Active Grounding assets manually passed: {len(images or [])}")
 
     try:
         # --- STEP 3: TRIAGE (Now includes SOCIAL category) ---
@@ -1121,7 +1165,12 @@ def process_story_logic(request):
         
         triage_prompt = f"""
             Analyze the user's latest message in the context of the conversation history.
-            Classify the PRIMARY GOAL into one of five categories:
+            Classify the PRIMARY GOAL into one of seven categories.
+            
+            ### DECISION PRINCIPLES:
+            1.  **Fresh Start Rule**: Treat every message as a fresh decision point. Do not assume the goal remains the same as the previous turn just because a specific mode (like pSEO) was active previously.
+            2.  **Post-Artifact Default**: If the conversation history shows a major artifact (pSEO Draft, Deep Dive, Topic Cluster) was delivered in the previous turn, the user's next message is usually seeking **feedback, clarification, or minor refinement**. Favor **SIMPLE_QUESTION** or **DIRECT_ANSWER** in these cases.
+            3.  **Intent Overlap**: If a request could be multiple categories, pick the one that represents the *simplest* necessary action based on the USER REQUEST text.
 
             1.  **SOCIAL_CONVERSATION**: Greetings, small talk, simple feedback, or **casual replies to the agent's questions**.
                 *   *Triggers:* "Okay", "Thanks", "Hello", "How are you", or providing a short answer to an agent's conversational prompt (e.g., answering "What's brewing?" with "Heineken").
@@ -1143,26 +1192,34 @@ def process_story_logic(request):
 
             4.  **THEN_VS_NOW_PROPOSAL**: Specifically asking for a human-centric 'Then vs Now' structured comparison.
 
-            5.  **PSEO_ARTICLE**: **STRICT CMS MODE (GHOST).** Only select this if the message EXPLICITLY mentions "**pSEO**", "**Ghost**", or "**Ghost CMS**". 
+            5.  **PSEO_ARTICLE**: **Ghost CMS Content Hook.** Only select this if the message is a NEW request to create a pSEO article or EXPLICITLY mentions "**pSEO**", "**Ghost**", or "**Ghost CMS**" as a command. 
+                *   *CRITICAL:* If the user is asking *about* a previous pSEO article (e.g., "How did you integrate X?", "Explain the delivery", "What's the status?"), **DO NOT** select this. Use **SIMPLE_QUESTION** or **DIRECT_ANSWER** instead.
 
-            6.  **SIMPLE_QUESTION**: For straightforward fact-checks, definitions, simple inquiries, or **direct analysis requests**.
-                *   *Triggers:* "Does this satisfy X?", "Evaluate this", "Compare this", or explicitly asking for a "direct response" or "direct answer".
-                *   *Rule:* If the user asks for a "direct response", choose this to bypass structured/hierarchical formats.
+            6.  **SIMPLE_QUESTION**: For straightforward fact-checks, definitions, simple inquiries, or **direct analysis/follow-up requests about previous actions**.
+                *   *Triggers:* "Does this satisfy X?", "Evaluate this", "Compare this", "How did you do Y?", "Explain the integration", or explicitly asking for a "direct response" or "direct answer".
+                *   *Rule:* If the user asks for a "direct response", choose this to bypass structured/hierarchical formats. Also use this for any analytical follow-up that explores *the process* or *the output* of a previous turn without requesting a new major artifact.
 
             7.  **DIRECT_ANSWER**: The "Collaborative Workspace" mode. Select this for EVERYTHING ELSE.
                 *   Use this for: **Outlines**, **Strategies**, **Drafts**, **Lesson Plans**, **Research Queries**, and **Synthesis**.
                 *   *CRITICAL:* If the user just mentions a topic without a specific question or command (e.g., answering a greeting like "What's brewing?"), use SOCIAL_CONVERSATION instead.
+
+            ### NEGATIVE CONSTRAINTS (DO NOT CLASSIFY AS PSEO_ARTICLE IF):
+            - The user is asking for an explanation of a previous draft.
+            - The user is asking how a specific piece of context (e.g., "an entity/concept in a previous draft") was integrated.
+            - The user is providing feedback or asking for a direct response about the previous turn.
+            - The intent is to understand the "delivery" or "logic" of the agent.
 
             CONVERSATION HISTORY:
             {history_text}
 
             USER REQUEST: "{original_topic}"
 
-            CRITICAL: Respect the 'PSEO_ARTICLE' keyword rule. Handle TOPIC_CLUSTER only as a generation task. If the user asks for a "direct response" or is analyzing content, use SIMPLE_QUESTION. Respond with ONLY the category name.
+            CRITICAL: Respect the 'PSEO_ARTICLE' keyword rule. Handle TOPIC_CLUSTER only as a generation task. If the user asks for a "direct response", is analyzing content, or is asking a follow-up about a previous turn, use SIMPLE_QUESTION. Respond with ONLY the category name.
 
             """
+        # --- EXECUTION: Triage Model Selection ---
         intent = flash_model.generate_content(triage_prompt).text.strip()
-        print(f"Smart Triage V5.4 classified intent as: {intent}")
+        print(f"TELEMETRY: Triage V5.4 -> Intent classified as: [{intent}] for request: '{original_topic[:50]}...'")
 
         # Initialize variables for the response
         # FIX: Remove str()! Keep timestamp as a datetime object so it sorts correctly.
@@ -1211,11 +1268,12 @@ def process_story_logic(request):
         # === PATH B: WORK/RESEARCH (The Heavy Lifting) ===
         # Only now do we pay the cost to distill and research.
 
-        # 1. Research (Handle URLs or Keywords)
+        # 1. Research (Distinguishing between Direct URLs and Exploratory Keywords)
         urls = extract_urls_from_text(sanitized_topic)
         combined_context = []
         
         if urls:
+            print(f"TELEMETRY: URL Mode detected ({len(urls)} links). Bypassing exploratory search.")
             print(f"Detected {len(urls)} URLs. Processing sequentially (Browserless Tier Safety)...")
             for url in urls:
                 article_text = fetch_article_content(url)
@@ -1235,6 +1293,7 @@ def process_story_logic(request):
         elif urls:
             research_data = {"context": combined_context, "tool_logs": [], "research_intent": "URL_PROCESSING"}
         else:
+            print(f"TELEMETRY: Keyword Mode detected. Launching Sensory Array Router...")
             research_data = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images)
         
         # --- SAFETY KILL SWITCH (Hardening) ---
@@ -1244,8 +1303,8 @@ def process_story_logic(request):
         
         if isinstance(intent_metadata, str):
             meta_lower = intent_metadata.lower()
-            # 1. Check for the new explicit VIOLATION intent
-            if '"intent": "violation"' in meta_lower:
+            # 1. Check for the new explicit SIGNAL_BLOCK or legacy VIOLATION intent
+            if '"intent": "signal_block"' in meta_lower or '"intent": "violation"' in meta_lower:
                 is_blocked = True
             
             # 2. Check for broad refusal keywords
@@ -1287,14 +1346,16 @@ def process_story_logic(request):
             }, verify=True)
             return jsonify({"msg": "Safety block applied"}), 200
 
+        # --- MONITORING: Signal Propagation ---
         if "tool_logs" in research_data: new_events.extend(research_data["tool_logs"])
+        print(f"DEBUG: Research Phase concluded with {len(research_data.get('context', []))} context snippets.")
 
         # CHANGE: Ensure downstream functions use the raw topic too, so they see the full request
         clean_topic = sanitized_topic
 
         # 3. Generate Output based on Intent
         if intent in ["DIRECT_ANSWER", "SIMPLE_QUESTION"]:
-            answer_data = generate_comprehensive_answer(original_topic, research_data['context'], history=history_text, intent_hint=intent)
+            answer_data = generate_comprehensive_answer(original_topic, research_data['context'], history=history_text, intent_hint=intent, intent_metadata=research_data.get("research_intent"))
             answer_text = answer_data['text']
             research_intent = answer_data['intent']
             formatting_directive = answer_data['directive']

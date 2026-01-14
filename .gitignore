@@ -26,3 +26,6 @@ desktop.ini
 *.egg-info/
 build/
 dist/
+
+# Agent Workflows (Custom/Local)
+.agent/workflows/load-the-crates.md
