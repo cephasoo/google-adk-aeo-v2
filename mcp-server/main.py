@@ -242,7 +242,7 @@ def handle_tool_call(name, arguments):
         result = "\n".join(memories) if memories else "No relevant memories found."
 
     elif name == "google_trends":
-        geo = arguments.get("geo", "US")
+        geo = arguments.get("geo", DEFAULT_GEO)
         params = {"api_key": SERPAPI_API_KEY, "engine": "google_trends_trending_now", "geo": geo, "hours": "24"}
         results = GoogleSearch(params).get_dict()
         result = json.dumps(results, indent=2)[:5000]
@@ -250,7 +250,7 @@ def handle_tool_call(name, arguments):
     elif name == "trend_analysis":
         query = arguments.get("query")
         if not query: return "Error: Missing query."
-        geo = arguments.get("geo", "US")
+        geo = arguments.get("geo", DEFAULT_GEO)
         params = {"api_key": SERPAPI_API_KEY, "engine": "google_trends", "q": query, "geo": geo, "data_type": "TIMESERIES", "date": "today 12-m"}
         results = GoogleSearch(params).get_dict()
         result = json.dumps(results, indent=2)[:5000]
@@ -282,7 +282,7 @@ def handle_tool_call(name, arguments):
     elif name == "google_news_search":
         query = arguments.get("query")
         if not query: return "Error: Missing query."
-        geo = arguments.get("geo", "US")
+        geo = arguments.get("geo", DEFAULT_GEO)
         params = {"engine": "google", "q": query, "gl": geo, "tbm": "nws", "num": 3, "api_key": SERPAPI_API_KEY}
         results = GoogleSearch(params).get_dict().get("news_results", [])
         result = "\n[NEWS CONTEXT]:\n" + "\n".join([f"- {n.get('title')}" for n in results]) if results else "No news found."
