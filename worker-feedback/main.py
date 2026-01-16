@@ -210,7 +210,7 @@ def process_feedback_logic(request):
         events_ref.add(user_event)
         events_ref.add({"event_type": "final_output", "content": target_content, "timestamp": datetime.datetime.now(datetime.timezone.utc)})
         
-        requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "proposal": [{"link": target_content}], "thread_ts": slack_context.get('ts'), "channel_id": slack_context.get('channel'), "is_final_story": True }, verify=certifi.where())
+        requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "proposal": [{"link": target_content}], "thread_ts": slack_context.get('ts'), "channel_id": slack_context.get('channel'), "is_final_story": True, "is_initial_post": False }, verify=certifi.where())
         return jsonify({"msg": "Approved and Ingested"}), 200
 
     elif intent == "REFINE":
@@ -243,7 +243,8 @@ def process_feedback_logic(request):
             "proposal": new_prop['interlinked_concepts'], 
             "thread_ts": slack_context.get('ts'), 
             "channel_id": slack_context.get('channel'),
-            "is_final_story": False 
+            "is_final_story": False,
+            "is_initial_post": False
         }, verify=certifi.where())
 
     return jsonify({"message": "Refinement processed."}), 200
