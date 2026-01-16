@@ -382,9 +382,27 @@ def get_search_api_key():
     return search_api_key
 
 def extract_json(text):
-    match = re.search(r'\{.*\}', text, re.DOTALL)
-    if not match: raise ValueError(f"No JSON found in text: {text[:200]}...")
-    return json.loads(match.group(0))
+    """
+    Super-Listener: Hardened extraction of JSON from LLM responses.
+    Handles markdown fences (```json) and raw braced strings.
+    """
+    if not text: return None
+    
+    # 1. Look for Markdown-wrapped blocks first
+    markdown_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+    if markdown_match:
+        content = markdown_match.group(1).strip()
+    else:
+        # 2. Fall back to finding the outermost braces
+        brace_match = re.search(r'(\{[\s\S]*\})', text)
+        if not brace_match: return None
+        content = brace_match.group(1).strip()
+    
+    try:
+        return json.loads(content)
+    except Exception as e:
+        print(f"FAILED JSON PARSE: {e}\nRaw Content: {content[:200]}")
+        return None
 
 def extract_urls_from_text(text):
     """Extracts ALL URLs from a given string."""
@@ -495,9 +513,9 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     # DEEP RECOLLECTION: If no images found, we use a semantic check to see if we SHOULD look for them in history.
     # This avoids hard-coding "boy", "eagle", etc.
     visual_check_prompt = f"Analyze if the user's query requires seeing an image, PDF, or visual asset to answer accurately. Query: '{raw_topic}'. Respond ONLY with 'YES' or 'NO'."
-    is_visual_query = "YES" in flash_model.generate_content(visual_check_prompt).text.upper()
+    is_recollective_visual_query = "YES" in flash_model.generate_content(visual_check_prompt).text.upper()
     
-    if not all_images and is_visual_query and history_context:
+    if not all_images and is_recollective_visual_query and history_context:
         print("Sensory Router: Semantic visual intent detected. Attempting Deep Recollection (Re-scraping URLs)...")
         # ... (rest of the logic remains the same)
         history_web_links = re.findall(r'(https?://[^\s<>|]+(?:twitter\.com|x\.com|instagram\.com|facebook\.com|threads\.net|tiktok\.com|youtube\.com|status/|p/)[^\s<>|]*)', history_context)
@@ -537,6 +555,44 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
         
     print(f"  -> Signal Detected | Geo: '{detected_geo}' | Intent: '{detected_intent_key}'")
     
+    # --- 2.5 SENSORY GATEKEEPER: Grounding Adequacy Audit ---
+    # We check if we ALREADY have enough info in context_snippets + history to satisfy the request.
+    # This specifically addresses the "Token Economy" requirement.
+    audit_prompt = f"""
+    Evaluate if the following knowledge is SUFFICIENT to answer the user's request without further web research.
+    
+    USER REQUEST: "{raw_topic}"
+    
+    COLLECTED KNOWLEDGE (RAG + HISTORY + VISUALS):
+    {history_context}
+    ---
+    {context_snippets}
+    
+    RULES:
+    1. If the user is asking to reorganize, summarize, or edit information whose COMPLETE context has already been retrieved and is visible in the history or snippets, it is SUFFICIENT.
+    2. PROFUNDITY MATCH: Surface-level context (e.g., social snippets, condensed infographics, summary cards, or casual mentions) is INSUFFICIENT if the user request demands high-fidelity technical depth, enforceable rules, or logical specifics.
+    3. SOURCE-NEUTRALITY: Do not rely on the *type* of source (social vs doc), but on the *content density*. Does the current context contain the specific answers to the user's 'How' and 'Why' questions?
+    4. If the user asks for NEW data, latest signals, or facts not present above, it is INSUFFICIENT.
+    5. If the user's query is purely conversational/social, it is SUFFICIENT.
+
+    OUTPUT FORMAT:
+    RATIONALE: <1-sentence explanation>
+    DECISION: [SUFFICIENT or INSUFFICIENT]
+    """
+    audit_raw = flash_model.generate_content(audit_prompt).text.strip().upper()
+    print(f"SENSORY GATEKEEPER: {audit_raw}")
+    
+    adequacy_score = "INSUFFICIENT"
+    if "DECISION: SUFFICIENT" in audit_raw:
+        adequacy_score = "SUFFICIENT"
+    elif "DECISION: INSUFFICIENT" in audit_raw:
+        adequacy_score = "INSUFFICIENT"
+
+    if adequacy_score == "SUFFICIENT" and "TRENDS" not in detected_intent_key:
+        print("SENSORY GATEKEEPER: Knowledge is sufficient. Skipping AI Router and forcing CONVERSATIONAL_CONTEXT.")
+        selected_tools = ["USE_CONVERSATIONAL_CONTEXT"]
+        return {"context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent_raw}
+
     # 3. Sensory Array Router (Decides based on RAW input)
     tool_choice_prompt = f"""
     Analyze the user's query to select the most appropriate research tool(s).
@@ -596,7 +652,10 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
         print(f"Router Parse Error: {e}. Defaulting to SIMPLE.")
         selected_tools = ["SIMPLE"]
 
-    if any("USE_CONVERSATIONAL_CONTEXT" in choice for choice in selected_tools):
+    # --- 0. CONVERSATIONAL SHORT-CIRCUIT ---
+    # We only return early if USE_CONVERSATIONAL_CONTEXT is the ONLY tool selected.
+    # If other tools (WEB, TRENDS, etc.) are present, we must execute them.
+    if len(selected_tools) == 1 and "USE_CONVERSATIONAL_CONTEXT" in selected_tools[0]:
         return {"context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent_raw}
 
     # --- CATEGORICAL SHARED EXTRACTION (Efficiency + Verbose Debugging) ---
@@ -613,109 +672,118 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
         distilled_trend_term = extract_trend_term(raw_topic, history=history_context)
         print(f"  -> Trend Entity: '{distilled_trend_term}'")
     
-    # --- MULTI-SIGNAL EXECUTION LOOP ---
-    target_geos = [g.strip() for g in detected_geo.split(',')][:3]
+    # SEMANTIC ANCHOR: We only allow visual grounding to skip web research if the user's query
+    # explicitly references visual elements AND we are not dealing with a NEW set of images.
+    is_visual_query = any(word in raw_topic.lower() for word in ["boy", "eagle", "color", "look like", "see", "image", "promo", "flag", "picture", "photo", "this", "it"])
     
-    # INTENT OVERRIDE: If we have visual insights (or are recollecting them) 
-    # and the intent is a SIMPLE_QUESTION about details, we can skip redundant WEB searches.
-    has_visuals_now = any("[VISUAL_INSIGHT]" in str(s) for s in context_snippets)
-    is_visual_query = any(word in raw_topic.lower() for word in ["boy", "eagle", "color", "look like", "see", "image", "promo", "flag"])
+    # Check if we have new images to analyze vs. just relying on history
+    has_new_images = len(all_images) > 0
+    has_visuals_in_history = any("[VISUAL_INSIGHT]" in str(s) for s in context_snippets)
     
-    if has_visuals_now and is_visual_query and "SIMPLE_QUESTION" in str(research_intent):
-        print("Sensory Router: Visual Grounding detected for follow-up. Skipping redundant WEB search.")
-        selected_tools = [t for t in selected_tools if t not in ["WEB", "SIMPLE"]]
-        if not selected_tools: selected_tools = ["USE_CONVERSATIONAL_CONTEXT"]
+    if has_visuals_in_history and is_visual_query and not has_new_images:
+        if "SIMPLE_QUESTION" in str(research_intent_raw):
+            print("Sensory Router: Explicit visual grounding (history) detected. Skipping redundant WEB search.")
+            selected_tools = [t for t in selected_tools if t not in ["WEB", "SIMPLE"]]
+            if not selected_tools: selected_tools = ["USE_CONVERSATIONAL_CONTEXT"]
+    # --- 1. GLOBAL KNOWLEDGE TOOLS (Independent of Trending Geos) ---
+    knowledge_tools = [t.split(':')[0].strip() for t in selected_tools if t.split(':')[0].strip() in ["WEB", "IMAGES", "VIDEOS", "SCHOLAR", "SIMPLE"]]
+    
+    for choice in knowledge_tools:
+        print(f"Executing Global Sensory Tool: '{choice}'")
+        research_context = None
+        tool_name = "unknown"
 
-    for geo_code in target_geos:
-        print(f"--- Processing Region: '{geo_code}' ---")
-        
-        # Iterate through each selected tool
-        for tool_selection in selected_tools:
-            choice = tool_selection.split(':')[0].strip() # Handle legacy format just in case
-            print(f"Executing Sensory Tool: '{choice}' (Geo: '{geo_code}')")
+        if choice == "WEB":
+            research_context = search_google_web(distilled_seo_query)
+            tool_name = "serpapi_web_search_global"
+        elif choice == "IMAGES":
+            research_context = search_google_images(distilled_seo_query)
+            tool_name = "serpapi_image_search"
+        elif choice == "VIDEOS":
+            research_context = search_google_videos(distilled_seo_query)
+            tool_name = "serpapi_video_search"
+        elif choice == "SCHOLAR":
+            research_context = search_google_scholar(distilled_seo_query)
+            tool_name = "serpapi_scholar_search"
+        elif choice == "SIMPLE":
+            pass # Fallback will handle it
 
-            research_context = None
-            tool_name = "unknown"
+        if research_context:
+            context_snippets.append(research_context)
+            tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": raw_topic, "status": "success"})
 
-            # --- 1. VIRAL DISCOVERY ---
-            if "TRENDS" in choice:
-                research_context = search_google_trends(geo=geo_code)
-                tool_name = f"serpapi_trends_search_{geo_code}"
+    # --- 2. REGIONAL TREND TOOLS (Region-Specific Discovery) ---
+    trend_tools = [t.split(':')[0].strip() for t in selected_tools if t.split(':')[0].strip() in ["TRENDS", "ANALYSIS"]]
+    
+    if trend_tools:
+        target_geos = [detected_geo] if detected_geo else ["NG"]
+        for geo_code in target_geos:
+            print(f"--- Processing Regional Trends: '{geo_code}' ---")
+            for choice in trend_tools:
+                research_context = None
+                tool_name = "unknown"
 
-            # --- 2. TREND ANALYSIS ---
-            elif "ANALYSIS" in choice:
-                search_query = distilled_trend_term
-                print(f"  + Fetching Quantitative Trend Stats for '{search_query}' in '{geo_code}'...")
-                stats_context = analyze_trend_history(search_query, geo=geo_code)
-                
-                # C. TAP 2: Qualitative Data
-                has_web_tool = any(t in ["WEB", "SIMPLE"] for t in selected_tools)
-                try:
-                    if not has_web_tool:
-                        print(f"  + Fetching Qualitative News Context for '{search_query}' in '{geo_code}' via MCP...")
-                        news_text = get_mcp_client().call("google_news_search", {"query": search_query, "geo": geo_code})
-                        research_context = f"[Region: {geo_code} Stats]:\n{stats_context}\n{news_text}"
-                    else:
-                        print(f"  - Skipping Supplemental News context (WEB search will provide it) for '{geo_code}'.")
-                        research_context = f"[Region: {geo_code} Stats]:\n{stats_context}"
-                except Exception as news_err: 
-                    print(f"  ! News fetch error for '{geo_code}': {news_err}")
-                    research_context = stats_context
-                tool_name = f"serpapi_trend_analysis_{geo_code}"
+                if "TRENDS" in choice:
+                    research_context = search_google_trends(geo=geo_code)
+                    tool_name = f"serpapi_trends_search_{geo_code}"
+                elif "ANALYSIS" in choice:
+                    search_query = distilled_trend_term
+                    print(f"  + Fetching Quantitative Trend Stats for '{search_query}' in '{geo_code}'...")
+                    stats_context = analyze_trend_history(search_query, geo=geo_code)
+                    
+                    # Qualitative Data Double-Tap
+                    has_web_tool = any(t in ["WEB", "SIMPLE"] for t in selected_tools)
+                    try:
+                        if not has_web_tool:
+                            print(f"  + Fetching Qualitative News Context for '{search_query}' in '{geo_code}' via MCP...")
+                            news_text = get_mcp_client().call("google_news_search", {"query": search_query, "geo": geo_code})
+                            research_context = f"[Region: {geo_code} Stats]:\n{stats_context}\n{news_text}"
+                        else:
+                            research_context = f"[Region: {geo_code} Stats]:\n{stats_context}"
+                    except Exception: 
+                        research_context = stats_context
+                    tool_name = f"serpapi_trend_analysis_{geo_code}"
 
-            # --- 3. STANDARD SEARCH TOOLS ---
-            elif choice in ["WEB", "IMAGES", "VIDEOS", "SCHOLAR", "SIMPLE"]:
-                search_query = distilled_seo_query
-                if choice == "WEB":
-                    results = search_google_web(search_query)
-                    research_context = f"[Region: {geo_code} Results]:\n{results}"
-                    tool_name = f"serpapi_web_search_{geo_code}"
-                elif choice == "IMAGES":
-                    research_context = search_google_images(search_query)
-                    tool_name = "serpapi_image_search"
-                elif choice == "VIDEOS":
-                    research_context = search_google_videos(search_query)
-                    tool_name = "serpapi_video_search"
-                elif choice == "SCHOLAR":
-                    research_context = search_google_scholar(search_query)
-                    tool_name = "serpapi_scholar_search"
-                elif choice == "SIMPLE":
-                    pass 
-                
-            # --- 4. FALLBACK / SIMPLE SEARCH ---
-            if not research_context and choice not in ["IMAGES", "VIDEOS", "SCHOLAR"]:
-                fallback_query = distilled_seo_query or distilled_trend_term or raw_topic
-                print(f"  ? Primary research failed for '{geo_code}'. Initiating fallback.")
-                research_context = google_simple_search(fallback_query)
-                tool_name = "google_simple_search"
+                if research_context:
+                    context_snippets.append(research_context)
+                    tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": raw_topic, "status": "success"})
 
-            if research_context:
-                context_snippets.append(research_context)
-                tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": raw_topic, "status": "success"})
+    # --- 3. FALLBACK (If no context was gathered) ---
+    if not context_snippets and "USE_CONVERSATIONAL_CONTEXT" not in selected_tools:
+        fallback_query = distilled_seo_query or distilled_trend_term or raw_topic
+        print(f"  ? Sensory research yielded no snippets. Initiating global fallback.")
+        research_context = google_simple_search(fallback_query)
+        context_snippets.append(research_context)
+        tool_logs.append({"event_type": "tool_call", "tool_name": "google_simple_search_fallback", "input": raw_topic, "status": "success"})
 
     return { "context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent_raw }
 
 
 #11. The Topic Cluster Generator
-def generate_topic_cluster(topic, context, history=""):
+def generate_topic_cluster(topic, context, history="", is_initial=True):
     global model
-    print("Tool: Topic Cluster Generator")
+    
+    state_context = "This is a NEW proposal for a new thread." if is_initial else "This is a REVISION or EXTENSION of a previous strategy in an existing thread."
+    
     prompt = f"""
-    You are a world-class SEO Strategist and Content Architect.
+    You are an expert SEO Architect. Create a comprehensive topic cluster for: "{topic}"
     
-    Conversation History: {history}.
+    STATE: {state_context}
+    CONTEXT: {context}
+    HISTORY: {history}
     
-    Your task is to generate a comprehensive TOPIC CLUSTER PROPOSAL for a pillar page on: "{topic}".
-    
-    EXPERT SEO PRINCIPLES:
+    ### EXPERT SEO PRINCIPLES:
     1. **Semantic Ecosystems (Entities over Strings):** Do not just match keywords. Identify the core concepts and entities (vocabulary of authority) required to be seen as an expert.
     2. **User Journey Maps:** Align clusters with the user's path from "Problem Awareness" (Informational/Top-of-funnel) to "Solution" (Transactional/Middle/Bottom-of-funnel).
     3. **Topical Authority Graphs:** Cover the topic's "nooks and crannies" to prove comprehensive expertise and create a defensive moat.
     4. **Information Architecture (The Library Model):** Ensure the structure follows a logical internal linking blueprint from the Master Pillar to supporting sub-topics.
+    
+    ### GUIDELINES:
+    1. If this is a REVISION (is_initial=False), you MAY start with a header like ":robot_face: The proposal has been REVISED" or similar context-aware greetings if appropriate.
+    2. If this is an INITIAL proposal, be structured and authoritative.
+    3. Ensure the output is strictly valid JSON for extraction.
 
-    CONTEXT: {context}
-
-    CRITICAL: Respond with a JSON object following this exact schema:
+    JSON SCHEMA:
     {{
       "pillar_page_title": "[The optimized H1 title for the pillar page]",
       "clusters": [
@@ -788,25 +856,23 @@ def generate_seo_metadata(article_html, topic):
         response = specialist.generate_content(prompt, generation_config={"temperature": 0.7})
         content = response.text.strip()
         
-        # 3. Clean and Parse JSON (Standard Logic)
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[0].strip()
-            
-        return json.loads(content)
+        # 3. Use the Unified Super-Listener
+        final_json = extract_json(content)
+        if final_json:
+            return final_json
+        
+        raise ValueError("Unified parser failed to extract valid metadata.")
 
     except Exception as e:
         print(f"⚠️ Specialist Anthropic Model Failed: {e}")
-        # Fallback to Basic Generation using the DEFAULT global model if Specialist fails
-        # or just return static fallback
+        # Return a safe fallback schema
         return {
             "title": topic.replace("Draft a pSEO article about ", "").strip('"'),
             "meta_title": topic[:60],
-            "meta_description": "Read our latest analysis on this topic.",
-            "custom_excerpt": "Click to read more.",
-            "featured_image_prompt": f"A futuristic abstract representation of {topic}",
-            "tags": ["AI", "Tech"]
+            "meta_description": f"Deep dive into {topic}.",
+            "custom_excerpt": f"Analysis of {topic}.",
+            "featured_image_prompt": "Abstract digital landscape representing AI ethics.",
+            "tags": ["The Leading Edge"]
         }
 
 #13. The Comprehensive Answer Generator (AEO-AWARE CONTENT STRATEGIST)
@@ -886,8 +952,8 @@ def generate_comprehensive_answer(topic, context, history="", intent_hint="DIREC
             # However, for now, we'll stick to Mermaid unless explicitly asked for a 'generation'.
             instruction = f"CRITICAL: You are in VISUAL MODE. {intent_instruction} DO NOT provide Python code. Provide a brief analytical summary (2-3 sentences max), followed ONLY by the Mermaid.js or CSV content."
         elif intent_hint == "SIMPLE_QUESTION":
-             # NO PERSONA WRAP for simple questions.
-             instruction = "Provide a Simple, Natural, and Empathetic response based on the context. Do not use structural headers, intros, or conclusions. Just a direct answer."
+             # Even for simple questions, stay in character as the strategist.
+             instruction = f"You are a Senior Content Strategist. Provide a direct, expert, and proactive answer. If the user's query implies a strategic need, provide a recommendation or a 'draft-next' strategy immediately. {persona_instruction}"
         else:
             instruction = f"CRITICAL: Base answer PRIMARILY on 'GROUNDING_CONTENT'. {intent_instruction} {persona_instruction}"
     else:
@@ -896,8 +962,8 @@ def generate_comprehensive_answer(topic, context, history="", intent_hint="DIREC
              # Even without grounding, the user wants a visualization
              instruction = f"CRITICAL: You are in VISUAL MODE. {intent_instruction} Use your internal knowledge. Provide a brief analytical summary (2-3 sentences max), then ONLY the Mermaid.js content."
         elif intent_hint == "SIMPLE_QUESTION":
-             # NO PERSONA WRAP for simple questions.
-             instruction = "Provide a Simple, Natural, and Empathetic response based on the context. Do not use structural headers, intros, or conclusions. Just a direct answer."
+             # Even for simple questions, stay in character as the strategist.
+             instruction = f"You are a Senior Content Strategist. Provide a direct, expert, and proactive answer. If the user's query implies a strategic need, provide a recommendation or a 'draft-next' strategy immediately. {persona_instruction}"
         else:
              instruction = f"You are a strategic partner and content architect. {persona_instruction}"
         
@@ -1061,11 +1127,29 @@ def generate_deep_dive_article(topic, context, history="", target_length=1500):
     return full_html
 
 #15. The Euphemistic 'Then vs Now' Linker
-def create_euphemistic_links(keyword_context):
+def create_euphemistic_links(keyword_context, is_initial=True):
     global model
+    
+    state_context = "This is a NEW proposal for a new thread." if is_initial else "This is a REVISION or EXTENSION of a previous strategy in an existing thread."
+    
     prompt = f"""
-    Topic: "{keyword_context['clean_topic']}". Context: {keyword_context['context']}
+    Topic: "{keyword_context['clean_topic']}". 
+    
+    STATE: {state_context}
+    CONTEXT: {keyword_context['context']}
+    
     Identify 4-10 core keyword clusters for 'Then' and 6-10 for 'Now'.
+    
+    ### STRATEGIC PRINCIPLES (Euphemistic Contrast):
+    1. **Historical Trajectory:** Contrast the 'Static/Manual' past with the 'Dynamic/AI-Driven' future.
+    2. **Value Shift:** Highlight how the user's role evolves from 'Execution' to 'Architecture'.
+    3. **Semantic Anchoring:** Ensure the links between Then and Now are logically sound and establish immediate authority.
+    
+    ### GUIDELINES:
+    1. If this is a REVISION (is_initial=False), you MAY start with a header like ":robot_face: The proposal has been REVISED" or similar context-aware greetings if appropriate.
+    2. If this is an INITIAL proposal, be structured and authoritative.
+    3. Ensure the output is strictly valid JSON for extraction.
+
     CRITICAL SCHEMA: Exact keys: "then_concept", "now_concept", "link".
     Structure: {{ "interlinked_concepts": [ {{ "then_concept": "...", "now_concept": "...", "link": "..." }} ] }}
     """
@@ -1107,9 +1191,13 @@ def process_story_logic(request):
     print(f"DEBUG: Story Worker received payload keys: {list(req.keys()) if req else 'None'}")
     session_id, original_topic, slack_context = req['session_id'], req.get('topic', ""), req['slack_context']
     images = req.get('images', [])
-    print(f"DEBUG: Story Worker images count: {len(images)}")
-    if images:
-        print(f"DEBUG: Story Worker first image URL: {images[0][:50]}...")
+    
+    # DYNAMIC THREAD AWARENESS: Determine if this is a thread starter or a continuation.
+    # Slack 'thread_ts' is missing or equal to 'ts' for the root message.
+    current_ts = slack_context.get('ts')
+    parent_ts = slack_context.get('thread_ts')
+    is_initial_post = not parent_ts or parent_ts == current_ts
+    print(f"DEBUG: Thread State -> is_initial_post: {is_initial_post} (ts: {current_ts}, thread_ts: {parent_ts})")
     
     # --- STEP 1: PERCEPTION (Sanitize Input) ---
     sanitized_topic = sanitize_input_text(original_topic)
@@ -1135,11 +1223,10 @@ def process_story_logic(request):
         # MEMORY EXPANSION: Removed .limit(20) to ensure deep context recall
         events_ref = doc_ref.collection('events')
         
-        # Sort DESCENDING (Newest first)
-        query = events_ref.order_by('timestamp', direction=firestore.Query.DESCENDING)
-        
         # Chronological order (Old -> New)
-        history_events = [doc.to_dict() for doc in query.stream()][::-1]
+        query = events_ref.order_by('timestamp', direction=firestore.Query.ASCENDING)
+        
+        history_events = [doc.to_dict() for doc in query.stream()]
 
 
     # MEMORY EXPANSION: Removed [-10:] slice to see the WHOLE conversation
@@ -1180,17 +1267,19 @@ def process_story_logic(request):
                 *   *Triggers:* "800 words", "1500 words", "Deep dive", "Draft an article", "Write a post", "Detailed draft", "Comprehensive article".
                 *   *Priority:* If a word count is mentioned, ALWAYS pick this over TOPIC_CLUSTER.
 
-            3.  **TOPIC_CLUSTER_PROPOSAL**: **SEMANTIC ARCHITECTURE GENERATION.** The user specifically wants to *create or generate* a new hierarchical map of keywords to establish topical authority. 
-                *   *CRITICAL:* If the user is asking to **analyze** a post against an existing cluster, evaluate if a post "satisfies" a cluster, or asks a question *about* a cluster, e.g. how could we enhance an existing cluster, this is **NOT** a proposal. 
-                *   *Rule:* Use this ONLY for the act of *fanning out* semantically related keyword structures from a seed topic.
+            3.  **TOPIC_CLUSTER_PROPOSAL**: **SEMANTIC ARCHITECTURE GENERATION.** The user SPECIFICALLY ASKS to *create, build, or generate* the full hierarchical map of keywords. 
+                *   *POSITIVE TRIGGERS:* "Generate", "Build", "Construct cluster", "Map out", "Create the strategy".
+                *   *Rule:* Use this ONLY for **BUILD COMMANDS**. If the user is asking *if* they should do a cluster, asking *how* to extend a topic, or asking for an expert opinion *before* building, do **NOT** pick this. Use DIRECT_ANSWER instead.
                 *   *Expert SEO Lenses:*
-                    - **Semantic Architecture:** Take the broad term (topic) and branch it into specific long-tail queries determined by the user's implied intent(s) for the topic or stages of the buyer's journey.
-                    - **Semantic Ecosystems:** Identifying concepts and entities (vocabulary of authority), not just text strings.
-                    - **User Journey Maps:** Aligning sub-topics with the path from "Problem Awareness" (Top-of-funnel) to "Solution" (Bottom-of-funnel).
+                    - **Semantic Architecture:** Branching topics into specific long-tail queries.
+                    - **Semantic Ecosystems:** Identifying concepts and entities (vocabulary of authority).
+                    - **User Journey Maps:** Aligning sub-topics with the path from "Awareness" to "Solution".
                     - **Topical Authority Graphs:** Covering every "nook and cranny" to prove expertise and create a defensive moat.
                     - **Information Architecture:** Providing a logical structure (Dewey Decimal System) for internal linking from the Master Pillar to supporting docs.
 
             4.  **THEN_VS_NOW_PROPOSAL**: Specifically asking for a human-centric 'Then vs Now' structured comparison.
+                *   *POSITIVE TRIGGERS:* "Compare human-centric", "Do a then vs now", "Show trajectory", "Contrast eras".
+                *   *Rule:* Use this ONLY for explicit trajectory/comparison requests.
 
             5.  **PSEO_ARTICLE**: **Ghost CMS Content Hook.** Only select this if the message is a NEW request to create a pSEO article or EXPLICITLY mentions "**pSEO**", "**Ghost**", or "**Ghost CMS**" as a command. 
                 *   *CRITICAL:* If the user is asking *about* a previous pSEO article (e.g., "How did you integrate X?", "Explain the delivery", "What's the status?"), **DO NOT** select this. Use **SIMPLE_QUESTION** or **DIRECT_ANSWER** instead.
@@ -1199,9 +1288,9 @@ def process_story_logic(request):
                 *   *Triggers:* "Does this satisfy X?", "Evaluate this", "Compare this", "How did you do Y?", "Explain the integration", or explicitly asking for a "direct response" or "direct answer".
                 *   *Rule:* If the user asks for a "direct response", choose this to bypass structured/hierarchical formats. Also use this for any analytical follow-up that explores *the process* or *the output* of a previous turn without requesting a new major artifact.
 
-            7.  **DIRECT_ANSWER**: The "Collaborative Workspace" mode. Select this for EVERYTHING ELSE.
-                *   Use this for: **Outlines**, **Strategies**, **Drafts**, **Lesson Plans**, **Research Queries**, and **Synthesis**.
-                *   *CRITICAL:* If the user just mentions a topic without a specific question or command (e.g., answering a greeting like "What's brewing?"), use SOCIAL_CONVERSATION instead.
+            7.  **DIRECT_ANSWER**: The "Collaborative Workspace" mode. Select this for EVERYTHING ELSE and for **STRATEGIC CONSULTATION**.
+                *   Use this for: **Expert opinions**, **Determining if a strategy is needed**, **How-to-extend queries**, **Outlines**, **Drafts**, **Lesson Plans**, **Research Queries**, and **Synthesis**.
+                *   *CRITICAL:* If the user asks "Should I consider a strategy?" or "How should I extend this?", pick this to trigger the Proactive Specialist Persona (Text) rather than the JSON Builder.
 
             ### NEGATIVE CONSTRAINTS (DO NOT CLASSIFY AS PSEO_ARTICLE IF):
             - The user is asking for an explanation of a previous draft.
@@ -1214,7 +1303,7 @@ def process_story_logic(request):
 
             USER REQUEST: "{original_topic}"
 
-            CRITICAL: Respect the 'PSEO_ARTICLE' keyword rule. Handle TOPIC_CLUSTER only as a generation task. If the user asks for a "direct response", is analyzing content, or is asking a follow-up about a previous turn, use SIMPLE_QUESTION. Respond with ONLY the category name.
+            CRITICAL: Respect the 'PSEO_ARTICLE' keyword rule. If the user asks for a "direct response", is analyzing content, or is asking a follow-up about a previous turn, use SIMPLE_QUESTION. For **STRATEGIC META-QUESTIONS** or "Should I?" inquiries, use DIRECT_ANSWER to trigger proactive consultation. Use TOPIC_CLUSTER_PROPOSAL **ONLY** for explicit build commands. Respond with ONLY the category name.
 
             """
         # --- EXECUTION: Triage Model Selection ---
@@ -1261,7 +1350,7 @@ def process_story_logic(request):
                 "type": "social",
                 "last_updated": expire_time
             })
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": reply_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts']}, verify=True, timeout=10)
+            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": reply_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=True, timeout=10)
             return jsonify({"msg": "Social reply sent"}), 200
 
 
@@ -1384,7 +1473,8 @@ def process_story_logic(request):
                 "intent": research_intent,
                 "directive": formatting_directive,
                 "channel_id": slack_context['channel'], 
-                "thread_ts": slack_context['ts']
+                "thread_ts": slack_context['ts'],
+                "is_initial_post": is_initial_post
             }, verify=True)
             return jsonify({"msg": "Answer sent"}), 200
 
@@ -1416,43 +1506,71 @@ def process_story_logic(request):
                 "type": "social", 
                 "message": convert_html_to_markdown(article_html), 
                 "channel_id": slack_context['channel'], 
-                "thread_ts": slack_context['ts']
+                "thread_ts": slack_context['ts'],
+                "is_initial_post": is_initial_post
             }, verify=True)
             return jsonify({"msg": "Deep-Dive article sent"}), 200
 
         elif intent == "TOPIC_CLUSTER_PROPOSAL":
-            cluster_data = generate_topic_cluster(clean_topic, research_data['context'], history=history_text)
-            new_events.append({"event_type": "agent_answer", "proposal_type": "topic_cluster", "data": cluster_data})
-            
-            # Writing to a Sub-collection
-            session_ref = db.collection('agent_sessions').document(session_id)
-            events_ref = session_ref.collection('events')
+            try:
+                cluster_data = generate_topic_cluster(clean_topic, research_data['context'], history=history_text, is_initial=is_initial_post)
+                if not cluster_data: raise ValueError("Failed to parse cluster JSON.")
+                
+                new_events.append({"event_type": "agent_answer", "proposal_type": "topic_cluster", "data": cluster_data})
+                
+                session_ref = db.collection('agent_sessions').document(session_id)
+                events_ref = session_ref.collection('events')
+                for event in new_events:
+                    if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
+                    events_ref.add(event)
 
-            for event in new_events:
-                if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                events_ref.add(event)
+                session_ref.update({
+                    "status": "awaiting_feedback", 
+                    "type": "work_proposal", 
+                    "topic": clean_topic,
+                    "slack_context": slack_context,
+                    "last_updated": expire_time
+                })
+                
+                # Align with N8N Parser: Wrap JSON in markdown for regex extraction
+                cluster_msg = f"```json\n{json.dumps(cluster_data, indent=2)}\n```"
+                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                    "session_id": session_id, 
+                    "type": "answer", 
+                    "message": cluster_msg,
+                    "intent": "TOPIC_CLUSTER_PROPOSAL",
+                    "channel_id": slack_context['channel'], 
+                    "thread_ts": slack_context['ts'],
+                    "is_initial_post": is_initial_post
+                }, verify=True, timeout=30) # Increased timeout for large clusters
+                return jsonify({"msg": "Topic cluster sent"}), 200
 
-            session_ref.update({
-                "status": "awaiting_feedback", 
-                "type": "work_proposal", 
-                "topic": clean_topic,
-                "slack_context": slack_context,
-                "last_updated": expire_time
-            })
-            
-            # Use structured payload for N8N rendering
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
-                "session_id": session_id, 
-                "type": "topic_cluster", 
-                "payload": cluster_data,
-                "channel_id": slack_context['channel'], 
-                "thread_ts": slack_context['ts']
-            }, verify=True)
-            return jsonify({"msg": "Topic cluster sent"}), 200
+            except Exception as e:
+                print(f"⚠️ TOPIC_CLUSTER Fallback: {e}")
+                answer_data = generate_comprehensive_answer(original_topic, research_data['context'], history=history_text)
+                answer_text = answer_data['text']
+                new_events.append({"event_type": "agent_answer", "text": answer_text})
+                
+                session_ref = db.collection('agent_sessions').document(session_id)
+                events_ref = session_ref.collection('events')
+                for event in new_events:
+                    if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
+                    events_ref.add(event)
+
+                session_ref.update({
+                    "status": "awaiting_feedback", 
+                    "type": "work_answer", 
+                    "topic": clean_topic,
+                    "slack_context": slack_context,
+                    "last_updated": expire_time
+                })
+                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=True, timeout=10)
+                return jsonify({"msg": "Cluster Fallback Answer sent"}), 200
 
         elif intent == "THEN_VS_NOW_PROPOSAL":
             try:
-                current_proposal = create_euphemistic_links(research_data)
+                # FIX: Pass clean_topic inside the data dictionary for tool consistency
+                current_proposal = create_euphemistic_links({**research_data, "clean_topic": clean_topic}, is_initial=is_initial_post)
                 approval_id = f"approval_{uuid.uuid4().hex[:8]}"
                 new_events.append({"event_type": "loop_draft", "iteration": 0, "proposal_data": current_proposal})
 
@@ -1464,10 +1582,35 @@ def process_story_logic(request):
                     except Exception: break
                     loop_count += 1
 
+                    loop_count += 1
+
                 approval_id = f"approval_{uuid.uuid4().hex[:8]}"
                 new_events.append({"event_type": "adk_request_confirmation", "approval_id": approval_id, "payload": current_proposal['interlinked_concepts']})
                 
-                # Writing to a Sub-collection
+                session_ref = db.collection('agent_sessions').document(session_id)
+                events_ref = session_ref.collection('events')
+                for event in new_events:
+                    if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
+                    events_ref.add(event)
+
+                session_ref.update({
+                    "status": "awaiting_feedback", 
+                    "type": "work_proposal", 
+                    "topic": clean_topic,
+                    "slack_context": slack_context,
+                    "last_updated": expire_time
+                })
+
+                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                    "session_id": session_id, 
+                    "type": "answer_proposal", 
+                    "proposal": current_proposal['interlinked_concepts'], 
+                    "approval_id": approval_id, 
+                    "channel_id": slack_context['channel'], 
+                    "thread_ts": slack_context['ts'],
+                    "is_initial_post": is_initial_post
+                }, verify=True, timeout=15)
+                return jsonify({"msg": "Then-vs-Now proposal sent"}), 200
                 session_ref = db.collection('agent_sessions').document(session_id)
                 events_ref = session_ref.collection('events')
 
@@ -1483,7 +1626,7 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 })
                 
-                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "approval_id": approval_id, "proposal": current_proposal['interlinked_concepts'], "thread_ts": slack_context['ts'], "channel_id": slack_context['channel'], "is_initial_post": True }, verify=True)
+                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "approval_id": approval_id, "proposal": current_proposal['interlinked_concepts'], "thread_ts": slack_context['ts'], "channel_id": slack_context['channel'], "is_initial_post": is_initial_post }, verify=True)
                 return jsonify({"msg": "Proposal sent"}), 200
 
             except ValueError as e:
@@ -1506,60 +1649,78 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 })
 
-                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts']}, verify=True)
+                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=True)
                 return jsonify({"msg": "Fallback answer sent"}), 200
 
         # === PATH C: PSEO ARTICLE GENERATION (Dual-Agent Path) ===
         elif intent == "PSEO_ARTICLE":
-            # 1. AGENT A (Gemini): Generate the Body Content
-            # We rely on Gemini's large context window for the deep research and writing.
-            article_html = generate_pseo_article(original_topic, research_data['context'], history=history_text)
-            
-            # 2. AGENT B (Claude): Generate the Semantic Metadata
-            # We feed the *drafted content* into Claude for high-precision SEO.
-            seo_data = generate_seo_metadata(article_html, original_topic)
-            
-            # 3. Add to Memory
-            new_events.append({"event_type": "agent_answer", "proposal_type": "pseo_article", "data": article_html})
-            
-            # 4. Write to Database
-            session_ref = db.collection('agent_sessions').document(session_id)
-            events_ref = session_ref.collection('events')
-            for event in new_events:
-                if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                events_ref.add(event)
+            try:
+                # 1. AGENT A (Gemini): Generate the Body Content
+                article_html = generate_pseo_article(original_topic, research_data['context'], history=history_text)
+                
+                # 2. AGENT B (Claude): Generate the Semantic Metadata
+                seo_data = generate_seo_metadata(article_html, original_topic)
+                
+                # 3. Add to Memory
+                new_events.append({"event_type": "agent_answer", "proposal_type": "pseo_article", "data": article_html})
+                
+                # 4. Write to Database
+                session_ref = db.collection('agent_sessions').document(session_id)
+                events_ref = session_ref.collection('events')
+                for event in new_events:
+                    if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
+                    events_ref.add(event)
 
-            session_ref.update({
-                "status": "awaiting_feedback", 
-                "type": "work_proposal", 
-                "topic": seo_data.get('title', clean_topic), # Update topic with the better title
-                "slack_context": slack_context,
-                "last_updated": expire_time
-            })
-            
-            # 5. Send STRUCTURED DATA to N8N
-            # We merge the HTML from Agent A with the Metadata from Agent B
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
-                "session_id": session_id, 
-                "type": "pseo_draft", 
-                "payload": {
-                    "title": seo_data.get("title"),
-                    "html": article_html, # From Gemini
-                    "tags": seo_data.get("tags", []),
-                    
-                    # NEW: High-Value Metadata from Anthropic
-                    "custom_excerpt": seo_data.get("custom_excerpt"),
-                    "meta_title": seo_data.get("meta_title"),
-                    "meta_description": seo_data.get("meta_description"),
-                    "featured_image_prompt": seo_data.get("featured_image_prompt"),
-                    
-                    "status": "draft"
-                },
-                "channel_id": slack_context['channel'], 
-                "thread_ts": slack_context['ts']
-            }, verify=certifi.where(), timeout=10)
+                session_ref.update({
+                    "status": "awaiting_feedback", 
+                    "type": "work_proposal", 
+                    "topic": seo_data.get('title', clean_topic),
+                    "slack_context": slack_context,
+                    "last_updated": expire_time
+                })
+                
+                # 5. Send STRUCTURED DATA to N8N
+                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                    "session_id": session_id, 
+                    "type": "pseo_draft", 
+                    "payload": {
+                        "title": seo_data.get("title"),
+                        "html": article_html,
+                        "tags": seo_data.get("tags", []),
+                        "custom_excerpt": seo_data.get("custom_excerpt"),
+                        "meta_title": seo_data.get("meta_title"),
+                        "meta_description": seo_data.get("meta_description"),
+                        "featured_image_prompt": seo_data.get("featured_image_prompt"),
+                        "status": "draft"
+                    },
+                    "channel_id": slack_context['channel'], 
+                    "thread_ts": slack_context['ts'],
+                    "is_initial_post": is_initial_post
+                }, verify=certifi.where(), timeout=10)
 
-            return jsonify({"msg": "pSEO Draft (Enhanced) sent to N8N"}), 200
+                return jsonify({"msg": "pSEO Draft sent"}), 200
+
+            except Exception as e:
+                print(f"⚠️ PSEO_ARTICLE Fallback: {e}")
+                answer_data = generate_comprehensive_answer(original_topic, research_data['context'], history=history_text)
+                answer_text = answer_data['text']
+                new_events.append({"event_type": "agent_answer", "text": answer_text})
+                
+                session_ref = db.collection('agent_sessions').document(session_id)
+                events_ref = session_ref.collection('events')
+                for event in new_events:
+                    if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
+                    events_ref.add(event)
+
+                session_ref.update({
+                    "status": "awaiting_feedback", 
+                    "type": "work_answer", 
+                    "topic": clean_topic,
+                    "slack_context": slack_context,
+                    "last_updated": expire_time
+                })
+                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=True)
+                return jsonify({"msg": "pSEO Fallback Answer sent"}), 200
 
         else: 
             return jsonify({"error": f"Unknown intent: {intent}"}), 500
