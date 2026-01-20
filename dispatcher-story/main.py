@@ -73,7 +73,11 @@ def start_story_workflow(request):
     if isinstance(request_json, list): request_json = request_json[0]
     text_input = request_json.get('topic')
     images = request_json.get('images', []) # Expecting a list of strings (URLs or Base64)
-    slack_context = { "ts": request_json.get('slack_ts'), "thread_ts": request_json.get('slack_thread_ts'), "channel": request_json.get('slack_channel') }
+    slack_context = { 
+        "ts": request_json.get('slack_ts'), 
+        "thread_ts": request_json.get('slack_thread_ts'), 
+        "channel": request_json.get('slack_channel') 
+    }
 
     if not text_input and not images: return jsonify({"error": "Invalid request"}), 400
     
@@ -150,13 +154,23 @@ def start_story_workflow(request):
              "slack_context": slack_context
         })
         
-        db.collection('agent_sessions').document(session_id).set({
+        session_ref = db.collection('agent_sessions').document(session_id)
+        session_ref.set({
              "status": "starting", 
              "type": "work_answer", 
              "topic": text_input,
              "images": images,
              "slack_context": slack_context,
              "last_updated": expire_time
+        })
+
+        # --- PERSIST INITIAL EVENT ---
+        # Fixed: Ensure the first 'WORK' turn is also in the events subcollection
+        session_ref.collection('events').add({
+            "event_type": "user_request",
+            "text": text_input,
+            "images": images,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc)
         })
         
         dispatch_task(payload, STORY_WORKER_URL)

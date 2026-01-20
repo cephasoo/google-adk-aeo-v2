@@ -101,7 +101,14 @@ def process_feedback_logic(request):
             "status": "delegating_research",
             "last_updated": expire_time
             })
-        dispatch_task({"session_id": session_id, "topic": user_feedback, "slack_context": slack_context, "images": images}, STORY_WORKER_URL)
+        # FIX: Persist the feedback into the events subcollection
+        doc_ref.collection('events').add({
+            "event_type": "user_feedback",
+            "text": user_feedback,
+            "images": images,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc)
+        })
+        dispatch_task({"session_id": session_id, "topic": session_data.get('topic'), "feedback_text": user_feedback, "slack_context": slack_context, "images": images}, STORY_WORKER_URL)
         return jsonify({"msg": "Delegated (URL detected)"}), 200
 
     # --- ADK FIX 2: CONTEXTUAL LLM TRIAGE ---
@@ -163,9 +170,21 @@ def process_feedback_logic(request):
             "status": "delegating_research",
             "last_updated": expire_time
             })
-        # No-Strip: Pass full payload forward
+        # FIX: Persist the feedback into the events subcollection
+        doc_ref.collection('events').add({
+            "event_type": "user_feedback",
+            "text": user_feedback,
+            "images": req.get('images', []),
+            "timestamp": datetime.datetime.now(datetime.timezone.utc)
+        })
+        # No-Strip: Pass full payload forward, but preserve mission topic
         payload = req.copy()
-        payload.update({"topic": user_feedback})
+        # FIX: Ensure we pass the CURRENT turn's context, not the stale session context
+        slack_context.update({
+            "ts": req.get('slack_ts'),
+            "thread_ts": req.get('slack_thread_ts')
+        })
+        payload.update({"topic": session_data.get('topic'), "feedback_text": user_feedback, "slack_context": slack_context})
         dispatch_task(payload, STORY_WORKER_URL)
         return jsonify({"msg": "Delegated to Research Worker"}), 200
         
@@ -175,7 +194,7 @@ def process_feedback_logic(request):
             print("Internal Error: APPROVE intent reached without strict literal match. Falling back to DELEGATE.")
             # No-Strip: Pass full payload forward
             payload = req.copy()
-            payload.update({"topic": user_feedback})
+            payload.update({"topic": session_data.get('topic'), "feedback_text": user_feedback})
             dispatch_task(payload, STORY_WORKER_URL)
             return jsonify({"msg": "Fallback to research (non-verbatim approval)"}), 200
 
@@ -222,7 +241,7 @@ def process_feedback_logic(request):
             print("Refine intent found, but no proposal exists. Delegating to story worker for clarification.")
             # No-Strip: Pass full payload forward
             payload = req.copy()
-            payload.update({"topic": user_feedback})
+            payload.update({"topic": session_data.get('topic'), "feedback_text": user_feedback})
             dispatch_task(payload, STORY_WORKER_URL)
             return jsonify({"msg": "Delegated (Refine Fallback)"}), 200
 
