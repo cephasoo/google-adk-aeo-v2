@@ -4,7 +4,7 @@ setup(
     name="sonnet-prose-eval",
     version="0.1.0",
     packages=find_packages(),
-    py_modules=["eval_runner", "verify_eval_suite"],
+    py_modules=["eval_runner"],
     install_requires=[
         "google-cloud-aiplatform",
         "google-cloud-firestore",

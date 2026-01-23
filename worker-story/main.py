@@ -20,6 +20,7 @@ import google.auth
 import google.auth.transport.requests
 from google.oauth2 import id_token
 from google.cloud import firestore
+from google.cloud.firestore_v1.vector import Vector
 
 # --- Configuration ---
 PROJECT_ID = os.environ.get("PROJECT_ID")
@@ -41,7 +42,7 @@ safety_settings = {
 }
 
 # --- Global Clients ---
-model = None
+unimodel = None
 flash_model = None
 search_api_key = None
 db = None
@@ -124,31 +125,44 @@ class UnifiedModel:
             self._native_model = GenerativeModel(model_name, safety_settings=safety_settings)
             print(f"✅ Loaded Native Vertex Model: {model_name} (Safety Active)", flush=True)
 
-    def generate_content(self, prompt, generation_config=None):
+    def generate_content(self, prompt, generation_config=None, max_retries=3):
         """
-        Universal generation function with safety catching.
+        Universal generation function with safety catching and Exponential Backoff.
         """
+        import time
+        import random
+        
         # PATH A: Native Vertex AI
         if self.provider == "vertex_ai":
-            try:
-                response = self._native_model.generate_content(prompt, generation_config=generation_config)
-                
-                # Robust Safety Check: Some SDK versions throw exceptions, others return empty candidates
-                if not response.candidates or response.candidates[0].finish_reason == 3: # 3 = SAFETY
-                     raise ValueError("Safety Block via FinishReason")
-                
-                return response
-            except Exception as e:
-                # Catch both the ValueError we raised above AND any SDK-specific exceptions
-                print(f"⚠️ Vertex AI Safety/SDK Block: {e}")
-                log_safety_event("safety_block", {"prompt": prompt, "error": str(e)})
-                
-                # Create a Fake Vertex Response Object for fallback
-                class MockResponse:
-                    def __init__(self, content):
-                        self.text = content
-                
-                return MockResponse("I'm sorry, I cannot fulfill this request as it conflicts with my safety guardrails. Let's try rephrasing.")
+            retries = 0
+            while retries <= max_retries:
+                try:
+                    response = self._native_model.generate_content(prompt, generation_config=generation_config)
+                    
+                    # Robust Safety Check: Some SDK versions throw exceptions, others return empty candidates
+                    if not response.candidates or response.candidates[0].finish_reason == 3: # 3 = SAFETY
+                         raise ValueError("Safety Block via FinishReason")
+                    
+                    return response
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    # Check for Rate Limit / Quota errors (429)
+                    if "429" in error_msg or "resource exhausted" in error_msg:
+                        if retries < max_retries:
+                            wait_time = (2 ** retries) + random.uniform(0, 1)
+                            print(f"⚠️ Vertex 429 (Quota): Retrying in {wait_time:.2f}s... (Attempt {retries+1}/{max_retries})")
+                            time.sleep(wait_time)
+                            retries += 1
+                            continue
+                    
+                    # If it's a safety block or we've exhausted retries, log and return fallback
+                    print(f"⚠️ Vertex AI Safety/SDK Error: {e}")
+                    log_safety_event("generation_error", {"prompt": prompt, "error": str(e)})
+                    
+                    # Return Mock for Fallback
+                    class MockResponse:
+                        def __init__(self, content): self.text = content
+                    return MockResponse("I encountered a safety limit or internal error. Could you rephrase?")
 
         # PATH B: Universal Route (OpenAI / Anthropic via LiteLLM)
         else:
@@ -305,23 +319,26 @@ def strip_html_tags(text):
     return re.sub(r'<[^>]+>', '', text).strip()
 
 def convert_html_to_markdown(html):
-    """Converts architectural HTML into Slack-friendly Markdown."""
-    # 1. Headers
-    text = re.sub(r'<h2>(.*?)</h2>', r'*\1*\n', html)
-    text = re.sub(r'<h3>(.*?)</h3>', r'_\1_\n', text)
+    """Converts architectural HTML into Slack-friendly Markdown with a clear hierarchy."""
+    # 0. Handle H1 Title (The Master Label)
+    text = re.sub(r'<h1>(.*?)</h1>', r'*🔥 \1*\n\n', html)
     
-    # 2. Sections to separators
-    text = text.replace('</section>', '\n---\n')
+    # 1. Headers (H2 and H3)
+    text = re.sub(r'<h2>(.*?)</h2>', r'\n*▌ \1*\n', text)
+    text = re.sub(r'<h3>(.*?)</h3>', r'_ \1 _\n', text)
+    
+    # 2. Sections to separators (More space)
+    text = text.replace('</section>', '\n\n---\n\n')
     text = re.sub(r'<section[^>]*>', '', text)
     
     # 3. Lists (Simple conversion)
     text = text.replace('<ul>', '').replace('</ul>', '')
     text = text.replace('<li>', '• ').replace('</li>', '\n')
     
-    # 4. Final Strip
+    # 4. Final Strip of remaining tags
     text = re.sub(r'<[^>]+>', '', text)
     
-    # Clean up excess newlines
+    # Clean up excess newlines (Max 2)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
@@ -765,7 +782,7 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
 
 #11. The Topic Cluster Generator
 def generate_topic_cluster(topic, context, history="", is_initial=True):
-    global model
+    global unimodel
     
     state_context = "This is a NEW proposal for a new thread." if is_initial else "This is a REVISION or EXTENSION of a previous strategy in an existing thread."
     
@@ -879,120 +896,177 @@ def generate_seo_metadata(article_html, topic):
             "tags": ["The Leading Edge"]
         }
 
-#13. The Comprehensive Answer Generator (AEO-AWARE CONTENT STRATEGIST)
-def generate_comprehensive_answer(topic, context, history="", intent_hint="DIRECT_ANSWER", intent_metadata=None):
+def ensure_markdown_spacing(text):
+    """
+    Enforces double newlines for paragraphs to ensure correct Slack rendering.
+    Skips code blocks, lists, and tables to prevent breaking syntax.
+    """
+    lines = text.split('\n')
+    new_lines = []
+    in_code_block = False
+    
+    for i, line in enumerate(lines):
+        # Toggle code block state
+        if line.strip().startswith("```"):
+            in_code_block = not in_code_block
+            new_lines.append(line)
+            continue
+            
+        if in_code_block:
+            new_lines.append(line)
+            continue
+            
+        # Detect clear paragraph breaks (non-list, non-header)
+        is_list_item = line.strip().startswith(('-', '*', '1.', '•'))
+        is_header = line.strip().startswith('#')
+        is_empty = not line.strip()
+        
+        new_lines.append(line)
+        
+        # Add extra newline if it's a paragraph end and next line isn't empty
+        if not is_empty and not is_list_item and not is_header and i < len(lines) - 1:
+            next_line = lines[i+1]
+            if next_line.strip() and not next_line.strip().startswith(('-', '*', '1.', '•')):
+                new_lines.append("")  
+
+    return "\n".join(new_lines)
+
+
+# 13a. The Natural Answer Generator (Conversational & Fluid)
+def generate_natural_answer(topic, context, history=""):
+    """
+    Handles SIMPLE_QUESTION and DIRECT_ANSWER with native intelligence.
+    Bypasses the heavy 'Strategist' persona for a more natural flow.
+    """
+    global unimodel
+    print(f"DEBUG: generate_natural_answer (Native) starting... [Topic: {topic[:50]}]")
+    
+    prompt = f"""
+    You are a helpful, knowledgeable AI assistant.
+    
+    ### CONVERSATION HISTORY:
+    {history}
+    
+    ### GROUNDING DATA:
+    {context}
+    
+    ### USER INSTRUCTION:
+    {topic}
+    
+    TASK:
+    Answer naturally and conversationally. 
+    Use the GROUNDING DATA to ensure accuracy, but do not force a rigid structure unless asked.
+    If the user asks for code, use markdown code blocks.
+    Use **bold** for key concepts.
+    Ensure paragraphs are separated by blank lines.
+    """
+    
+    try:
+        response = unimodel.generate_content(prompt, generation_config={"temperature": 0.4})
+        final_text = ensure_markdown_spacing(response.text.strip())
+        
+        # Simple intent detection for metadata consistency
+        intent = "SIMPLE_QUESTION"
+        if "```" in final_text: intent = "TECHNICAL_EXPLANATION"
+        
+        return {
+            "text": final_text,
+            "intent": intent,
+            "directive": ""
+        }
+    except Exception as e:
+        print(f"Native Gen Error: {e}")
+        return {"text": f"I encountered an error generating a natural response: {e}", "intent": "ERROR", "directive": ""}
+
+
+# 13b. The Comprehensive Answer Generator (AEO-AWARE CONTENT STRATEGIST)
+def generate_comprehensive_answer(topic, context, history="", intent_hint="DIRECT_ANSWER", intent_metadata=None, context_topic=""):
     """
     Standardizes the logic for generating a direct answer.
     Uses 'detect_research_intent' signal to adjust formatting (Tables/Lists).
     """
-    global model
+    global model, unimodel
     print(f"DEBUG: generate_comprehensive_answer starting... [Topic: {topic[:50]}]")
-    is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
-    has_visuals = any("VISUAL_INSIGHT" in str(c) for c in context)
     
-    if is_grounded or has_visuals:
-        print(f"  -> Context is GROUNDED (Visuals: {has_visuals}). Enforcing Data-Lead Execution.")
-    else:
-        print(f"  -> Context is NOT grounded. Using strategic dialogue mode.")
+    # NEW: Context check includes history if researchers marked it as sufficient
+    context_str = str(context)
+    is_grounded = "GROUNDING_CONTENT" in context_str or "IN-CONTEXT HISTORY" in context_str
+    has_visuals = "VISUAL_INSIGHT" in context_str
     
-    # AUDIENCE DETECTION: Search history for tone instructions
+    # 1. PERSONA & AUDIENCE
     audience_context = detect_audience_context(history)
-
-    # UNIFIED PERSONA: The AEO-Aware Content Strategist
     persona_instruction = f"""
     You are the 'Sonnet & Prose' Senior Content Strategist. 
-    You excel at Answer Engine Optimization (AEO), Conversational Synthesis, and Visual Reasoning.
-    
-    AUDIENCE: 
-    {audience_context}
-    
-    CORE OPERATING PRINCIPLES:
-    1. **Dual-Intent Synthesis**: Connect external 'Research Context' and 'Visual Insights' (from images) with the specific artifacts and nuances found in the SLACK HISTORY. 
-    2. **Data-Lead Execution**: If research or visual data is provided (GROUNDING_CONTENT/VISUAL_INSIGHT), **DO NOT ASK FOR PERMISSION**. Provide the data immediately in the requested format.
-    3. **Visual Reasoning**: If images were analyzed, refer to specific visual elements mentioned in the VISUAL_INSIGHT context to ground your answer.
-    4. **Contextual Formatting (AEO vs. Dialogue)**: 
-       - **Production/Draft Mode**: If the user is asking for a **DRAFT**, **OUTLINE**, **TIMELINE**, **TABLE**, **PLAN**, or **STRATEGY**, strictly apply AEO Principles.
-       - **Dialogue/Research Mode**: If the user is asking a direct question or exploring a trend, provide a **Simple, Natural, and Empathetic** response.
-    5. **Deliverables Over Dialog**: If the user asks for a 'Timeline', produce a clear table. If they ask for 'Trends', list them clearly.
-    6. **Sonnet & Prose Balance**: Wrap technical depth (Prose) in a human-centric intro and a reflective conclusion (Sonnet).
-    
-    CRITICAL: Do NOT include structural labels like 'Lead', 'Summary', 'H2', 'H3', 'Prose', or 'Sonnetal close'.
+    AUDIENCE: {audience_context}
+    PRINCIPLE: provide technical depth (Prose) wrapped in human-centric perspective (Sonnet).
     """
 
-    # Signal Detection (MCP Refactored) - Prevent Second Call
-    if intent_metadata:
-        hybrid_signal_raw = intent_metadata
-        print("  -> Using cached intent metadata (Router Pass-through).")
-    else:
-        hybrid_signal_raw = mcp_detect_intent(topic)
-        print("  -> Fetched fresh intent metadata (Standalone Generator Call).")
-
+    # 2. INTENT DETECTION
     try:
-        signal_data = json.loads(hybrid_signal_raw)
+        signal_data = json.loads(intent_metadata) if intent_metadata else {}
         research_intent = signal_data.get("intent", "FORMAT_GENERAL")
         formatting_directive = signal_data.get("directive", "")
-    except Exception:
+    except:
         research_intent = "FORMAT_GENERAL"
         formatting_directive = ""
 
-    if is_grounded:
-        temp = 0.0
-        # Incorporate Intent into formatting instruction
-        intent_instruction = ""
-        if research_intent in ["TIMELINE", "FORMAT_TIMELINE"]:
-            intent_instruction = "CRITICAL: The user wants a TIMELINE. Provide a structured table with 'Date', 'Event', and 'Description'."
-        elif research_intent in ["TABLE", "FORMAT_TABLE"]:
-            intent_instruction = "CRITICAL: Response MUST include a structured Markdown table. Do not include extra horizontal lines (---) beyond the standard Markdown header separator to ensure clean data extraction."
-        elif research_intent in ["CHART", "FORMAT_CHART"]:
-            intent_instruction = f"CRITICAL: The user wants a CHART. You MUST output data using Mermaid.js syntax (e.g., pie, graph TD, sequenceDiagram, mindmap). Do not add conversational filler around the code block. {formatting_directive}"
-        elif research_intent in ["LISTICLE", "FORMAT_LISTICLE"]:
-            intent_instruction = f"CRITICAL: The user wants a LISTICLE. Use high-impact headers, numbered lists, and bolding for key terms. {formatting_directive}"
-        elif formatting_directive:
-            intent_instruction = f"FORMATTING DIRECTIVE: {formatting_directive}"
-        
-        if research_intent in ["CHART", "FORMAT_CHART", "CSV", "FORMAT_CSV"]:
-            # Visual-Only Mode: Suppress long persona filler
-            # UPGRADE: If intent is CHART but topic suggests "realistic" or "studio" image, we could trigger generate_studio_image here.
-            # However, for now, we'll stick to Mermaid unless explicitly asked for a 'generation'.
-            instruction = f"CRITICAL: You are in VISUAL MODE. {intent_instruction} DO NOT provide Python code. Provide a brief analytical summary (2-3 sentences max), followed ONLY by the Mermaid.js or CSV content."
-        elif intent_hint == "SIMPLE_QUESTION":
-             # Even for simple questions, stay in character as the strategist.
-             instruction = f"You are a Senior Content Strategist. Provide a direct, expert, and proactive answer. If the user's query implies a strategic need, provide a recommendation or a 'draft-next' strategy immediately. {persona_instruction}"
-        else:
-            instruction = f"CRITICAL: Base answer PRIMARILY on 'GROUNDING_CONTENT'. {intent_instruction} {persona_instruction}"
-    else:
-        temp = 0.7
-        if research_intent in ["CHART", "FORMAT_CHART"]:
-             # Even without grounding, the user wants a visualization
-             instruction = f"CRITICAL: You are in VISUAL MODE. {intent_instruction} Use your internal knowledge. Provide a brief analytical summary (2-3 sentences max), then ONLY the Mermaid.js content."
-        elif intent_hint == "SIMPLE_QUESTION":
-             # Even for simple questions, stay in character as the strategist.
-             instruction = f"You are a Senior Content Strategist. Provide a direct, expert, and proactive answer. If the user's query implies a strategic need, provide a recommendation or a 'draft-next' strategy immediately. {persona_instruction}"
-        else:
-             instruction = f"You are a strategic partner and content architect. {persona_instruction}"
-        
+    # 3. FORMATTING SENTINEL (Hard-coded prioritization)
+    intent_instruction = ""
+    target_temp = 0.3 # Lower temperature for better formatting adherence
+    
+    if research_intent in ["TIMELINE", "FORMAT_TIMELINE"]:
+        intent_instruction = "CRITICAL: Output a structured TIMELINE table."
+    elif research_intent in ["TABLE", "FORMAT_TABLE"]:
+        intent_instruction = "CRITICAL: Output a Markdown TABLE."
+    elif research_intent in ["LISTICLE", "FORMAT_LISTICLE", "OUTLINE"]:
+        intent_instruction = f"CRITICAL: Output a DETAILED OUTLINE/LISTICLE. Use headings and bullet points. {formatting_directive}"
+    elif formatting_directive:
+        intent_instruction = f"FORMATTING DIRECTIVE: {formatting_directive}"
+
+    # 4. DYNAMIC PROMPT ASSEMBLY
     prompt = f"""
-        {instruction}
+    {persona_instruction}
+    
+    ### CONTEXT & MISSION:
+    The user is engaged in a thread about: "{context_topic}"
+    (Audience is already defined in persona above)
+    
+    ### LATEST INSTRUCTION (PRIORITY):
+    "{topic}"
+    
+    ### GROUNDING DATA:
+    {context}
+    
+    ### CONVERSATION HISTORY:
+    {history}
+    
+    ### FORMATTING GUIDANCE:
+    {intent_instruction}
+    
+    Generate a response that directly addresses the LATEST INSTRUCTION while using the GROUNDING DATA as supporting evidence.
+    """
+
+    try:
+        # Use unimodel (which has backoff) for the final synthesis
+        response = unimodel.generate_content(prompt, generation_config={"temperature": target_temp})
         
-        CONVERSATION HISTORY:
-        {history}
+        # Enforce spacing on the output
+        final_text = ensure_markdown_spacing(response.text.strip())
         
-        CURRENT REQUEST: "{topic}"
-        
-        RESEARCH CONTEXT:
-        {context}
-        
-        RESPONSE:
-        """
-    return {
-        "text": model.generate_content(prompt, generation_config={"temperature": temp}).text.strip(),
-        "intent": research_intent if intent_hint != "SIMPLE_QUESTION" else "SIMPLE_QUESTION",
-        "directive": formatting_directive
-    }
+        return {
+            "text": final_text,
+            "intent": research_intent,
+            "directive": formatting_directive
+        }
+    except Exception as e:
+        print(f"Synthesis Error: {e}")
+        # Final fallback
+        fallback = unimodel.generate_content(prompt).text.strip()
+        return {"text": fallback, "intent": research_intent, "directive": formatting_directive}
 
 # 14. The Dedicated pSEO Article Generator (High Trust & Transparency)
 def generate_pseo_article(topic, context, history=""):
-    global model
+    global unimodel
     print(f"Tool: Generating pSEO Article for '{topic}'")
     
     # AUDIENCE DETECTION: Search history for tone instructions
@@ -1045,72 +1119,95 @@ def generate_pseo_article(topic, context, history=""):
     Article Draft:
     """
     
-    return model.generate_content(prompt, generation_config={"temperature": 0.3}).text.strip()
+    return unimodel.generate_content(prompt, generation_config={"temperature": 0.3}).text.strip()
 
 # 14.5 The Recursive Deep-Dive Generator (Dynamic Room-by-Room Construction)
 def generate_deep_dive_article(topic, context, history="", target_length=1500):
-    global model
+    global unimodel
     print(f"Tool: Initiating Recursive Deep-Dive for '{topic}' (Target: {target_length} words)")
     
+    # CLAMP: Prevent unbounded generation that crashes SSL/Webhooks
+    target_length = min(3500, max(500, target_length))
+    
     is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
+    audience_context = detect_audience_context(history)
     
     # Calculate architecture: Aim for ~300 words per section
     num_sections = max(3, target_length // 300)
-    words_per_section = target_length // (num_sections + 1) # Plus one for intro
+    words_per_section = target_length // (num_sections + 1)
     
-    # PHASE 1: Generate the Blueprint
+    # PHASE 1: Generate the Blueprint & Title
     blueprint_prompt = f"""
+    You are the Lead Architect for 'Sonnet & Prose'.
     Create a strategic {target_length} word article blueprint for: "{topic}".
-    STRUCTURE: Provide exactly {num_sections} thematic sections (H2) for the body.
-    Return ONLY a JSON list of objects:
-    [ {{"title": "Section Title", "focus": "What specific data or analogies to use here"}} ]
     
+    AUDIENCE: {audience_context}
     RESEARCH CONTEXT: {context}
     HISTORY: {history}
+
+    OUTPUT: Return ONLY a JSON object:
+    {{
+        "title": "A Compelling Blog Post Title",
+        "sections": [ {{"title": "Section Title", "focus": "Data or analogies to use"}} ]
+    }}
+    STRUCTURE: Provide exactly {num_sections} thematic H2 sections.
     """
     
     try:
-        blueprint_raw = model.generate_content(blueprint_prompt).text.strip()
+        blueprint_raw = unimodel.generate_content(blueprint_prompt).text.strip()
         if "```json" in blueprint_raw: blueprint_raw = blueprint_raw.split("```json")[1].split("```")[0].strip()
-        sections = json.loads(blueprint_raw)
+        blueprint = json.loads(blueprint_raw)
+        title = blueprint.get("title", f"The Strategic Analysis of {topic}")
+        sections = blueprint.get("sections", [])
     except Exception:
+        # Fallback to pSEO if blueprinting fails
         return generate_pseo_article(topic, context, history)
 
     # PHASE 2: Recursive Room Building
-    article_parts = []
+    article_parts = [f"<h1>{title}</h1>"]
     
     # Intro
-    print(f"  + Drafting Architectural Intro...")
-    intro_prompt = f"Write a compelling {words_per_section}-word philosophical intro for: '{topic}'. History: {history}"
-    article_parts.append(f'<section class="intro">\n{model.generate_content(intro_prompt).text.strip()}\n</section>')
+    print(f"  + Drafting Hook Intro...")
+    intro_prompt = f"""
+    Write a compelling {words_per_section}-word editorial intro (Sonnet style) for: '{title}'.
+    AUDIENCE: {audience_context}
+    HISTORY: {history}
+    GOAL: Connect the topic to the human experience with a sharp hook.
+    """
+    article_parts.append(f'<section class="intro">\n{unimodel.generate_content(intro_prompt).text.strip()}\n</section>')
     
     for i, section in enumerate(sections):
         print(f"  + Constructing Room {i+1}/{len(sections)}: {section['title']}...")
         
-        # CONTEXT STITCHING: Strip HTML and pass the tail of the previous part
+        # CONTEXT STITCHING
         last_plain = strip_html_tags(article_parts[-1])
         prev_context = ". ".join(last_plain.split(". ")[-3:]) if ". " in last_plain else last_plain[-150:]
         
         room_prompt = f"""
-        Write a {words_per_section}-word deep-dive section for: "{topic}".
+        Write a {words_per_section}-word editorial deep-dive (Prose style) for: "{title}".
         
         CHAPTER: {section['title']}
         FOCUS: {section['focus']}
-        TONE: Authoritative, architectural, visionary.
+        TONE: Architectural, authoritative, but readable.
         TRANSITION FROM: "...{prev_context}"
+        
+        STRICT LIMIT: Stay under {words_per_section + 50} words.
         
         GROUNDING DATA: {context if is_grounded else "Internal Knowledge base"}
         CONVERSATIONAL HISTORY: {history}
         
-        OUTPUT: Provide the content wrapped in <h2> if there's a title, with clean 1-2 paragraph structure.
+        OUTPUT: Start with <h2>{section['title']}</h2> then the content.
         """
-        room_content = model.generate_content(room_prompt).text.strip()
+        room_content = unimodel.generate_content(room_prompt).text.strip()
         article_parts.append(f'<section class="body-part">\n{room_content}\n</section>')
+
+    # Conclusion
+    print("  + Drafting Final Reflection...")
+    conc_prompt = f"Write a {words_per_section // 2}-word concluding thought (Sonnet style) for '{title}'. Audience: {audience_context}. Summary of key impact."
+    article_parts.append(f'<section class="conclusion">\n<h2>Final Reflection</h2>\n{unimodel.generate_content(conc_prompt).text.strip()}\n</section>')
 
     # PHASE 3: Methodology
     print("  + Finalizing Methodology & Transparency...")
-    
-    # Clean source extraction for the footer
     if is_grounded:
         found_urls = list(set(re.findall(r'https?://[^\s<>"]+', str(context))))
         source_text = ", ".join(found_urls[:5]) if found_urls else "Verified research sources."
@@ -1120,8 +1217,8 @@ def generate_deep_dive_article(topic, context, history="", target_length=1500):
     methodology_text = f"""
     <section class="methodology">
     <h2>Methodology & Transparency</h2>
-    This {target_length}-word deep-dive was architected recursively to ensure narrative depth.
-    Sources included: {source_text}
+    This {target_length}-word analysis was recursively architected for the 'Sonnet & Prose' publication.
+    Sources: {source_text}
     </section>
     """
     article_parts.append(methodology_text)
@@ -1157,30 +1254,30 @@ def create_euphemistic_links(keyword_context, is_initial=True):
     CRITICAL SCHEMA: Exact keys: "then_concept", "now_concept", "link".
     Structure: {{ "interlinked_concepts": [ {{ "then_concept": "...", "now_concept": "...", "link": "..." }} ] }}
     """
-    response = model.generate_content(prompt)
+    response = unimodel.generate_content(prompt)
     return extract_json(response.text)
 
 #16. The Proposal Critic and Refiner
 def critique_proposal(topic, current_proposal):
-    global model
+    global unimodel
     prompt = f"Review proposal for '{topic}': {json.dumps(current_proposal, indent=2)}. If excellent, respond: APPROVED. Else, provide concise feedback to improve 'Then vs Now' contrast."
-    return model.generate_content(prompt).text.strip()
+    return unimodel.generate_content(prompt).text.strip()
 
 #17. The Proposal Refiner
 def refine_proposal(topic, current_proposal, critique):
-    global model
+    global unimodel
     prompt = f"""
     REWRITE proposal. Topic: {topic}. Draft: {json.dumps(current_proposal)}. Critique: {critique}. 
     Preserve keys: 'then_concept', 'now_concept', 'link'. Ensure JSON format.
     """
-    return extract_json(model.generate_content(prompt).text)
+    return extract_json(unimodel.generate_content(prompt).text)
 
 # --- THE STATEFUL MAIN WORKER FUNCTION (FINAL V6 - SOCIAL AWARE) ---
 @functions_framework.http
 def process_story_logic(request):
-    global model, flash_model, db
-    if model is None:
-        model = UnifiedModel(MODEL_PROVIDER, MODEL_NAME)
+    global unimodel, flash_model, db
+    if unimodel is None:
+        unimodel = UnifiedModel(MODEL_PROVIDER, MODEL_NAME)
     
     if flash_model is None:
         # Initialize Vertex AI explicitly for the Flash Model (Triage)
@@ -1231,17 +1328,22 @@ def process_story_logic(request):
         history_events = [doc.to_dict() for doc in query.stream()]
 
 
-    # MEMORY EXPANSION: Removed [-10:] slice to see the WHOLE conversation
+    # RESTORED: Removed the MAX_HISTORY_EVENTS limit to preserve the full conversation thread.
+    # The 429 errors are now handled by Exponential Backoff in UnifiedModel.
+    recent_events = history_events
+    
+    # 2. Extract context from history for Triage and Routing
     formatted_history = []
-    for i, e in enumerate(history_events):
-        if e.get('event_type') == 'tool_call':
-            # MEMORY EXPANSION: Removed char limits to keep full data context
-            entry = f"Turn {i+1} (System Search Results): {e.get('content', '')}" 
-        else:
-            # MEMORY EXPANSION: Removed char limits for full conversational fidelity
-            entry = f"Turn {i+1} ({e.get('event_type')}): {e.get('text', '')}"
-        formatted_history.append(entry)
-
+    for event in recent_events:
+        etype = event.get('event_type')
+        if etype == 'user_request':
+            formatted_history.append(f"USER: {event.get('text')}")
+        elif etype == 'user_feedback':
+            formatted_history.append(f"USER FEEDBACK: {event.get('text')}")
+        elif etype in ['agent_answer', 'agent_reply', 'agent_proposal']:
+            content = event.get('text') or event.get('content') or str(event.get('data', ''))
+            formatted_history.append(f"AGENT: {content}") 
+    
     history_text = "\n".join(formatted_history)
     
     # --- MONITORING: Context Loading Statistics ---
@@ -1265,9 +1367,9 @@ def process_story_logic(request):
                 *   *Triggers:* "Okay", "Thanks", "Hello", "How are you", or providing a short answer to an agent's conversational prompt (e.g., answering "What's brewing?" with "Heineken").
                 *   *Rule:* If the user is just continuing a friendly chat without asking for a draft, research, or a direct answer, pick this.
 
-            2.  **DEEP_DIVE**: **LONG-FORM ARCHITECTURE.** Select this if the user asks for a specific word count OR uses major drafting keywords.
-                *   *Triggers:* "800 words", "1500 words", "Deep dive", "Draft an article", "Write a post", "Detailed draft", "Comprehensive article".
-                *   *Priority:* If a word count is mentioned, ALWAYS pick this over TOPIC_CLUSTER.
+            2.  **DEEP_DIVE**: **LONG-FORM BODY CONTENT (800-2000+ Words).** Select this ONLY if the user asks for a complete article body or specific word counts.
+                *   *CRITICAL:* **NEVER** select this for "Outlines", "Briefs", "Checklists", or "Structures". If the word "Outline" or "Structure" appears, it is NOT a Deep Dive. 
+                *   *Triggers:* "800 words", "1500 words", "Write the full post", "Draft the entire article".
 
             3.  **TOPIC_CLUSTER_PROPOSAL**: **SEMANTIC ARCHITECTURE GENERATION.** The user SPECIFICALLY ASKS to *create, build, or generate* the full hierarchical map of keywords. 
                 *   *POSITIVE TRIGGERS:* "Generate", "Build", "Construct cluster", "Map out", "Create the strategy".
@@ -1286,18 +1388,17 @@ def process_story_logic(request):
             5.  **PSEO_ARTICLE**: **Ghost CMS Content Hook.** Only select this if the message is a NEW request to create a pSEO article or EXPLICITLY mentions "**pSEO**", "**Ghost**", or "**Ghost CMS**" as a command. 
                 *   *CRITICAL:* If the user is asking *about* a previous pSEO article (e.g., "How did you integrate X?", "Explain the delivery", "What's the status?"), **DO NOT** select this. Use **SIMPLE_QUESTION** or **DIRECT_ANSWER** instead.
 
-            6.  **SIMPLE_QUESTION**: For straightforward fact-checks, definitions, or clarifying a previous response. 
-                *   *Rule:* Use this if the user is asking a basic question or explicitly asks for a **"direct response"** or **"direct answer"**. Choosing this bypasses the strategic persona for a more concise readout.
-                *   *Triggers:* "What is X?", "What did you say about Y?", "Explain that word", "Give me a direct answer."
+            6.  **SIMPLE_QUESTION**: **The Efficient Operative/OS Mode.** For fact-checks, definitions, **OUTLINES**, **BRIEFS**, retrieving information from history, or re-formatting previous points. 
+                *   *Triggers:* "Summarize our progress," "Blog Outline," "Create an outline," "Format those points as bullets," "Explain your logic."
+                *   *Rule:* If the user is asking for a **STRUCTURE** (Outline/Brief) or asks about the agent's own process, you MUST select this.
 
-            7.  **DIRECT_ANSWER**: The "Strategic Consultant" mode. Select this for **SYNTHESIS**, **DETAILED ANALYSIS**, **SECURITY REVIEWS**, and **EXPERT OPINIONS**. 
-                *   *Rule:* Use this for complex "how" or "why" tasks where the user wants a technical deep-dive (like AP2/A2A sufficiency).
-                *   *Priority:* This is our default "expert" mode for high-value strategic work.
+            7.  **DIRECT_ANSWER**: **The Research Architect.** Select this ONLY for **NOVEL SYNTHESIS** or **TECHNICAL AUDITS** that require combining multiple external data sources into a new expert opinion. 
+                *   *Example:* "Analyze the security layer of AP2 vs standard PCI-DSS." 
 
-            ### NEGATIVE CONSTRAINTS (DO NOT CLASSIFY AS PSEO_ARTICLE IF):
-            - The user is asking for an explanation of a previous draft.
-            - The user is providing feedback or asking for a direct response about the previous turn.
-            - The intent is to understand the "delivery" or "logic" of the agent.
+            ### NEGATIVE CONSTRAINTS (DO NOT CLASSIFY AS DEEP_DIVE IF):
+            - The word "Outline" is present.
+            - The user is asking for a "Brief" or "Checklist".
+            - The request is purely for the formatting or retrieval of previously discussed information.
 
             CONVERSATION HISTORY:
             {history_text}
@@ -1305,13 +1406,13 @@ def process_story_logic(request):
             USER REQUEST (THE COMMAND): "{sanitized_topic}"
             MISSION SUBJECT: "{original_topic}"
 
-            CRITICAL: Respect the user's explicit request for a "direct response" by selecting SIMPLE_QUESTION. Otherwise, use DIRECT_ANSWER for any request asking for "Synthesis", "Analysis", "Sufficiency", or "Expert Opinion". Respond with ONLY the category name.
+            CRITICAL: Respect the "No Outlines in Deep_Dive" rule. Select SIMPLE_QUESTION for all Outlines, history retrieval, or formatting requests. Select DIRECT_ANSWER ONLY for new, complex synthesis of external data. Respond with ONLY the category name.
 
             """
         # --- EXECUTION: Triage Model Selection ---
         # Triage on the Command (sanitized_topic) but with history context
         intent = flash_model.generate_content(triage_prompt).text.strip()
-        print(f"TELEMETRY: Triage V5.4 -> Intent classified as: [{intent}] for command: '{sanitized_topic[:50]}...'")
+        print(f"TELEMETRY: Triage V6.0 -> Intent classified as: [{intent}] for command: '{sanitized_topic[:50]}...'")
 
         # Initialize variables for the response
         new_events = [] 
@@ -1333,7 +1434,7 @@ def process_story_logic(request):
             History:
             {history_text}
             """
-            reply_text = model.generate_content(social_prompt).text.strip()
+            reply_text = unimodel.generate_content(social_prompt).text.strip()
             
             new_events.append({"event_type": "agent_reply", "text": reply_text})
             
@@ -1443,7 +1544,7 @@ def process_story_logic(request):
                 "message": reply_text, 
                 "channel_id": slack_context['channel'], 
                 "thread_ts": slack_context['ts']
-            }, verify=True)
+            }, verify=certifi.where(), timeout=10)
             return jsonify({"msg": "Safety block applied"}), 200
 
         # --- MONITORING: Signal Propagation ---
@@ -1455,7 +1556,8 @@ def process_story_logic(request):
 
         # 3. Generate Output based on Intent
         if intent in ["DIRECT_ANSWER", "SIMPLE_QUESTION"]:
-            answer_data = generate_comprehensive_answer(original_topic, research_data['context'], history=history_text, intent_hint=intent, intent_metadata=research_data.get("research_intent"))
+            # ROUTING CHANGE: use generate_natural_answer for fluid interactions
+            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text)
             answer_text = answer_data['text']
             research_intent = answer_data['intent']
             formatting_directive = answer_data['directive']
@@ -1488,7 +1590,7 @@ def process_story_logic(request):
                 "channel_id": slack_context['channel'], 
                 "thread_ts": slack_context['ts'],
                 "is_initial_post": is_initial_post
-            }, verify=True)
+            }, verify=certifi.where(), timeout=15)
             return jsonify({"msg": "Answer sent"}), 200
 
         elif intent == "DEEP_DIVE":
@@ -1499,7 +1601,13 @@ def process_story_logic(request):
             # Use Claude for metadata even for deep dives
             seo_data = generate_seo_metadata(article_html, original_topic)
             
-            new_events.append({"event_type": "agent_answer", "proposal_type": "deep_dive_article", "data": article_html})
+            # SUCCESS: Log the event to subcollection for Feedback Worker retrieval
+            new_events.append({
+                "event_type": "agent_proposal", 
+                "proposal_type": "deep_dive", 
+                "text": convert_html_to_markdown(article_html),
+                "proposal_data": {"article_html": article_html, "seo": seo_data}
+            })
             
             session_ref = db.collection('agent_sessions').document(session_id)
             events_ref = session_ref.collection('events')
@@ -1507,7 +1615,6 @@ def process_story_logic(request):
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
                 events_ref.add(event)
 
-            # UPDATE METADATA: Preserve Mission Topic
             update_data = {
                 "status": "awaiting_feedback", 
                 "type": "work_proposal", 
@@ -1516,6 +1623,7 @@ def process_story_logic(request):
             }
             if is_initial_post: update_data["topic"] = seo_data.get('title', clean_topic)
             session_ref.update(update_data)
+
             requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
                 "session_id": session_id, 
                 "type": "social", 
@@ -1523,7 +1631,7 @@ def process_story_logic(request):
                 "channel_id": slack_context['channel'], 
                 "thread_ts": slack_context['ts'],
                 "is_initial_post": is_initial_post
-            }, verify=True)
+            }, verify=certifi.where(), timeout=30)
             return jsonify({"msg": "Deep-Dive article sent"}), 200
 
         elif intent == "TOPIC_CLUSTER_PROPOSAL":
@@ -1532,7 +1640,11 @@ def process_story_logic(request):
                 cluster_data = generate_topic_cluster(original_topic, research_data['context'], history=history_text, is_initial=is_initial_post)
                 if not cluster_data: raise ValueError("Failed to parse cluster JSON.")
                 
-                new_events.append({"event_type": "agent_answer", "proposal_type": "topic_cluster", "data": cluster_data})
+                new_events.append({
+                    "event_type": "agent_proposal", 
+                    "proposal_type": "topic_cluster", 
+                    "proposal_data": cluster_data
+                })
                 
                 session_ref = db.collection('agent_sessions').document(session_id)
                 events_ref = session_ref.collection('events')
@@ -1559,12 +1671,12 @@ def process_story_logic(request):
                     "channel_id": slack_context['channel'], 
                     "thread_ts": slack_context['ts'],
                     "is_initial_post": is_initial_post
-                }, verify=True, timeout=30) # Increased timeout for large clusters
+                }, verify=certifi.where(), timeout=30) # Increased timeout for large clusters
                 return jsonify({"msg": "Topic cluster sent"}), 200
 
             except Exception as e:
                 print(f"⚠️ TOPIC_CLUSTER Fallback: {e}")
-                answer_data = generate_comprehensive_answer(original_topic, research_data['context'], history=history_text)
+                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic)
                 answer_text = answer_data['text']
                 new_events.append({"event_type": "agent_answer", "text": answer_text})
                 
@@ -1582,7 +1694,7 @@ def process_story_logic(request):
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
                 session_ref.update(update_data)
-                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=True, timeout=10)
+                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=certifi.where(), timeout=15)
                 return jsonify({"msg": "Cluster Fallback Answer sent"}), 200
 
         elif intent == "THEN_VS_NOW_PROPOSAL":
@@ -1626,12 +1738,12 @@ def process_story_logic(request):
                     "channel_id": slack_context['channel'], 
                     "thread_ts": slack_context['ts'],
                     "is_initial_post": is_initial_post
-                }, verify=True, timeout=15)
+                }, verify=certifi.where(), timeout=20)
                 return jsonify({"msg": "Then-vs-Now proposal sent"}), 200
 
             except ValueError as e:
                 # Fallback
-                answer_text = generate_comprehensive_answer(original_topic, research_data['context'], history=history_text)
+                answer_text = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic)['text']
                 new_events.append({"event_type": "agent_answer", "text": answer_text})
                 
                 session_ref = db.collection('agent_sessions').document(session_id)
@@ -1649,8 +1761,7 @@ def process_story_logic(request):
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
                 session_ref.update(update_data)
-
-                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=True)
+                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=certifi.where(), timeout=15)
                 return jsonify({"msg": "Fallback answer sent"}), 200
 
         # === PATH C: PSEO ARTICLE GENERATION (Dual-Agent Path) ===
@@ -1662,8 +1773,13 @@ def process_story_logic(request):
                 # 2. AGENT B (Claude): Generate the Semantic Metadata
                 seo_data = generate_seo_metadata(article_html, original_topic)
                 
-                # 3. Add to Memory
-                new_events.append({"event_type": "agent_answer", "proposal_type": "pseo_article", "data": article_html})
+                # SUCCESS: Log the event to subcollection
+                new_events.append({
+                    "event_type": "agent_proposal", 
+                    "proposal_type": "pseo_article", 
+                    "text": convert_html_to_markdown(article_html),
+                    "proposal_data": {"article_html": article_html}
+                })
                 
                 # 4. Write to Database
                 session_ref = db.collection('agent_sessions').document(session_id)
@@ -1699,13 +1815,13 @@ def process_story_logic(request):
                     "channel_id": slack_context['channel'], 
                     "thread_ts": slack_context['ts'],
                     "is_initial_post": is_initial_post
-                }, verify=certifi.where(), timeout=10)
+                }, verify=certifi.where(), timeout=30)
 
                 return jsonify({"msg": "pSEO Draft sent"}), 200
 
             except Exception as e:
                 print(f"⚠️ PSEO_ARTICLE Fallback: {e}")
-                answer_data = generate_comprehensive_answer(original_topic, research_data['context'], history=history_text)
+                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic)
                 answer_text = answer_data['text']
                 new_events.append({"event_type": "agent_answer", "text": answer_text})
                 
@@ -1723,7 +1839,7 @@ def process_story_logic(request):
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
                 session_ref.update(update_data)
-                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=True)
+                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=certifi.where(), timeout=15)
                 return jsonify({"msg": "pSEO Fallback Answer sent"}), 200
 
         else: 
@@ -1736,7 +1852,7 @@ def process_story_logic(request):
 # --- FUNCTION: Ingest Knowledge ---
 @functions_framework.http
 def ingest_knowledge(request):
-    global db, model
+    global db, unimodel
     if db is None: db = firestore.Client(project=PROJECT_ID)
     vertexai.init(project=PROJECT_ID, location=LOCATION)
     embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")

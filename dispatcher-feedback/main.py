@@ -31,14 +31,15 @@ def dispatch_task(payload, target_url):
 @functions_framework.http
 def handle_feedback_workflow(request):
     req = request.get_json(silent=True)
+    if not req: return jsonify({"error": "No JSON payload"}), 400
     if isinstance(req, list): req = req[0]
     
     # NORMALIZE: Ensure worker-compatible context exists without stripping original payload
     if 'slack_context' not in req:
         req['slack_context'] = {
-            "ts": req.get('slack_ts'),
-            "thread_ts": req.get('slack_thread_ts'),
-            "channel": req.get('slack_channel')
+            "ts": req.get('slack_ts') or req.get('ts'),
+            "thread_ts": req.get('slack_thread_ts') or req.get('thread_ts'),
+            "channel": req.get('slack_channel') or req.get('channel')
         }
         
     dispatch_task(req, FEEDBACK_WORKER_URL)

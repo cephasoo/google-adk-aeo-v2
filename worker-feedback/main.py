@@ -12,6 +12,44 @@ import certifi
 import requests
 from google.cloud import firestore, tasks_v2
 
+# --- UNIFIED MODEL ADAPTER (The Brain Switch) ---
+class UnifiedModel:
+    def __init__(self, provider, model_name):
+        self.provider = provider
+        self.model_name = model_name
+        if provider == "vertex_ai":
+            vertexai.init(project=PROJECT_ID, location=LOCATION)
+            from vertexai.generative_models import GenerativeModel, SafetySetting
+            # Standard safety settings
+            safety = [
+                SafetySetting(category=SafetySetting.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH),
+                SafetySetting(category=SafetySetting.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH),
+                SafetySetting(category=SafetySetting.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH),
+                SafetySetting(category=SafetySetting.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH),
+            ]
+            self._native_model = GenerativeModel(model_name, safety_settings=safety)
+            print(f"✅ Loaded Unified Vertex Model: {model_name}")
+
+    def generate_content(self, prompt, generation_config=None, max_retries=3):
+        import time
+        import random
+        if self.provider == "vertex_ai":
+            retries = 0
+            while retries <= max_retries:
+                try:
+                    return self._native_model.generate_content(prompt, generation_config=generation_config)
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if "429" in error_msg or "resource exhausted" in error_msg:
+                        if retries < max_retries:
+                            wait_time = (2 ** retries) + random.uniform(0, 1)
+                            print(f"⚠️ Feedback 429 (Quota): Retrying in {wait_time:.2f}s...")
+                            time.sleep(wait_time)
+                            retries += 1
+                            continue
+                    raise e
+        return None
+
 # --- Config ---
 PROJECT_ID = os.environ.get("PROJECT_ID")
 LOCATION = os.environ.get("LOCATION")
@@ -23,7 +61,7 @@ FUNCTION_IDENTITY_EMAIL = os.environ.get("FUNCTION_IDENTITY_EMAIL")
 # PROPOSAL_KEYWORDS = ["outline", "draft", "proposal", "story", "brief"]
 INGEST_KNOWLEDGE_URL = os.environ.get("INGEST_KNOWLEDGE_URL")
 
-model = None
+unimodel = None
 db = None
 tasks_client = None
 
@@ -62,18 +100,17 @@ def dispatch_task(payload, target_url):
 
 def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None):
     if not tool_confirmation or not tool_confirmation.get("confirmed"): raise PermissionError("Wait for approval.")
-    return model.generate_content(f"Tell a 'Then and Now' story using: {interlinked_concepts}").text
+    return unimodel.generate_content(f"Tell a 'Then and Now' story using: {interlinked_concepts}").text
 
 def refine_proposal(topic, current_proposal, critique):
-    return extract_json(model.generate_content(f"REWRITE proposal... Draft: {json.dumps(current_proposal)}...").text)
+    return extract_json(unimodel.generate_content(f"REWRITE proposal... Draft: {json.dumps(current_proposal)}...").text)
 
 # --- THE STATEFUL AND HARDENED FEEDBACK WORKER ---
 @functions_framework.http
 def process_feedback_logic(request):
-    global model, db
-    if model is None: 
-        vertexai.init(project=PROJECT_ID, location=LOCATION)
-        model = GenerativeModel(MODEL_NAME)
+    global unimodel, db
+    if unimodel is None: 
+        unimodel = UnifiedModel("vertex_ai", MODEL_NAME)
         db = firestore.Client()
 
     req = request.get_json(silent=True)
@@ -132,33 +169,35 @@ def process_feedback_logic(request):
     
     history_text = "\n".join(formatted_history)
 
-    # --- ADK FIX 3: STRICT VERBATIM APPROVAL ---
-    # We strip common formatting and check for the literal "approved" (case-insensitive)
-    sanitized_feedback = user_feedback.strip().strip('*_~').lower()
-    is_strict_approval = sanitized_feedback == "approved"
+    # --- ADK FIX 3: ROBUST APPROVAL DETECTION ---
+    # Fast-path for single-word approvals
+    tokens = re.sub(r'[^\w\s]', '', user_feedback).strip().lower().split()
+    is_quick_approval = len(tokens) <= 3 and any(t in ["approved", "approve"] for t in tokens)
 
-    if is_strict_approval:
+    if is_quick_approval:
         intent = "APPROVE"
-        print("Literal 'approved' detected. Forcing APPROVE intent.")
+        print(f"Quick Approval detected. Forcing APPROVE intent.")
     else:
         feedback_triage_prompt = f"""
-        Analyze the user's latest message in the context of the conversation history. Classify the user's INTENT into one of two categories:
+        Analyze the user's latest message in the context of the conversation history. Classify the user's INTENT into one of three categories:
 
-        1.  **REFINE**: The user is asking for a change to the agent's current strategy or last structured proposal (e.g., a 'Then vs Now' draft).
-            *   *Examples:* "Make it shorter", "Can you change the tone?", "Add a point about X, Why does X look like X when it should look like Y?"
+        1.  **APPROVE**: The user is explicitly confirming, finalizing, or "approving" the current result for the record or knowledge base.
+            *   *Examples:* "I approve on the ideas in this conversation.", "Approved!", "This is perfect, save it.", "I like this, we are done."
 
-        2.  **DELEGATE**: The user is asking a new factual question, confirming a proposed research direction, or asking a "meta" question about the agent's behavior. This category is for anything that requires the research agent to keep working.
-            *   **CRITICAL INCLUSION:** If the user is saying "Yes", "Proceed", "Looks good", or confirming a suggestion for further research or development, select **DELEGATE**.
-            *   *Examples:* "What's trending in social media?", "Yes, please do that research.", "Demystify job impact.", "Thanks!", "Makes sense."
+        2.  **REFINE**: The user is asking for a change to the agent's current strategy or last structured proposal (e.g., a 'Then vs Now' draft).
+            *   *Examples:* "Make it shorter", "Can you change the tone?", "Add a point about X"
+
+        3.  **DELEGATE**: The user is asking a new factual question, confirming a proposed research direction, or asking a "meta" question. 
+            *   **CRITICAL:** If the user is saying "Yes", "Proceed", "Looks good", or confirming a suggestion for *further research*, select **DELEGATE**.
 
         CONVERSATION HISTORY:
         {history_text}
 
         USER'S LATEST MESSAGE: "{user_feedback}"
 
-        Respond with ONLY the category name (REFINE or DELEGATE).
+        Respond with ONLY the category name (APPROVE, REFINE, or DELEGATE).
         """
-        intent = model.generate_content(feedback_triage_prompt).text.strip().upper()
+        intent = unimodel.generate_content(feedback_triage_prompt).text.strip().upper()
     
     print(f"Feedback Triage classified intent as: {intent}")
     
@@ -189,35 +228,57 @@ def process_feedback_logic(request):
         return jsonify({"msg": "Delegated to Research Worker"}), 200
         
     elif intent == "APPROVE":
-        # Final safety check: We ONLY proceed with finalization/ingestion if it was a strict literal approval
-        if not is_strict_approval:
-            print("Internal Error: APPROVE intent reached without strict literal match. Falling back to DELEGATE.")
-            # No-Strip: Pass full payload forward
-            payload = req.copy()
-            payload.update({"topic": session_data.get('topic'), "feedback_text": user_feedback})
-            dispatch_task(payload, STORY_WORKER_URL)
-            return jsonify({"msg": "Fallback to research (non-verbatim approval)"}), 200
+        # Final safety check: We proceed if either quick-approval was hit OR LLM classified as APPROVE
+        print(f"Executing APPROVE path for: {user_feedback}")
 
         ts = datetime.datetime.now(datetime.timezone.utc)
         user_event = {"event_type": "user_feedback", "text": user_feedback, "intent": "APPROVE", "timestamp": ts}
 
         # FIX: Fetch FULL history from subcollection to find the proposal
         full_history = [doc.to_dict() for doc in events_ref.order_by('timestamp').stream()]
+        # --- ROBUST ARTIFACT EXTRACTION (Avoids Old "Then-and-Now" Rants) ---
         target_content = None
         
+        # We go backwards. The FIRST high-fidelity thing we hit is our target.
         for event in reversed(full_history):
-            if event.get('event_type') == 'adk_request_confirmation':
+            etype = event.get('event_type')
+            
+            # CATEGORY A: Direct Artifacts (Text already exists)
+            # This includes blog posts, topic clusters, and direct answers
+            if etype in ['agent_answer', 'agent_proposal', 'loop_draft']:
+                # Prefer text, then data/payload
+                raw_data = event.get('proposal_data') or event.get('payload') or event.get('data')
+                target_content = event.get('text') or event.get('content')
+                
+                if not target_content and raw_data:
+                    target_content = json.dumps(raw_data, indent=2) if isinstance(raw_data, (dict, list)) else str(raw_data)
+                
+                if target_content:
+                    print(f"Found Recent Artifact: {etype}")
+                    break
+
+            # CATEGORY B: Deferred Synthesis (Requires calling a tool)
+            # Only synthesize if this was the most recent professional event
+            elif etype == 'adk_request_confirmation' and event.get('payload'):
+                print("Found Recent Request for Synthesis (Then-and-Now). Synthesizing...")
                 target_content = tell_then_and_now_story(event['payload'], tool_confirmation={"confirmed": True})
                 break
-            elif event.get('event_type') in ['agent_answer', 'agent_proposal', 'agent_reply']:
-                target_content = event.get('text') or event.get('content') or str(event.get('data', ''))
-                break
+
+        # Pass 2: Social Fallback
+        if not target_content:
+            for event in reversed(full_history):
+                if event.get('event_type') == 'agent_reply':
+                    target_content = event.get('text') or event.get('content')
+                    if target_content: break
         
         if not target_content:
             return jsonify({"msg": "Nothing to approve found."}), 404
 
+        # --- RAG INGESTION ---
         if INGEST_KNOWLEDGE_URL:
-            dispatch_task({"session_id": session_id, "topic": session_data.get('topic'), "story": target_content}, INGEST_KNOWLEDGE_URL)
+             # Prepend Mission Context for better future retrieval
+            rag_content = f"MISSION: {session_data.get('topic', 'General Inquiry')}\n\nCONTENT:\n{target_content}"
+            dispatch_task({"session_id": session_id, "topic": session_data.get('topic'), "story": rag_content}, INGEST_KNOWLEDGE_URL)
         
         # FIX: Update parent status, but write events to subcollection
         doc_ref.update({
@@ -229,23 +290,34 @@ def process_feedback_logic(request):
         events_ref.add(user_event)
         events_ref.add({"event_type": "final_output", "content": target_content, "timestamp": datetime.datetime.now(datetime.timezone.utc)})
         
-        requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "proposal": [{"link": target_content}], "thread_ts": slack_context.get('ts'), "channel_id": slack_context.get('channel'), "is_final_story": True, "is_initial_post": False }, verify=certifi.where())
+        requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "proposal": [{"link": target_content}], "thread_ts": slack_context.get('ts'), "channel_id": slack_context.get('channel'), "is_final_story": True, "is_initial_post": False }, verify=certifi.where(), timeout=15)
         return jsonify({"msg": "Approved and Ingested"}), 200
 
     elif intent == "REFINE":
         # FIX: Fetch history from subcollection
         full_history = [doc.to_dict() for doc in events_ref.order_by('timestamp').stream()]
-        last_prop = next((e for e in reversed(full_history) if e.get('proposal_data')), None)
         
-        if not last_prop:
-            print("Refine intent found, but no proposal exists. Delegating to story worker for clarification.")
+        # --- ROBUST ARTIFACT EXTRACTION (Same as APPROVE path) ---
+        last_prop_data = None
+        for event in reversed(full_history):
+            etype = event.get('event_type')
+            # Look for structured data in common keys
+            data = event.get('proposal_data') or event.get('payload') or event.get('data')
+            if data and etype in ['agent_proposal', 'loop_draft', 'adk_request_confirmation', 'agent_answer']:
+                last_prop_data = data
+                print(f"Refine: Found target artifact in '{etype}' event.")
+                break
+        
+        if not last_prop_data:
+            print("Refine intent found, but no usable technical artifact exists in history. Delegating...")
             # No-Strip: Pass full payload forward
             payload = req.copy()
             payload.update({"topic": session_data.get('topic'), "feedback_text": user_feedback})
             dispatch_task(payload, STORY_WORKER_URL)
             return jsonify({"msg": "Delegated (Refine Fallback)"}), 200
 
-        new_prop = refine_proposal(session_data.get('topic'), last_prop['proposal_data'], user_feedback)
+        # Optimization: If it's a dict/list, we refine it. If it's raw text, we treat it as the 'current_proposal'
+        new_prop = refine_proposal(session_data.get('topic'), last_prop_data, user_feedback)
         new_id = f"approval_{uuid.uuid4().hex[:8]}"
         
         # FIX: Write to subcollection
@@ -264,6 +336,6 @@ def process_feedback_logic(request):
             "channel_id": slack_context.get('channel'),
             "is_final_story": False,
             "is_initial_post": False
-        }, verify=certifi.where())
+        }, verify=certifi.where(), timeout=15)
 
     return jsonify({"message": "Refinement processed."}), 200
