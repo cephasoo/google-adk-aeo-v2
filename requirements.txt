@@ -1,4 +1,0 @@
-google-cloud-aiplatform
-google-cloud-firestore
-requests
-certifi

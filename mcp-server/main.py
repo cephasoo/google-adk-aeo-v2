@@ -138,6 +138,25 @@ def scrub_pii(text):
     text = re.sub(r'\+?\d{1,3}[-.\s]?\d{3}[-.\s]?\d{3}[-.\s]?\d{4}', '[PHONE_MASKED]', text)
     return text
 
+def extract_acronym_definitions(text):
+    """
+    Scans text for patterns like 'Verifiable Digital Credentials (VDC)' or 'VDC (Verifiable Digital Credentials)'.
+    Returns a list of clear definitions found to ensure the Writer includes them.
+    """
+    definitions = []
+    # Pattern 1: Full Name (Acronym) -> e.g. "World Health Organization (WHO)"
+    # Constraint: Acronym must be 2-6 caps, Name must be capitalized words
+    pattern1 = re.findall(r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,5})\s+\(([A-Z]{2,6})\)', text)
+    for name, acronym in pattern1:
+        definitions.append(f"{acronym}: {name}")
+        
+    # Pattern 2: Acronym (Full Name) -> e.g. "WHO (World Health Organization)"
+    pattern2 = re.findall(r'([A-Z]{2,6})\s+\(([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,5})\)', text)
+    for acronym, name in pattern2:
+        definitions.append(f"{acronym}: {name}")
+        
+    return list(set(definitions))
+
 def handle_tool_call(name, arguments):
     """
     Central dispatcher for all sensory tools.
@@ -174,6 +193,9 @@ def handle_tool_call(name, arguments):
         payload = {"url": url, "rejectResourceTypes": ["media", "font"], "gotoOptions": {"timeout": 15000, "waitUntil": "networkidle2"}}
         response = requests.post(endpoint, json=payload, timeout=20, verify=certifi.where())
         soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # CLEANUP FIRST: Remove noise elements (nav, footer, ads) BEFORE extraction
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "ad"]): tag.decompose()
 
         # Extract high-value image URLs (Social-Media Aware Detection)
         found_images = []
@@ -206,13 +228,39 @@ def handle_tool_call(name, arguments):
                     found_images.append(clean_src)
             if len(found_images) >= 5: break
 
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "ad"]): tag.decompose()
+        # --- NEW: Extract Hyperlinks for Recursive "Turbo" Navigation ---
+        found_links = []
+        skip_domains = ["twitter.com", "x.com", "facebook.com", "instagram.com", "linkedin.com", "youtube.com"]
+        for link in soup.find_all("a", href=True):
+            href = link.get("href", "").strip()
+            text = link.get_text().strip()
+            
+            # Filter noise
+            if not href.startswith("http"): continue # Skip relative/internal links for now to avoid broken fragments
+            if len(text) < 5: continue # Skip "Click here", "More", icons
+            if any(d in href for d in skip_domains): continue # Skip generic social shares
+            
+            # Format: "Link Text (URL)"
+            entry = f"- {text} ({href})"
+            if entry not in found_links:
+                found_links.append(entry)
+            
+            if len(found_links) >= 8: break # Limit context window usage
+
+        # (Decompose moved to top)
         text = soup.get_text(separator='\n\n')
         clean_text = re.sub(r'\n\s*\n', '\n\n', text).strip()
         
-        # Append images as grounded context
+        # Append images AND links as grounded context
         image_context = "\n\n[DETECTED_IMAGES]:\n" + "\n".join(found_images) if found_images else ""
-        result = (clean_text[:18000] + image_context).strip()
+        link_context = "\n\n[DETECTED_LINKS]:\n" + "\n".join(found_links) if found_links else ""
+        
+        # --- ACROYNM SAFEGUARD ---
+        # Extract explicit definitions found in the text so they don't get buried
+        acronym_defs = extract_acronym_definitions(clean_text)
+        def_context = "\n\n[DETECTED_DEFINITIONS]:\n" + "\n".join(acronym_defs) if acronym_defs else ""
+        
+        result = (def_context + "\n\n" + clean_text[:18000] + image_context + link_context).strip()
 
     elif name == "rag_search":
         query = arguments.get("query")

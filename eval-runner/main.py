@@ -1,4 +1,5 @@
 import os
+import functions_framework
 import json
 import requests
 import datetime
@@ -267,24 +268,28 @@ class EvalRunner:
         return blocks
 
 
-# --- GCP Cloud Function Entry Point ---
-def evaluate_session_trigger(event, context):
+# --- GCP Cloud Function Entry Point (Gen 2) ---
+@functions_framework.cloud_event
+def evaluate_session_trigger(cloud_event):
     """
-    Cloud Function entry point for Firestore trigger.
+    Cloud Function entry point for Firestore trigger (Gen 2 CloudEvent).
     Triggered when an 'agent_sessions' document is created or updated.
     """
+    event_data = cloud_event.data
+    
     # 1. Parse session_id from document path
-    # Example path: projects/{project}/databases/(default)/documents/agent_sessions/{sessionId}
-    resource = event.get('value', {}).get('name', '')
+    # Resource format: projects/{project}/databases/(default)/documents/agent_sessions/{sessionId}
+    # CloudEvent data.value.name contains the full resource path
+    resource = event_data.get('value', {}).get('name', '')
     if not resource:
-        print("Error: No resource name in event.")
+        print("Error: No resource name in CloudEvent data.")
         return
     
     session_id = resource.split('/')[-1]
     
     # 2. Check status to avoid infinite loops if eval updates the same doc
-    # (Though here we write to 'evaluations', so we are safe)
-    status = event.get('value', {}).get('fields', {}).get('status', {}).get('stringValue', '')
+    # (Here we read from 'fields' structure in Firestore Change Event)
+    status = event_data.get('value', {}).get('fields', {}).get('status', {}).get('stringValue', '')
     
     if status == "completed" or "awaiting" in status:
         print(f"Trigger: Evaluating session {session_id} based on status '{status}'")

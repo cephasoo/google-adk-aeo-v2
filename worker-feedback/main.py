@@ -316,7 +316,16 @@ def process_feedback_logic(request):
             dispatch_task(payload, STORY_WORKER_URL)
             return jsonify({"msg": "Delegated (Refine Fallback)"}), 200
 
-        # Optimization: If it's a dict/list, we refine it. If it's raw text, we treat it as the 'current_proposal'
+        # Optimization: If it's a dict/list (JSON Proposal), we refine it locally.
+        # If it's raw text/HTML (Article), we DELEGATE to Story Worker for "Repurpose Mode".
+        if isinstance(last_prop_data, str) or (isinstance(last_prop_data, dict) and 'interlinked_concepts' not in last_prop_data):
+            print("Refine target is Text/HTML Article. Delegating to Story Worker for Repurposing...")
+            payload = req.copy()
+            payload.update({"topic": session_data.get('topic'), "feedback_text": user_feedback, "slack_context": slack_context})
+            dispatch_task(payload, STORY_WORKER_URL)
+            return jsonify({"msg": "Delegated (Article Refinement)"}), 200
+
+        # JSON Path (Then-vs-Now)
         new_prop = refine_proposal(session_data.get('topic'), last_prop_data, user_feedback)
         new_id = f"approval_{uuid.uuid4().hex[:8]}"
         

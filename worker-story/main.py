@@ -44,6 +44,7 @@ safety_settings = {
 # --- Global Clients ---
 unimodel = None
 flash_model = None
+specialist_model = None
 search_api_key = None
 db = None
 mcp_client = None
@@ -230,7 +231,7 @@ def detect_audience_context(history):
     if not history: return default
     
     hist_lower = history.lower()
-    if "8-grader" in hist_lower or "8th grade" in hist_lower or "simple" in hist_lower:
+    if "8-grader" in hist_lower or "8th grade" in hist_lower or "explain like i'm 5" in hist_lower or "eli5" in hist_lower:
          return "An 8th-grader. Use extremely simple words, short sentences, and clear analogies. Avoid jargon."
     elif "non-technical" in hist_lower:
          return "Non-technical business owners. Focus on value and 'what it does' rather than 'how it works'."
@@ -251,6 +252,8 @@ def log_safety_event(event_name, data):
         print(f"Logging Block: {e}")
 
 # --- Utils ---
+# (Moved ensure_markdown_spacing to line ~960 for consolidation as ensure_slack_compatibility)
+
 # --- Input Santitation Utility ---
 def sanitize_input_text(text):
     """Strips common markdown/Slack formatting from the start and end of a string."""
@@ -304,15 +307,52 @@ def extract_core_topic(user_prompt, history=""):
     print(f"Distilled Core Topic: '{core_topic}'")
     return core_topic
 
-def extract_target_word_count(user_prompt):
+def extract_target_word_count(text):
     """
-    Finds a numeric word count in the prompt (e.g., "1500 words").
-    Defaults to 1500 if none found.
+    Semantically extracts the user's desired word count using a Dedicated Anthropic Model (Claude).
+    Handles nuance: "1600+", "at least 2000", "short summary", "< 500".
     """
-    matches = re.findall(r'(\d+)\+?[\s-]*words?', user_prompt, re.IGNORECASE)
-    if matches:
-        return int(matches[0])
-    return 1500
+    global specialist_model
+    try:
+        # Fallback default
+        default_count = 1500
+        
+        # 1. Use the Global Specialist Brain (Anthropic)
+        prompt = f"""
+        Analyze the user's request: "{text}"
+        
+        Extract the implied target word count as a single integer.
+        
+        ### INTERPRETATION RULES:
+        1. **Explicit Numbers**: '1500 words' -> 1500.
+        2. **Floors/Expansion (+, >, at least)**: If the user implies a minimum (e.g., '1600+', '>1500', 'at least 2000'), provide a target slightly ABOVE that number to satisfy the request.
+        3. **Ceilings/Constraint (<, less than, max)**: If the user implies a limit (e.g., '<1000', 'max 500'), provide a target BELOW that number.
+        4. **Vague Descriptors**: 
+           - "Deep dive" / "Long form" -> ~2000
+           - "Short" / "Brief" -> ~800
+           - "Standard" / "Default" -> 1500
+        
+        OUTPUT: Return ONLY the integer (e.g., 1800). Do not write sentences.
+        """
+        
+        # 2. Generate
+        response = specialist_model.generate_content(prompt).text.strip()
+        
+        # 3. Clean and Parse
+        digits = re.sub(r'\D', '', response)
+        
+        if digits:
+            return int(digits)
+        else:
+            return default_count
+            
+    except Exception as e:
+        print(f"Semantic Extraction Failed: {e}. Using Default.")
+        # Regex Fallback (Just in case)
+        match = re.search(r'(\d+)\s*(?:word|token)s?', text, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        return 1500
 
 def strip_html_tags(text):
     """Removes HTML tags for clean context stitching and plain-text views."""
@@ -321,10 +361,10 @@ def strip_html_tags(text):
 def convert_html_to_markdown(html):
     """Converts architectural HTML into Slack-friendly Markdown with a clear hierarchy."""
     # 0. Handle H1 Title (The Master Label)
-    text = re.sub(r'<h1>(.*?)</h1>', r'*🔥 \1*\n\n', html)
+    text = re.sub(r'<h1>(.*?)</h1>', r'*\1*\n\n', html)
     
     # 1. Headers (H2 and H3)
-    text = re.sub(r'<h2>(.*?)</h2>', r'\n*▌ \1*\n', text)
+    text = re.sub(r'<h2>(.*?)</h2>', r'\n*\1*\n', text)
     text = re.sub(r'<h3>(.*?)</h3>', r'_ \1 _\n', text)
     
     # 2. Sections to separators (More space)
@@ -547,6 +587,24 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
                 all_images.extend(found_img_links[:2])
                 tool_logs.append({"event_type": "tool_call", "tool_name": "recollective_scrape", "status": "success", "content": f"Found images: {found_img_links[:2]}"})
 
+            # --- TURBO CHARGED: Deep Navigator (Recursive Link Analysis) ---
+            # If the scrape was successful, check if we should go deeper
+            if scrape_data and "[DETECTED_LINKS]:" in scrape_data:
+                links_section = scrape_data.split("[DETECTED_LINKS]:")[1]
+                deep_url = analyze_deep_navigation(links_section, grounding_subject, history_context)
+                
+                if deep_url:
+                    print(f"Sensory Router: Deep Navigator decided to click: {deep_url}")
+                    deep_data = get_mcp_client().call("scrape_article", {"url": deep_url})
+                    if deep_data:
+                         # Append the recursive finding as high-value context
+                        context_snippets.append(f"[DEEP_NAVIGATOR_INSIGHT (Source: {deep_url})]:\n{deep_data[:8000]}")
+                        tool_logs.append({"event_type": "tool_call", "tool_name": "deep_navigator_scrape", "status": "success", "content": f"Recursively scraped: {deep_url}"})
+                    else:
+                        print("Sensory Router: Deep click returned no data.")
+                else:
+                    print("Sensory Router: Deep Navigator decided NO_ACTION (No critical link found).")
+
     if all_images:
         print(f"Sensory Router: Analyzing {len(all_images)} images for visual grounding...")
         for i, img in enumerate(all_images):
@@ -558,6 +616,52 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
             visual_context = analyze_image(img, prompt=f"Analyze this image in the context of: {grounding_subject}")
             context_snippets.append(f"[VISUAL_INSIGHT]: {visual_context}")
             tool_logs.append({"event_type": "tool_call", "tool_name": "analyze_image", "status": "success", "content": f"[VISUAL_INSIGHT]: {visual_context}"})
+
+    return {"context": context_snippets, "tool_logs": tool_logs, "research_intent": "KEYWORD_SENSORY"}
+
+# --- Deep Navigator Logic ---
+def analyze_deep_navigation(links_text, mission_topic, history_context):
+    """
+    Uses the Specialist Model to decide if we should recursively scrape a 'Child Link'.
+    Returns: The URL to scrape (str) or None.
+    """
+    global specialist_model
+    if not links_text or "No links found" in links_text: return None
+    
+    print(f"Deep Navigator: Analyzing {links_text.count('h')} potential links for topic '{mission_topic}'...")
+
+    prompt = f"""
+    You are a Senior Research Navigator.
+    MISSION: We are researching '{mission_topic}'.
+    CONTEXT: We just scraped a page and found these 'Child Links'.
+    
+    TASK:
+    Analyze the links below. Determine if ONE of them is likely to contain CRITICAL information missing from our current understanding.
+    
+    CRITERIA:
+    1. Relevance: Must be directly related to the core mystery/topic.
+    2. Value Add: Must likely contain data, specs, or details not usually found on the home page.
+    3. Safety: Do not click login, signup, or social media share links.
+    
+    LINKS FOUND:
+    {links_text}
+    
+    DECISION:
+    Return ONLY the URL of the single best link to click.
+    If none are critical, return "NO_ACTION".
+    """
+    
+    try:
+        response = specialist_model.generate_content(prompt).text.strip()
+        if "http" in response and "NO_ACTION" not in response:
+            # Extract clean URL (handling potential markdown wrapper)
+            url_match = re.search(r'(https?://[^\s<>"]+)', response)
+            if url_match:
+                return url_match.group(1)
+        return None
+    except Exception as e:
+        print(f"Deep Navigator Error: {e}")
+        return None
 
     # 2. Automated Signal Detection (MCP Refactored)
     print("Sensory Router: Detecting Signals (Geo & Intent) via MCP Hub...")
@@ -868,13 +972,11 @@ def generate_seo_metadata(article_html, topic):
     """
     
     try:
-        # 1. Initialize the Specialist Brain via your Adapter
-        # This ensures we use the exact same logic/keys as the rest of the app
-        specialist = UnifiedModel(provider="anthropic", model_name="claude-sonnet-4-5")
+        # 1. Use the Global Specialist Brain (Anthropic)
         
         # 2. Generate Content using the Universal Method
         # The adapter returns a response object where .text is the content
-        response = specialist.generate_content(prompt, generation_config={"temperature": 0.7})
+        response = specialist_model.generate_content(prompt, generation_config={"temperature": 0.7})
         content = response.text.strip()
         
         # 3. Use the Unified Super-Listener
@@ -896,11 +998,15 @@ def generate_seo_metadata(article_html, topic):
             "tags": ["The Leading Edge"]
         }
 
-def ensure_markdown_spacing(text):
+def ensure_slack_compatibility(text):
     """
-    Enforces double newlines for paragraphs to ensure correct Slack rendering.
-    Skips code blocks, lists, and tables to prevent breaking syntax.
+    Ensures text is formatted correctly for Slack:
+    1. Enforces double newlines for paragraphs.
+    2. Converts Markdown bold (**) to Slack bold (*).
+    
+    Skips code blocks to prevent breaking syntax.
     """
+    if not text: return ""
     lines = text.split('\n')
     new_lines = []
     in_code_block = False
@@ -921,7 +1027,11 @@ def ensure_markdown_spacing(text):
         is_header = line.strip().startswith('#')
         is_empty = not line.strip()
         
-        new_lines.append(line)
+        # FIX BOLDING: Convert **text** to *text* only if not in code block
+        # Use regex to replace double asterisks with single, preserving inner content
+        processed_line = re.sub(r'\*\*(.+?)\*\*', r'*\1*', line)
+        
+        new_lines.append(processed_line)
         
         # Add extra newline if it's a paragraph end and next line isn't empty
         if not is_empty and not is_list_item and not is_header and i < len(lines) - 1:
@@ -963,7 +1073,7 @@ def generate_natural_answer(topic, context, history=""):
     
     try:
         response = unimodel.generate_content(prompt, generation_config={"temperature": 0.4})
-        final_text = ensure_markdown_spacing(response.text.strip())
+        final_text = ensure_slack_compatibility(response.text.strip())
         
         # Simple intent detection for metadata consistency
         intent = "SIMPLE_QUESTION"
@@ -980,7 +1090,7 @@ def generate_natural_answer(topic, context, history=""):
 
 
 # 13b. The Comprehensive Answer Generator (AEO-AWARE CONTENT STRATEGIST)
-def generate_comprehensive_answer(topic, context, history="", intent_hint="DIRECT_ANSWER", intent_metadata=None, context_topic=""):
+def generate_comprehensive_answer(topic, context, history="", intent_metadata=None, context_topic=""):
     """
     Standardizes the logic for generating a direct answer.
     Uses 'detect_research_intent' signal to adjust formatting (Tables/Lists).
@@ -1051,7 +1161,7 @@ def generate_comprehensive_answer(topic, context, history="", intent_hint="DIREC
         response = unimodel.generate_content(prompt, generation_config={"temperature": target_temp})
         
         # Enforce spacing on the output
-        final_text = ensure_markdown_spacing(response.text.strip())
+        final_text = ensure_slack_compatibility(response.text.strip())
         
         return {
             "text": final_text,
@@ -1065,7 +1175,7 @@ def generate_comprehensive_answer(topic, context, history="", intent_hint="DIREC
         return {"text": fallback, "intent": research_intent, "directive": formatting_directive}
 
 # 14. The Dedicated pSEO Article Generator (High Trust & Transparency)
-def generate_pseo_article(topic, context, history=""):
+def generate_pseo_article(topic, context, history="", history_events=None):
     global unimodel
     print(f"Tool: Generating pSEO Article for '{topic}'")
     
@@ -1073,38 +1183,65 @@ def generate_pseo_article(topic, context, history=""):
     audience_context = detect_audience_context(history)
 
     # 1. Determine System Instruction (Grounding Logic)
-    # This ensures the model sticks to the facts found by the Researcher (worker-story)
     is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
-    if is_grounded:
-        system_instruction = "EVIDENCE-BASED WRITING: Base the article PRIMARILY on the provided 'Research Context'. Do not hallucinate data."
-    else:
-        system_instruction = "You are an expert Editor. Use the provided context to write a high-authority article."
-
-    # 2. Strict System Prompt for "Sonnet & Prose" Style
-    prompt = f"""
-    You are the Senior Editor for 'Sonnet & Prose', a publication exploring the intersection of creativity (Sonnet) and automation (Prose).
     
+    # 2. History Check for Repurposing (Adherence)
+    # Check if a structural draft exists in history (proposal_type="deep_dive")
+    has_existing_draft = False
+    is_repurpose_command = any(kw in topic.lower() for kw in ["dump", "repurpose", "convert", "use existing", "use the draft", "publish"])
+    has_markdown_structure = "## " in str(history) or "Title:" in str(history)
+    
+    if history_events:
+        has_existing_draft = any(e.get('proposal_type') in ['deep_dive', 'pseo_article'] for e in history_events)
+    else:
+        has_existing_draft = False
+
+    # Combined Check: If explicit command OR strong artifact signals
+    if is_repurpose_command and has_markdown_structure:
+        has_existing_draft = True
+    elif "Deep-Dive Complete" in str(history) or "Here is the draft" in str(history):
+        has_existing_draft = True
+    
+    if has_existing_draft:
+        print("  + Detected existing draft (Structural Check). Switching to REPURPOSE MODE.")
+        system_instruction = """
+        You are a Content Formatter. 
+        TASK: Convert the EXISTING DRAFT found in the 'Conversation History' into the specific HTML structure below.
+        CRITICAL: Do not rewrite the substance. Keep the original content, analogies, and tone. Just apply the requested HTML tags and organization.
+        """
+    else:
+        print("  + No draft detected. Switching to AUTHOR MODE.")
+        if is_grounded:
+            system_instruction = "You are a Clear Technical Communicator. Base the article PRIMARILY on the provided 'Research Context'."
+        else:
+            system_instruction = "You are a Clear Technical Communicator. Use the provided context to write a high-authority article."
+
+    if has_existing_draft:
+        tone_instruction = "Tone: Maintain the exact professional tone and depth of the existing draft."
+    else:
+        tone_instruction = "Tone: Clear, engaging, professional English. Use analogies to explain complex ideas, but maintain technical accuracy. Rule: Define technical acronyms on first use (e.g., 'Hardware Security Module (HSM)')."
+
+    # 3. Strict System Prompt
+    prompt = f"""
     {system_instruction}
     
     AUDIENCE: 
     {audience_context}
     
-    TONE:
-    - **The Sonnet:** The introduction and conclusion must be human-centric, philosophical, and empathetic.
-    - **The Prose:** The body must be technical, architectural, and actionable.
+    {tone_instruction}
     
     STRUCTURE REQUIREMENTS (HTML Format):
-    1.  **<section class="intro">**: A compelling hook connecting the topic to the human experience.
+    1.  **<section class="intro">**: A compelling, simple hook connecting the topic to the reader.
     2.  **<section class="body">**: Detailed analysis using <h2> and <h3> tags. Use specific data/facts from the context.
     3.  **<section class="methodology">**: A TRANSPARENCY FOOTER. 
         - Must be titled "## Methodology & Sources".
         - Explicitly list the domains/articles found in the research.
-        - Explain *why* you selected them (e.g., "Used Google Trends data to verify 2025 growth").
+        - Explain *why* you selected them.
     
     CRITICAL RULES:
-    - Do NOT hallucinate. If the context is empty, admit it.
+    - Do NOT hallucinate.
     - Return ONLY the HTML content (no ```html``` markdown wrappers).
-    - Do NOT include labels like 'Intro', 'Body', or 'Methodology' as text; use the provided HTML class structure for organization.
+    - Do NOT include labels like 'Intro', 'Body', or 'Methodology' as text.
     - Ensure it is ready for Ghost CMS.
 
     CONTEXTUAL DATA:
@@ -1122,7 +1259,7 @@ def generate_pseo_article(topic, context, history=""):
     return unimodel.generate_content(prompt, generation_config={"temperature": 0.3}).text.strip()
 
 # 14.5 The Recursive Deep-Dive Generator (Dynamic Room-by-Room Construction)
-def generate_deep_dive_article(topic, context, history="", target_length=1500):
+def generate_deep_dive_article(topic, context, history="", history_events=None, target_length=1500):
     global unimodel
     print(f"Tool: Initiating Recursive Deep-Dive for '{topic}' (Target: {target_length} words)")
     
@@ -1132,47 +1269,70 @@ def generate_deep_dive_article(topic, context, history="", target_length=1500):
     is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
     audience_context = detect_audience_context(history)
     
-    # Calculate architecture: Aim for ~300 words per section
-    num_sections = max(3, target_length // 300)
-    words_per_section = target_length // (num_sections + 1)
+    # Calculate architecture: Dynamic Range (3-8 sections)
+    # logic: We give the Blueprint Architect the freedom to choose, but provide a heuristic target.
+    # We remove the rigid calc: num_sections = max(3, target_length // 300)
+    words_per_section = 300 # Baseline heuristic for prompting
     
-    # PHASE 1: Generate the Blueprint & Title
+    # PHASE 1: Generate the Blueprint & Title (The Architect)
     blueprint_prompt = f"""
-    You are the Lead Architect for 'Sonnet & Prose'.
-    Create a strategic {target_length} word article blueprint for: "{topic}".
+    You are the Lead Architect. Create a strategic content blueprint for: "{topic}".
+    Target Length: ~{target_length} words.
+    
+    ### STEP 1: HISTORY CHECK (CONSENSUS)
+    Check the `HISTORY` below. 
+    - **IF** the user provided a **specific Title** or **Outline** (e.g. "Title: ..."), YOU MUST USE IT. Do NOT invent a new title if one is given.
+    - **IF** a specific Outline structure exists, ADHERE TO IT.
+    - **OTHERWISE (Default)**: Design an optimal structure from scratch based on the topic, collected context, and conversation history.
+    
+    ### STEP 2: STYLE ANALYSIS
+    Analyze the user's request ("{topic}") for specific tone/style instructions (e.g., "sarcastic", "storytelling", "academic", "debate").
+    - **IF DETECTED**: Apply that style to the writing instructions below.
+    - **IF SILENT**: Use the DEFAULT STYLE: "Clear, engaging, professional English. Use analogies to explain complex ideas, but maintain technical accuracy."
+    
+    ### STEP 3: BLUEPRINT GENERATION
+    Design the optimal structure.
+    - **Sections**: Create between 3 and 8 H2 sections depending on the complexity of the topic.
+    - **Flow**: Ensure a logical narrative arc.
     
     AUDIENCE: {audience_context}
     RESEARCH CONTEXT: {context}
     HISTORY: {history}
-
+    
     OUTPUT: Return ONLY a JSON object:
     {{
-        "title": "A Compelling Blog Post Title",
-        "sections": [ {{"title": "Section Title", "focus": "Data or analogies to use"}} ]
+        "title": "A Compelling Title (Or the Agreed Title)",
+        "sections": [ 
+            {{
+                "title": "Section Title", 
+                "writing_instruction": "Specific instruction for the writer (e.g., 'Tell a story about X', 'List 5 facts about Y'). Ensure it aligns with the detected style."
+            }} 
+        ]
     }}
-    STRUCTURE: Provide exactly {num_sections} thematic H2 sections.
     """
     
     try:
         blueprint_raw = unimodel.generate_content(blueprint_prompt).text.strip()
         if "```json" in blueprint_raw: blueprint_raw = blueprint_raw.split("```json")[1].split("```")[0].strip()
         blueprint = json.loads(blueprint_raw)
-        title = blueprint.get("title", f"The Strategic Analysis of {topic}")
+        title = blueprint.get("title", f"The Analysis of {topic}")
         sections = blueprint.get("sections", [])
-    except Exception:
+    except Exception as e:
+        print(f"Blueprint Error: {e}")
         # Fallback to pSEO if blueprinting fails
-        return generate_pseo_article(topic, context, history)
+        return generate_pseo_article(topic, context, history, history_events=history_events)
 
-    # PHASE 2: Recursive Room Building
+    # PHASE 2: Recursive Room Building (The Writer)
     article_parts = [f"<h1>{title}</h1>"]
     
     # Intro
     print(f"  + Drafting Hook Intro...")
     intro_prompt = f"""
-    Write a compelling {words_per_section}-word editorial intro (Sonnet style) for: '{title}'.
+    Write a compelling {words_per_section}-word intro for: '{title}'.
+    
     AUDIENCE: {audience_context}
-    HISTORY: {history}
-    GOAL: Connect the topic to the human experience with a sharp hook.
+    STYLE: Clear, engaging, professional English. Use analogies for complex ideas.
+    GOAL: {topic}
     """
     article_parts.append(f'<section class="intro">\n{unimodel.generate_content(intro_prompt).text.strip()}\n</section>')
     
@@ -1183,18 +1343,20 @@ def generate_deep_dive_article(topic, context, history="", target_length=1500):
         last_plain = strip_html_tags(article_parts[-1])
         prev_context = ". ".join(last_plain.split(". ")[-3:]) if ". " in last_plain else last_plain[-150:]
         
+        instruction = section.get('writing_instruction', 'Explain this concept clearly.')
+        
         room_prompt = f"""
-        Write a {words_per_section}-word editorial deep-dive (Prose style) for: "{title}".
+        Write a {words_per_section}-word section for: "{title}".
         
         CHAPTER: {section['title']}
-        FOCUS: {section['focus']}
-        TONE: Architectural, authoritative, but readable.
+        INSTRUCTION: {instruction}
         TRANSITION FROM: "...{prev_context}"
         
         STRICT LIMIT: Stay under {words_per_section + 50} words.
         
+        GLOBAL CONSTRAINT: Ensure professional but accessible English. Avoid jargon, but do not dumb down technical concepts. Define technical acronyms on first use (e.g., 'Payment Card Industry (PCI)').
+        
         GROUNDING DATA: {context if is_grounded else "Internal Knowledge base"}
-        CONVERSATIONAL HISTORY: {history}
         
         OUTPUT: Start with <h2>{section['title']}</h2> then the content.
         """
@@ -1214,10 +1376,14 @@ def generate_deep_dive_article(topic, context, history="", target_length=1500):
     else:
         source_text = "AEO Synthesis from Knowledge Base."
 
+    # Calculate interim word count for the footer
+    current_content = " ".join(article_parts)
+    est_words = len(current_content.split())
+
     methodology_text = f"""
     <section class="methodology">
     <h2>Methodology & Transparency</h2>
-    This {target_length}-word analysis was recursively architected for the 'Sonnet & Prose' publication.
+    This {est_words}-word analysis was recursively architected for the 'Sonnet & Prose' publication.
     Sources: {source_text}
     </section>
     """
@@ -1275,7 +1441,7 @@ def refine_proposal(topic, current_proposal, critique):
 # --- THE STATEFUL MAIN WORKER FUNCTION (FINAL V6 - SOCIAL AWARE) ---
 @functions_framework.http
 def process_story_logic(request):
-    global unimodel, flash_model, db
+    global unimodel, flash_model, specialist_model, db
     if unimodel is None:
         unimodel = UnifiedModel(MODEL_PROVIDER, MODEL_NAME)
     
@@ -1283,6 +1449,10 @@ def process_story_logic(request):
         # Initialize Vertex AI explicitly for the Flash Model (Triage)
         vertexai.init(project=PROJECT_ID, location=LOCATION)
         flash_model = GenerativeModel(FLASH_MODEL_NAME, safety_settings=safety_settings)
+        
+    if specialist_model is None:
+        # Initialize Anthropic Specialist explicitly
+        specialist_model = UnifiedModel(provider="anthropic", model_name="claude-sonnet-4-5")
         
     if db is None:
         db = firestore.Client(project=PROJECT_ID)
@@ -1368,8 +1538,9 @@ def process_story_logic(request):
                 *   *Rule:* If the user is just continuing a friendly chat without asking for a draft, research, or a direct answer, pick this.
 
             2.  **DEEP_DIVE**: **LONG-FORM BODY CONTENT (800-2000+ Words).** Select this ONLY if the user asks for a complete article body or specific word counts.
-                *   *CRITICAL:* **NEVER** select this for "Outlines", "Briefs", "Checklists", or "Structures". If the word "Outline" or "Structure" appears, it is NOT a Deep Dive. 
-                *   *Triggers:* "800 words", "1500 words", "Write the full post", "Draft the entire article".
+                *   *CRITICAL:* Select this if the user says "Draft a post using this outline" or "Expand this structure".
+                *   *EXCEPTION:* Do NOT select this if the user asks to *CREATE* an outline. Only if they ask to *WRITE* the full text.
+                *   *Triggers:* "800 words", "1500 words", "Write the full post", "Draft the entire article", "Expand this point".
 
             3.  **TOPIC_CLUSTER_PROPOSAL**: **SEMANTIC ARCHITECTURE GENERATION.** The user SPECIFICALLY ASKS to *create, build, or generate* the full hierarchical map of keywords. 
                 *   *POSITIVE TRIGGERS:* "Generate", "Build", "Construct cluster", "Map out", "Create the strategy".
@@ -1388,9 +1559,9 @@ def process_story_logic(request):
             5.  **PSEO_ARTICLE**: **Ghost CMS Content Hook.** Only select this if the message is a NEW request to create a pSEO article or EXPLICITLY mentions "**pSEO**", "**Ghost**", or "**Ghost CMS**" as a command. 
                 *   *CRITICAL:* If the user is asking *about* a previous pSEO article (e.g., "How did you integrate X?", "Explain the delivery", "What's the status?"), **DO NOT** select this. Use **SIMPLE_QUESTION** or **DIRECT_ANSWER** instead.
 
-            6.  **SIMPLE_QUESTION**: **The Efficient Operative/OS Mode.** For fact-checks, definitions, **OUTLINES**, **BRIEFS**, retrieving information from history, or re-formatting previous points. 
-                *   *Triggers:* "Summarize our progress," "Blog Outline," "Create an outline," "Format those points as bullets," "Explain your logic."
-                *   *Rule:* If the user is asking for a **STRUCTURE** (Outline/Brief) or asks about the agent's own process, you MUST select this.
+            6.  **SIMPLE_QUESTION**: **The Efficient Operative/OS Mode.** For fact-checks, definitions, **CREATING OUTLINES**, **BRIEFS**, retrieving information from history, or re-formatting previous points. 
+                *   *Triggers:* "Summarize our progress," "Create a Blog Outline," "Draft an outline," "Format those points as bullets," "Explain your logic."
+                *   *Rule:* If the user asks to **GENERATE A STRUCTURE** (Outline/Brief), you MUST select this. If they ask to **WRITE THE POST** from an outline, select DEEP_DIVE.
 
             7.  **DIRECT_ANSWER**: **The Research Architect.** Select this ONLY for **NOVEL SYNTHESIS** or **TECHNICAL AUDITS** that require combining multiple external data sources into a new expert opinion. 
                 *   *Example:* "Analyze the security layer of AP2 vs standard PCI-DSS." 
@@ -1434,7 +1605,7 @@ def process_story_logic(request):
             History:
             {history_text}
             """
-            reply_text = unimodel.generate_content(social_prompt).text.strip()
+            reply_text = ensure_slack_compatibility(unimodel.generate_content(social_prompt).text.strip())
             
             new_events.append({"event_type": "agent_reply", "text": reply_text})
             
@@ -1488,14 +1659,18 @@ def process_story_logic(request):
         # FIX: Even if URLs were processed, we MUST still process the passed 'images/assets'
         if images:
             print(f"Sensory Worker: Grounding with {len(images)} direct assets (in addition to URLs)...")
-            research_data = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images, mission_topic=original_topic)
-            combined_context.extend(research_data['context'])
-            research_data = {"context": combined_context, "tool_logs": research_data['tool_logs'], "research_intent": "URL_PLUS_SENSORY"}
+            r_result = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images, mission_topic=original_topic)
+            combined_context.extend(r_result['context'])
+            research_data = {"context": combined_context, "tool_logs": r_result['tool_logs'], "research_intent": "URL_PLUS_SENSORY"}
         elif urls:
             research_data = {"context": combined_context, "tool_logs": [], "research_intent": "URL_PROCESSING"}
+
         else:
             print(f"TELEMETRY: Keyword Mode detected. Launching Sensory Array Router...")
-            research_data = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images, mission_topic=original_topic)
+            r_result = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images, mission_topic=original_topic)
+            research_data = r_result
+            # Ensure Key Persistence
+            if "research_intent" not in research_data: research_data["research_intent"] = "KEYWORD_SENSORY"
         
         # --- SAFETY KILL SWITCH (Hardening) ---
         intent_metadata = research_data.get("research_intent", "")
@@ -1596,7 +1771,8 @@ def process_story_logic(request):
         elif intent == "DEEP_DIVE":
             target_count = extract_target_word_count(original_topic)
             print(f"Executing Dynamic Deep-Dive Recursive Expansion (Target: {target_count})...")
-            article_html = generate_deep_dive_article(original_topic, research_data['context'], history=history_text, target_length=target_count)
+            # PASS THE FULL EVENT LIST for structural checking downstream
+            article_html = generate_deep_dive_article(original_topic, research_data['context'], history=history_text, history_events=history_events, target_length=target_count)
             
             # Use Claude for metadata even for deep dives
             seo_data = generate_seo_metadata(article_html, original_topic)
@@ -1768,7 +1944,7 @@ def process_story_logic(request):
         elif intent == "PSEO_ARTICLE":
             try:
                 # 1. AGENT A (Gemini): Generate the Body Content
-                article_html = generate_pseo_article(original_topic, research_data['context'], history=history_text)
+                article_html = generate_pseo_article(original_topic, research_data['context'], history=history_text, history_events=history_events)
                 
                 # 2. AGENT B (Claude): Generate the Semantic Metadata
                 seo_data = generate_seo_metadata(article_html, original_topic)
