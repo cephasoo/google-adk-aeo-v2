@@ -1,0 +1,9 @@
+functions-framework==3.5.0
+google-cloud-firestore==2.11.1
+google-cloud-logging==3.5.0
+google-cloud-secret-manager==2.16.1
+google-auth==2.29.0
+google-api-python-client==2.129.0
+gspread==6.1.0
+requests==2.31.0
+litellm>=1.40.0

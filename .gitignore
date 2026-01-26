@@ -29,3 +29,10 @@ dist/
 
 # Agent Workflows (Custom/Local)
 .agent/workflows/load-the-crates.md
+# Diagnostic / Debugging Scripts
+worker-tracker/fetch_logs.py
+worker-tracker/conn_log.txt
+mcp-server/diagnose_serp.py
+mcp-server/mcp_logs*.json
+worker-tracker/debug_*.py
+worker-tracker/mcp_logs*.json
