@@ -27,6 +27,13 @@ BROWSERLESS_API_KEY = None
 FLASH_MODEL_NAME = os.environ.get("FLASH_MODEL_NAME", "gemini-2.0-flash-exp")
 DEFAULT_GEO = os.environ.get("DEFAULT_GEO", "NG") # Default to Nigeria as primary operating region, but configurable
 
+# --- SEMRush-Based Power Player Benchmarking ---
+# Updated for Tiered Authority System (Step: 4500)
+GLOBAL_AUTHORITY_DOMAINS = [
+    "reddit.com", "wikipedia.org", "linkedin.com", "forbes.com", 
+    "youtube.com", "medium.com", "nih.gov", "google.com"
+]
+
 # --- Initialize FastAPI ---
 app = FastAPI(title="Sensory-Tools-Server")
 
@@ -98,6 +105,23 @@ def _parse_serp_features(results):
                 elif block.get("type") == "list" and "list" in block:
                     aio_parts.append("\n".join([f" - {i.get('snippet')}" for i in block["list"]]))
             if len(aio_parts) > 1: extracted_features.append("\n\n".join(aio_parts))
+        
+        if "references" in aio:
+            refs = ["**AI Overview References:**"]
+            for ref in aio["references"]:
+                title = ref.get("title", "N/A")
+                link = ref.get("link", "N/A")
+                source = ref.get("source", "N/A")
+                
+                # Tagging for Authority Benchmarking
+                tag = ""
+                if any(domain in link.lower() for domain in GLOBAL_AUTHORITY_DOMAINS):
+                    # Extract the matching domain for the tag
+                    matched = next((d for d in GLOBAL_AUTHORITY_DOMAINS if d in link.lower()), "High Authority")
+                    tag = f" [CITATION_TIER:GLOBAL: {matched}]"
+                
+                refs.append(f"- {title} ({source}): {link}{tag}")
+            if len(refs) > 1: extracted_features.append("\n".join(refs))
 
     if "knowledge_graph" in results:
         kg = results["knowledge_graph"]
@@ -120,7 +144,29 @@ def _parse_serp_features(results):
 
     if "organic_results" in results:
         organic = results["organic_results"][:5]
-        organic_list = [f"- {res.get('title', 'Untitled')}: {res.get('snippet', '')} ({res.get('link')})" for res in organic]
+        organic_list = []
+        for res in organic:
+            title = res.get("title", "Untitled")
+            snippet = res.get("snippet", "")
+            link = res.get("link", "")
+            
+            # Tagging for Tiered Authority Benchmarking
+            tag = ""
+            matched_global = next((d for d in GLOBAL_AUTHORITY_DOMAINS if d in link.lower()), None)
+            
+            if matched_global:
+                tag = f" [CITATION_TIER:GLOBAL: {matched_global}]"
+            else:
+                # Inverse Logic: If it's on Page 1 and NOT Global, it's a Local/Niche Authority
+                # We extract the domain for clarity
+                try:
+                    domain = link.split("//")[-1].split("/")[0].replace("www.", "")
+                    tag = f" [CITATION_TIER:LOCAL/NICHE: {domain}]"
+                except:
+                    tag = " [CITATION_TIER:LOCAL/NICHE]"
+            
+            organic_list.append(f"- {title}: {snippet} ({link}){tag}")
+            
         if organic_list:
             extracted_features.append("**Web Results:**\n" + "\n".join(organic_list))
 
@@ -173,7 +219,8 @@ def handle_tool_call(name, arguments):
         "google_web_search", "scrape_article", "rag_search", "google_trends", 
         "trend_analysis", "google_images_search", "google_videos_search", 
         "google_scholar_search", "google_news_search", "google_simple_search",
-        "detect_geo", "detect_intent", "analyze_image", "generate_image"
+        "detect_geo", "detect_intent", "analyze_image", "generate_image",
+        "google_ai_overview"
     ]
     if name not in allowed_tools:
         return f"Error: Tool '{name}' is not in the allowed list."
@@ -184,6 +231,41 @@ def handle_tool_call(name, arguments):
         params = {"api_key": SERPAPI_API_KEY, "engine": "google", "q": arguments.get("query"), "no_cache": True}
         results = GoogleSearch(params).get_dict()
         result = _parse_serp_features(results)
+        
+        # --- OMNI-TOKEN DETECTION (Ultra-Robust) ---
+        # We scan everywhere for a token that could trigger AI Overview expansion
+        def find_token(data):
+            if not isinstance(data, dict): return None
+            # 1. Check direct keys
+            for key in ["next_page_token", "page_token", "token"]:
+                if data.get(key): return data.get(key)
+            # 2. Check if this is an AIO block
+            if data.get("type") == "ai_overview" and (data.get("next_page_token") or data.get("page_token")):
+                return data.get("next_page_token") or data.get("page_token")
+            return None
+
+        # Primary Candidates
+        token = find_token(results.get("ai_overview")) or find_token(results)
+        
+        # Secondary Candidates: Related Questions of type ai_overview
+        if not token and "related_questions" in results:
+            for q in results["related_questions"]:
+                token = find_token(q)
+                if token: break
+
+        if token:
+            print(f"MCP Hub: [DOUBLE-TAP] Expansion token found: {token[:15]}...", flush=True)
+            aio_params = {"api_key": SERPAPI_API_KEY, "engine": "google_ai_overview", "page_token": token}
+            aio_results = GoogleSearch(aio_params).get_dict()
+            
+            # Check if expansion results contains actual AIO content
+            # Often SerpAPI puts the expanded AIO at the root or under 'ai_overview'
+            expanded_context = _parse_serp_features(aio_results)
+            print(f"MCP Hub: [DOUBLE-TAP] Expansion length: {len(expanded_context)} chars.", flush=True)
+            
+            if "[GROUNDING_CONTENT]" in expanded_context:
+                clean_expanded = expanded_context.replace("[GROUNDING_CONTENT]\n", "")
+                result += "\n\n--- EXPANDED AI INSIGHTS ---\n" + clean_expanded
 
     elif name == "scrape_article":
         url = arguments.get("url")
@@ -343,6 +425,13 @@ def handle_tool_call(name, arguments):
         res = service.cse().list(q=query, cx=SEARCH_ENGINE_ID, num=5).execute()
         google_snippets = [item.get('snippet', '') for item in res.get('items', [])]
         result = "[GROUNDING_CONTENT (Fallback)]:\n" + "\n".join(google_snippets) if google_snippets else "No fallback results found."
+
+    elif name == "google_ai_overview":
+        token = arguments.get("page_token") or arguments.get("next_page_token")
+        if not token: return "Error: Missing page_token or next_page_token."
+        params = {"api_key": SERPAPI_API_KEY, "engine": "google_ai_overview", "page_token": token}
+        results = GoogleSearch(params).get_dict()
+        result = _parse_serp_features(results)
 
     elif name == "detect_geo":
         query = arguments.get("query")

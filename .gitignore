@@ -36,3 +36,8 @@ mcp-server/diagnose_serp.py
 mcp-server/mcp_logs*.json
 worker-tracker/debug_*.py
 worker-tracker/mcp_logs*.json
+
+# Proprietary Components (Local Only)
+worker-tracker/
+ops/
+
