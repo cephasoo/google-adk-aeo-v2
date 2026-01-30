@@ -23,6 +23,7 @@ import google.auth.transport.requests
 from google.oauth2 import id_token
 from google.cloud import firestore
 from google.cloud.firestore_v1.vector import Vector
+import concurrent.futures
 
 # --- Logging Setup ---
 try:
@@ -313,7 +314,7 @@ def extract_core_topic(user_prompt, history=""):
     SEARCH QUERY:
     """
     
-    core_topic = flash_model.generate_content(extraction_prompt).text.strip()
+    core_topic = unimodel.generate_content(extraction_prompt).text.strip()
 
     print(f"Distilled Core Topic: '{core_topic}'")
     return core_topic
@@ -425,8 +426,8 @@ def extract_trend_term(user_prompt, history=""):
     ENTITY:
     """
     try:
-        # Use flash_model for speed/cost since this is a simple extraction
-        entity = flash_model.generate_content(prompt).text.strip().replace('"', '').replace("'", "")
+        # Use unimodel for speed/cost since this is a simple extraction
+        entity = unimodel.generate_content(prompt).text.strip().replace('"', '').replace("'", "")
         print(f"Distilled Trend Entity: '{entity}'")
         return entity
     except Exception as e:
@@ -577,7 +578,7 @@ def analyze_deep_navigation(links_text, mission_topic, history_context):
         return None
 
 # 10. The Router (Updated with "Double-Tap" Analysis)
-def find_trending_keywords(raw_topic, history_context="", session_id=None, images=None, mission_topic=None):
+def find_trending_keywords(raw_topic, history_context="", session_id=None, images=None, mission_topic=None, session_metadata=None):
     """
     An intelligent meta-tool that routes a query to the best specialized search tool.
     Uses 'raw_topic' for routing to allow for "USE_CONVERSATIONAL_CONTEXT" selection on conversational turns.
@@ -626,7 +627,7 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
             
     # DEEP RECOLLECTION: If no images found, we use a semantic check to see if we SHOULD look for them in history.
     visual_check_prompt = f"Analyze if the user's query requires seeing an image, PDF, or visual asset to answer accurately. Query: '{raw_topic}'. Respond ONLY with 'YES' or 'NO'."
-    is_recollective_visual_query = "YES" in flash_model.generate_content(visual_check_prompt).text.upper()
+    is_recollective_visual_query = "YES" in unimodel.generate_content(visual_check_prompt).text.upper()
     
     if not all_images and is_recollective_visual_query and history_context:
         print("Sensory Router: Semantic visual intent detected. Attempting Deep Recollection (Re-scraping URLs)...")
@@ -671,10 +672,49 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
             visual_context = analyze_image(img, prompt=f"Analyze this image in the context of: {grounding_subject}")
             context_snippets.append(f"[VISUAL_INSIGHT]: {visual_context}")
             tool_logs.append({"event_type": "tool_call", "tool_name": "analyze_image", "status": "success", "content": f"[VISUAL_INSIGHT]: {visual_context}"})
-    # 2. Automated Signal Detection (MCP Refactored)
+    # 2. Automated Signal Detection (Always-On Parallel + Smart Fallback)
     print("Sensory Router: Detecting Signals (Geo & Intent) via MCP Hub...")
-    detected_geo = mcp_detect_geo(raw_topic, history=history_context)
-    research_intent_raw = mcp_detect_intent(raw_topic)
+    
+    # SAFETY: Ensure session_metadata is a dict to prevent NoneType errors
+    if session_metadata is None:
+        session_metadata = {}
+    
+    prev_geo = session_metadata.get('detected_geo', 'Global')
+    prev_intent = session_metadata.get('intent', 'FORMAT_GENERAL')
+    
+    # ALWAYS EXECUTE PARALLEL: Use ThreadPoolExecutor for concurrent MCP Hub calls
+    # This ensures we are ALWAYS listening for pivots (e.g. "Why is it different in France?")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        future_geo = executor.submit(mcp_detect_geo, raw_topic, history=history_context)
+        future_intent = executor.submit(mcp_detect_intent, raw_topic)
+        
+        try:
+            detected_geo = future_geo.result(timeout=8)  # Reduced from 10s to prevent cascading timeouts
+            research_intent_raw = future_intent.result(timeout=8)
+        except concurrent.futures.TimeoutError:
+            print(f"⚠️ Parallel Signal Detection timed out. Using graceful fallback to session memory.")
+            # GRACEFUL DEGRADATION: If MCP is slow, inherit from session memory entirely
+            detected_geo = prev_geo
+            research_intent_raw = json.dumps({"intent": prev_intent, "directive": "Fallback due to timeout"})
+        except Exception as e:
+            print(f"⚠️ Parallel Signal Detection failed: {e}. Attempting sequential fallback...")
+            try:
+                detected_geo = mcp_detect_geo(raw_topic, history=history_context)
+                research_intent_raw = mcp_detect_intent(raw_topic)
+            except Exception as fallback_error:
+                print(f"❌ Sequential fallback also failed: {fallback_error}. Using session memory.")
+                detected_geo = prev_geo
+                research_intent_raw = json.dumps({"intent": prev_intent, "directive": "Fallback due to error"})
+
+    # --- SMART INHERITANCE LOGIC ---
+    # Rule: If new signal is generic ("Global") but memory is specific, inherit.
+    # Rule: If new signal is specific, prioritize it (Pivot).
+    if detected_geo == "Global" and prev_geo != "Global":
+        print(f"  -> Smart Inheritance: New signal is Global. Falling back to session memory: '{prev_geo}'")
+        detected_geo = prev_geo
+    elif detected_geo != "Global" and detected_geo != prev_geo:
+        print(f"  -> Topic Pivot: New specific Geo signal detected: '{detected_geo}'. Overriding memory.")
+
     print(f"  -> Signal Detected | Geo: '{detected_geo}' | Intent: '{research_intent_raw}'")
     
     # Parse for the prompt context to avoid JSON clutter
@@ -709,7 +749,7 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     RATIONALE: <1-sentence explanation>
     DECISION: [SUFFICIENT or INSUFFICIENT]
     """
-    audit_raw = flash_model.generate_content(audit_prompt).text.strip().upper()
+    audit_raw = specialist_model.generate_content(audit_prompt).text.strip().upper()
     print(f"SENSORY GATEKEEPER: {audit_raw}")
     
     adequacy_score = "INSUFFICIENT"
@@ -720,10 +760,8 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
 
     if adequacy_score == "SUFFICIENT" and "TRENDS" not in detected_intent_key:
         print("SENSORY GATEKEEPER: Knowledge is sufficient. Skipping AI Router and forcing CONVERSATIONAL_CONTEXT.")
-        # FIX: Explicitly append history to context to resolve the Paradox
-        context_snippets.append(f"IN-CONTEXT HISTORY (Sufficient for response):\n{history_context}")
         selected_tools = ["USE_CONVERSATIONAL_CONTEXT"]
-        return {"context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent_raw}
+        return {"context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent_raw, "detected_geo": detected_geo}
 
     # 3. Sensory Array Router (Decides based on RAW input)
     tool_choice_prompt = f"""
@@ -776,7 +814,7 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     """
     # 4. Robust Parsing Logic
     try:
-        raw_response = flash_model.generate_content(tool_choice_prompt).text.strip().upper()
+        raw_response = specialist_model.generate_content(tool_choice_prompt).text.strip().upper()
         clean_response = raw_response.replace("*", "").replace("`", "").replace("'", "").replace('"', "").rstrip(".")
         
         selected_tools = [t.strip() for t in clean_response.split(',')]
@@ -790,7 +828,7 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     # We only return early if USE_CONVERSATIONAL_CONTEXT is the ONLY tool selected.
     # If other tools (WEB, TRENDS, etc.) are present, we must execute them.
     if len(selected_tools) == 1 and "USE_CONVERSATIONAL_CONTEXT" in selected_tools[0]:
-        return {"context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent_raw}
+        return {"context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent_raw, "detected_geo": detected_geo}
 
     # --- CATEGORICAL SHARED EXTRACTION (Efficiency + Verbose Debugging) ---
     distilled_seo_query = None
@@ -892,7 +930,7 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
         context_snippets.append(research_context)
         tool_logs.append({"event_type": "tool_call", "tool_name": "google_simple_search_fallback", "input": raw_topic, "status": "success"})
 
-    return { "context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent_raw }
+    return { "context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent_raw, "detected_geo": detected_geo }
 
 
 #11. The Topic Cluster Generator
@@ -1603,7 +1641,7 @@ def process_story_logic(request):
             """
         # --- EXECUTION: Triage Model Selection ---
         # Triage on the Command (sanitized_topic) but with history context
-        intent = flash_model.generate_content(triage_prompt).text.strip()
+        intent = unimodel.generate_content(triage_prompt).text.strip()
         print(f"TELEMETRY: Triage V6.0 -> Intent classified as: [{intent}] for command: '{sanitized_topic[:50]}...'")
 
         # Initialize variables for the response
@@ -1677,21 +1715,38 @@ def process_story_logic(request):
                         combined_context.append(f"[VISUAL_INSIGHT]: {visual_context}")
                         new_events.append({"event_type": "tool_call", "tool_name": "analyze_scraped_image", "status": "success", "content": f"[VISUAL_INSIGHT]: {visual_context}"})
         
-        # FIX: Even if URLs were processed, we MUST still process the passed 'images/assets'
-        if images:
-            print(f"Sensory Worker: Grounding with {len(images)} direct assets (in addition to URLs)...")
-            r_result = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images, mission_topic=original_topic)
+        # TIER 2: Grounding & Signal Detection (Images or URLs)
+        if images or urls:
+            print(f"TELEMETRY: Media-Rich Request detected. Analyzing signals and grounding assets...")
+            # We call find_trending_keywords to get Geo/Intent signals and analyze any direct images
+            r_result = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images, mission_topic=original_topic, session_metadata=session_data)
+            
+            # Merge context: URL scrapes (combined_context) + keyword/image insights (r_result)
             combined_context.extend(r_result['context'])
-            research_data = {"context": combined_context, "tool_logs": r_result['tool_logs'], "research_intent": "URL_PLUS_SENSORY"}
-        elif urls:
-            research_data = {"context": combined_context, "tool_logs": [], "research_intent": "URL_PROCESSING"}
+            research_data = {
+                "context": combined_context, 
+                "tool_logs": r_result['tool_logs'], 
+                "research_intent": "URL_PLUS_SENSORY" if (urls and images) else ("URL_PROCESSING" if urls else "IMAGE_GROUNDING"), 
+                "detected_geo": r_result.get('detected_geo')
+            }
 
         else:
             print(f"TELEMETRY: Keyword Mode detected. Launching Sensory Array Router...")
-            r_result = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images, mission_topic=original_topic)
+            r_result = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images, mission_topic=original_topic, session_metadata=session_data)
             research_data = r_result
             # Ensure Key Persistence
             if "research_intent" not in research_data: research_data["research_intent"] = "KEYWORD_SENSORY"
+        
+        # --- METADATA EXTRACTION (Thread Memory Optimization) ---
+        final_geo = research_data.get("detected_geo", session_data.get("detected_geo", "Global"))
+        final_intent_key = "FORMAT_GENERAL"
+        try:
+            ri = research_data.get("research_intent", "")
+            if isinstance(ri, str) and "{" in ri:
+                final_intent_key = json.loads(ri).get("intent", "FORMAT_GENERAL")
+        except:
+             pass
+        print(f"TELEMETRY: Signals for Persistence | Geo: {final_geo} | Intent: {final_intent_key}")
         
         # --- SAFETY KILL SWITCH (Hardening) ---
         intent_metadata = research_data.get("research_intent", "")
@@ -1732,6 +1787,8 @@ def process_story_logic(request):
             session_ref.update({
                 "status": "blocked",
                 "type": "safety_violation",
+                "detected_geo": final_geo,
+                "intent": final_intent_key,
                 "last_updated": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
             })
             requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
@@ -1774,6 +1831,8 @@ def process_story_logic(request):
                 "status": "awaiting_feedback", 
                 "type": "work_answer", 
                 "slack_context": slack_context,
+                "detected_geo": final_geo,
+                "intent": final_intent_key,
                 "last_updated": expire_time
             }
             if is_initial_post: update_data["topic"] = clean_topic
@@ -1791,10 +1850,10 @@ def process_story_logic(request):
             return jsonify({"msg": "Answer sent"}), 200
 
         elif intent == "DEEP_DIVE":
-            target_count = extract_target_word_count(original_topic)
+            target_count = extract_target_word_count(sanitized_topic)
             print(f"TELEMETRY: Executing Dynamic Deep-Dive Recursive Expansion (Target: {target_count})...")
-            # PASS THE FULL EVENT LIST for structural checking downstream
-            article_html = generate_deep_dive_article(original_topic, research_data['context'], history=history_text, history_events=history_events, target_length=target_count)
+            # PASS THE sanitzied_topic as the DIRECTIVE to prioritize feedback
+            article_html = generate_deep_dive_article(sanitized_topic, research_data['context'], history=history_text, history_events=history_events, target_length=target_count)
             
             # Use Claude for metadata even for deep dives
             seo_data = generate_seo_metadata(article_html, original_topic)
@@ -1817,6 +1876,8 @@ def process_story_logic(request):
                 "status": "awaiting_feedback", 
                 "type": "work_proposal", 
                 "slack_context": slack_context,
+                "detected_geo": final_geo,
+                "intent": final_intent_key,
                 "last_updated": expire_time
             }
             if is_initial_post: update_data["topic"] = seo_data.get('title', clean_topic)
@@ -1834,8 +1895,8 @@ def process_story_logic(request):
 
         elif intent == "TOPIC_CLUSTER_PROPOSAL":
             try:
-                # Use original_topic (Mission) for cluster subject
-                cluster_data = generate_topic_cluster(original_topic, research_data['context'], history=history_text, is_initial=is_initial_post)
+                # Use sanitized_topic (Feedback) for priority cluster subject
+                cluster_data = generate_topic_cluster(sanitized_topic, research_data['context'], history=history_text, is_initial=is_initial_post)
                 if not cluster_data: raise ValueError("Failed to parse cluster JSON.")
                 
                 new_events.append({
@@ -1854,6 +1915,8 @@ def process_story_logic(request):
                     "status": "awaiting_feedback", 
                     "type": "work_proposal", 
                     "slack_context": slack_context,
+                    "detected_geo": final_geo,
+                    "intent": final_intent_key,
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
@@ -1888,6 +1951,8 @@ def process_story_logic(request):
                     "status": "awaiting_feedback", 
                     "type": "work_answer", 
                     "slack_context": slack_context,
+                    "detected_geo": final_geo,
+                    "intent": final_intent_key,
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
@@ -1923,6 +1988,8 @@ def process_story_logic(request):
                     "status": "awaiting_feedback", 
                     "type": "work_proposal", 
                     "slack_context": slack_context,
+                    "detected_geo": final_geo,
+                    "intent": final_intent_key,
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
@@ -1955,6 +2022,8 @@ def process_story_logic(request):
                     "status": "awaiting_feedback", 
                     "type": "work_answer", 
                     "slack_context": slack_context,
+                    "detected_geo": final_geo,
+                    "intent": final_intent_key,
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
@@ -1965,8 +2034,8 @@ def process_story_logic(request):
         # === PATH C: PSEO ARTICLE GENERATION (Dual-Agent Path) ===
         elif intent == "PSEO_ARTICLE":
             try:
-                # 1. AGENT A (Gemini): Generate the Body Content
-                article_html = generate_pseo_article(original_topic, research_data['context'], history=history_text, history_events=history_events)
+                # 1. AGENT A (Gemini): Generate the Body Content (Prioritizing Latest Feedback)
+                article_html = generate_pseo_article(sanitized_topic, research_data['context'], history=history_text, history_events=history_events)
                 
                 # 2. AGENT B (Claude): Generate the Semantic Metadata
                 seo_data = generate_seo_metadata(article_html, original_topic)
@@ -1991,6 +2060,8 @@ def process_story_logic(request):
                     "status": "awaiting_feedback", 
                     "type": "work_proposal", 
                     "slack_context": slack_context,
+                    "detected_geo": final_geo,
+                    "intent": final_intent_key,
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = seo_data.get('title', clean_topic)
@@ -2033,6 +2104,8 @@ def process_story_logic(request):
                     "status": "awaiting_feedback", 
                     "type": "work_answer", 
                     "slack_context": slack_context,
+                    "detected_geo": final_geo,
+                    "intent": final_intent_key,
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
@@ -2056,6 +2129,18 @@ def process_story_logic(request):
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
                 events_ref.add(event)
 
+            # UPDATE METADATA (Fallback Persistence)
+            update_data = {
+                "status": "awaiting_feedback", 
+                "type": "work_answer", 
+                "slack_context": slack_context,
+                "detected_geo": final_geo,
+                "intent": final_intent_key,
+                "last_updated": expire_time
+            }
+            if is_initial_post: update_data["topic"] = clean_topic
+            session_ref.update(update_data)
+
             requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
                 "session_id": session_id, 
                 "type": "social", 
@@ -2070,7 +2155,10 @@ def process_story_logic(request):
             return jsonify({"msg": "Unknown intent fallback answer sent"}), 200
 
     except Exception as e:
-        print(f"Worker Error: {e}")
+        import traceback
+        error_trace = traceback.format_exc()
+        print(f"❌ WORKER ERROR: {e}")
+        print(f"STACK TRACE:\n{error_trace}")
         return jsonify({"error": str(e)}), 500
 
 # --- FUNCTION: Ingest Knowledge ---
