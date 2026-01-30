@@ -6,7 +6,9 @@ import litellm
 from litellm import completion
 from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, Part
 import google.cloud.logging
+import logging
 import base64
+
 litellm.drop_params = True  # CRITICAL: Handle unsupported params for new models (like gpt-5)
 from vertexai.language_models import TextEmbeddingModel
 import os
@@ -21,6 +23,13 @@ import google.auth.transport.requests
 from google.oauth2 import id_token
 from google.cloud import firestore
 from google.cloud.firestore_v1.vector import Vector
+
+# --- Logging Setup ---
+try:
+    client = google.cloud.logging.Client()
+    client.setup_logging()
+except Exception:
+    pass # Fallback to standard logging if local
 
 # --- Configuration ---
 PROJECT_ID = os.environ.get("PROJECT_ID")
@@ -94,13 +103,18 @@ class RemoteTools:
                 verify=certifi.where()
             )
             if response.status_code != 200:
+                logging.error(f"MCP Server Error {response.status_code}: {response.text}")
                 return f"Error: MCP Server returned {response.status_code}"
             
             data = response.json()
             # Extract text from MCP response format
             content = data.get("result", {}).get("content", [])
             if content:
-                return content[0].get("text", "No text returned.")
+                text_out = content[0].get("text", "No text returned.")
+                logging.info(f"MCP Tool Success: {tool_name} (Length: {len(text_out)})")
+                print(f"  -> MCP OUT [{tool_name}]: {text_out[:150].replace('\n', ' ')}...")
+                return text_out
+            logging.warning(f"MCP Tool '{tool_name}' returned empty content.")
             return "Empty response from tool."
         except Exception as e:
             return f"MCP Error: {str(e)}"
@@ -108,7 +122,9 @@ class RemoteTools:
 def get_mcp_client():
     global mcp_client
     if mcp_client is None:
-        mcp_client = RemoteTools(os.environ.get("MCP_SERVER_URL", "http://localhost:8080"))
+        url = os.environ.get("MCP_SERVER_URL", "http://localhost:8080")
+        logging.info(f"MCP CLIENT INIT: Connecting to {url}")
+        mcp_client = RemoteTools(url)
     return mcp_client
 
 # --- UNIFIED MODEL ADAPTER (The Brain Switch) ---
@@ -175,33 +191,20 @@ class UnifiedModel:
             elif self.provider == "openai" and OPENAI_API_KEY:
                 os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
             
-            # Normalize Parameters (Temp default 0.7)
+            # Normalize Parameters
             temp = generation_config.get('temperature', 0.7) if generation_config else 0.7
             
             try:
-                # The Universal Call
-                # LiteLLM handling of multimodal might vary, focusing on Vertex native for roadmap
-                if isinstance(prompt, list):
-                    # Convert Parts to LiteLLM compatible format if possible, otherwise fallback
-                    messages = [{"role": "user", "content": []}]
-                    for p in prompt:
-                        if isinstance(p, str):
-                            messages[0]["content"].append({"type": "text", "text": p})
-                        elif isinstance(p, Part):
-                            # This is simplified; real LiteLLM image handling depends on provider
-                            messages[0]["content"].append({"type": "image_url", "image_url": {"url": "base64_data_here"}})
-                else:
-                    messages = [{"role": "user", "content": prompt}]
-
+                # LiteLLM Call
                 response = completion(
                     model=self.model_name, 
-                    messages=messages,
+                    messages=[{"role": "user", "content": prompt}],
                     temperature=temp,
-                    num_retries=3,
-                    timeout=60  # Increased for complex recursive drafting
+                    max_tokens=2048
                 )
                 
-                # Create a Fake Vertex Response Object
+                # Create a Mock Response Object to mimic Vertex AI's SDK
+                # This ensures downstream code (getting .text) doesn't break
                 class MockResponse:
                     def __init__(self, content):
                         self.text = content
@@ -210,7 +213,15 @@ class UnifiedModel:
                 
             except Exception as e:
                 print(f"❌ LiteLLM Error: {e}", flush=True)
-                raise e
+                # Fallback to an empty mock handling - Required re-definition due to scope
+                class MockResponse:
+                    def __init__(self, content): self.text = content
+                return MockResponse("Error generating content.")
+
+    def analyze_citation(self, prompt_text, scrape_content):
+        # Compatibility stub for worker-tracker alignment
+        return {"cited": False, "snippet": "Feature not active in worker-story."}
+
 
 # --- Safety Utils ---
 def scrub_pii(text):
@@ -521,6 +532,50 @@ def analyze_image(image_data, prompt="Describe this image in detail."):
 def generate_studio_image(prompt):
     return get_mcp_client().call("generate_image", {"prompt": prompt})
 
+# --- Deep Navigator Logic ---
+def analyze_deep_navigation(links_text, mission_topic, history_context):
+    """
+    Uses the Specialist Model to decide if we should recursively scrape a 'Child Link'.
+    Returns: The URL to scrape (str) or None.
+    """
+    global specialist_model
+    if not links_text or "No links found" in links_text: return None
+    
+    print(f"Deep Navigator: Analyzing {links_text.count('h')} potential links for topic '{mission_topic}'...")
+
+    prompt = f"""
+    You are a Senior Research Navigator.
+    MISSION: We are researching '{mission_topic}'.
+    CONTEXT: We just scraped a page and found these 'Child Links'.
+    
+    TASK:
+    Analyze the links below. Determine if ONE of them is likely to contain CRITICAL information missing from our current understanding.
+    
+    CRITERIA:
+    1. Relevance: Must be directly related to the core mystery/topic.
+    2. Value Add: Must likely contain data, specs, or details not usually found on the home page.
+    3. Safety: Do not click login, signup, or social media share links.
+    
+    LINKS FOUND:
+    {links_text}
+    
+    DECISION:
+    Return ONLY the URL of the single best link to click.
+    If none are critical, return "NO_ACTION".
+    """
+    
+    try:
+        response = specialist_model.generate_content(prompt).text.strip()
+        if "http" in response and "NO_ACTION" not in response:
+            # Extract clean URL (handling potential markdown wrapper)
+            url_match = re.search(r'(https?://[^\s<>"]+)', response)
+            if url_match:
+                return url_match.group(1)
+        return None
+    except Exception as e:
+        print(f"Deep Navigator Error: {e}")
+        return None
+
 # 10. The Router (Updated with "Double-Tap" Analysis)
 def find_trending_keywords(raw_topic, history_context="", session_id=None, images=None, mission_topic=None):
     """
@@ -532,12 +587,12 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     2. Fetches Top News (Qual)
     This prevents "blind" statistical answers (e.g., seeing a spike but not knowing why).
     """
-    global model, flash_model
+    global unimodel, flash_model
     # --- MONITORING: Router Invocation ---
     # MISSION VS COMMAND: Grounding remains on mission_topic, routing on raw_topic
     grounding_subject = mission_topic or raw_topic
-    print(f"DEBUG: find_trending_keywords invoked for topic: '{raw_topic}' (Grounding on: '{grounding_subject}')")
-    if images: print(f"DEBUG: Grounding with {len(images)} images.")
+    print(f"TELEMETRY: find_trending_keywords starting. Topic='{raw_topic}' | GroundingSubject='{grounding_subject}'")
+    if images: print(f"TELEMETRY: Grounding with {len(images)} images.")
     
     tool_logs = []
     context_snippets = []
@@ -616,53 +671,6 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
             visual_context = analyze_image(img, prompt=f"Analyze this image in the context of: {grounding_subject}")
             context_snippets.append(f"[VISUAL_INSIGHT]: {visual_context}")
             tool_logs.append({"event_type": "tool_call", "tool_name": "analyze_image", "status": "success", "content": f"[VISUAL_INSIGHT]: {visual_context}"})
-
-    return {"context": context_snippets, "tool_logs": tool_logs, "research_intent": "KEYWORD_SENSORY"}
-
-# --- Deep Navigator Logic ---
-def analyze_deep_navigation(links_text, mission_topic, history_context):
-    """
-    Uses the Specialist Model to decide if we should recursively scrape a 'Child Link'.
-    Returns: The URL to scrape (str) or None.
-    """
-    global specialist_model
-    if not links_text or "No links found" in links_text: return None
-    
-    print(f"Deep Navigator: Analyzing {links_text.count('h')} potential links for topic '{mission_topic}'...")
-
-    prompt = f"""
-    You are a Senior Research Navigator.
-    MISSION: We are researching '{mission_topic}'.
-    CONTEXT: We just scraped a page and found these 'Child Links'.
-    
-    TASK:
-    Analyze the links below. Determine if ONE of them is likely to contain CRITICAL information missing from our current understanding.
-    
-    CRITERIA:
-    1. Relevance: Must be directly related to the core mystery/topic.
-    2. Value Add: Must likely contain data, specs, or details not usually found on the home page.
-    3. Safety: Do not click login, signup, or social media share links.
-    
-    LINKS FOUND:
-    {links_text}
-    
-    DECISION:
-    Return ONLY the URL of the single best link to click.
-    If none are critical, return "NO_ACTION".
-    """
-    
-    try:
-        response = specialist_model.generate_content(prompt).text.strip()
-        if "http" in response and "NO_ACTION" not in response:
-            # Extract clean URL (handling potential markdown wrapper)
-            url_match = re.search(r'(https?://[^\s<>"]+)', response)
-            if url_match:
-                return url_match.group(1)
-        return None
-    except Exception as e:
-        print(f"Deep Navigator Error: {e}")
-        return None
-
     # 2. Automated Signal Detection (MCP Refactored)
     print("Sensory Router: Detecting Signals (Geo & Intent) via MCP Hub...")
     detected_geo = mcp_detect_geo(raw_topic, history=history_context)
@@ -772,9 +780,10 @@ def analyze_deep_navigation(links_text, mission_topic, history_context):
         clean_response = raw_response.replace("*", "").replace("`", "").replace("'", "").replace('"', "").rstrip(".")
         
         selected_tools = [t.strip() for t in clean_response.split(',')]
-        print(f"TELEMETRY: Router decided on Strategy: {selected_tools} | Target Geo: {detected_geo}")
+        logging.info(f"TELEMETRY: Router decided on Strategy: {selected_tools} | Target Geo: {detected_geo}")
     except Exception as e:
-        print(f"Router Parse Error: {e}. Defaulting to SIMPLE.")
+
+        logging.error(f"Router Parse Error: {e}. Defaulting to SIMPLE.")
         selected_tools = ["SIMPLE"]
 
     # --- 0. CONVERSATIONAL SHORT-CIRCUIT ---
@@ -855,6 +864,8 @@ def analyze_deep_navigation(links_text, mission_topic, history_context):
                     search_query = distilled_trend_term
                     print(f"  + Fetching Quantitative Trend Stats for '{search_query}' in '{geo_code}'...")
                     stats_context = analyze_trend_history(search_query, geo=geo_code)
+                    print(f"DEBUG: analyze_trend_history returned {len(stats_context)} chars.", flush=True)
+
                     
                     # Qualitative Data Double-Tap
                     has_web_tool = any(t in ["WEB", "SIMPLE"] for t in selected_tools)
@@ -1065,8 +1076,13 @@ def generate_natural_answer(topic, context, history=""):
     
     TASK:
     Answer naturally and conversationally. 
-    Use the GROUNDING DATA to ensure accuracy, but do not force a rigid structure unless asked.
-    If the user asks for code, use markdown code blocks.
+    Use the GROUNDING DATA to ensure accuracy.
+    
+    ### MULTI-NICHE AUDIT PROTOCOL:
+    1. **Signal Sifting**: Carefully examine the entire GROUNDING DATA for signals matching the user's specific sub-topic (e.g., 'Politics', 'Education', 'Law').
+    2. **Avoid "Sports Blindness"**: High-volume categories like 'Sports' often dominate trend feeds. You must look past global volume to find signals that relate to the user's specific query. 
+    3. **Nuance**: If the grounding data contains niche items like 'Iyabo Obasanjo' or 'NELFUND', prioritize explaining their context over simply reporting high-volume sports scores.
+    
     Use **bold** for key concepts.
     Ensure paragraphs are separated by blank lines.
     """
@@ -1395,7 +1411,7 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
 
 #15. The Euphemistic 'Then vs Now' Linker
 def create_euphemistic_links(keyword_context, is_initial=True):
-    global model
+    global unimodel
     
     state_context = "This is a NEW proposal for a new thread." if is_initial else "This is a REVISION or EXTENSION of a previous strategy in an existing thread."
     
@@ -1442,6 +1458,11 @@ def refine_proposal(topic, current_proposal, critique):
 @functions_framework.http
 def process_story_logic(request):
     global unimodel, flash_model, specialist_model, db
+
+    # 0. ENTRY TELEMETRY (Observability)
+    now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n[MISSION START] {now_str} | Function: process_story_logic")
+
     if unimodel is None:
         unimodel = UnifiedModel(MODEL_PROVIDER, MODEL_NAME)
     
@@ -1724,13 +1745,14 @@ def process_story_logic(request):
 
         # --- MONITORING: Signal Propagation ---
         if "tool_logs" in research_data: new_events.extend(research_data["tool_logs"])
-        print(f"DEBUG: Research Phase concluded with {len(research_data.get('context', []))} context snippets.")
+        print(f"TELEMETRY: Research Phase concluded with {len(research_data.get('context', []))} context snippets.")
 
         # CHANGE: Ensure downstream functions use the raw topic too, so they see the full request
         clean_topic = sanitized_topic
 
         # 3. Generate Output based on Intent
-        if intent in ["DIRECT_ANSWER", "SIMPLE_QUESTION"]:
+        # UPGRADE: Handle structural intents (FORMAT_*) and provide a robust fallback
+        if intent in ["DIRECT_ANSWER", "SIMPLE_QUESTION"] or str(intent).startswith("FORMAT_"):
             # ROUTING CHANGE: use generate_natural_answer for fluid interactions
             answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text)
             answer_text = answer_data['text']
@@ -1770,7 +1792,7 @@ def process_story_logic(request):
 
         elif intent == "DEEP_DIVE":
             target_count = extract_target_word_count(original_topic)
-            print(f"Executing Dynamic Deep-Dive Recursive Expansion (Target: {target_count})...")
+            print(f"TELEMETRY: Executing Dynamic Deep-Dive Recursive Expansion (Target: {target_count})...")
             # PASS THE FULL EVENT LIST for structural checking downstream
             article_html = generate_deep_dive_article(original_topic, research_data['context'], history=history_text, history_events=history_events, target_length=target_count)
             
@@ -1851,7 +1873,7 @@ def process_story_logic(request):
                 return jsonify({"msg": "Topic cluster sent"}), 200
 
             except Exception as e:
-                print(f"⚠️ TOPIC_CLUSTER Fallback: {e}")
+                print(f"TELEMETRY: ⚠️ TOPIC_CLUSTER Fallback: {e}")
                 answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic)
                 answer_text = answer_data['text']
                 new_events.append({"event_type": "agent_answer", "text": answer_text})
@@ -2019,7 +2041,33 @@ def process_story_logic(request):
                 return jsonify({"msg": "pSEO Fallback Answer sent"}), 200
 
         else: 
-            return jsonify({"error": f"Unknown intent: {intent}"}), 500
+            # ROBUST FALLBACK: If intent is unknown, default to a natural answer rather than crashing with 500
+            print(f"TELEMETRY: ⚠️ Unknown Intent Detected: '{intent}'. Defaulting to Natural Answer fallback.")
+            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text)
+            answer_text = answer_data['text']
+            research_intent = answer_data['intent']
+            formatting_directive = answer_data['directive']
+            
+            new_events.append({"event_type": "agent_answer", "text": answer_text, "intent": research_intent, "status": "intent_fallback"})
+            
+            session_ref = db.collection('agent_sessions').document(session_id)
+            events_ref = session_ref.collection('events')
+            for event in new_events:
+                if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
+                events_ref.add(event)
+
+            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                "session_id": session_id, 
+                "type": "social", 
+                "message": answer_text, 
+                "intent": research_intent,
+                "directive": formatting_directive,
+                "channel_id": slack_context['channel'], 
+                "thread_ts": slack_context['ts'],
+                "is_initial_post": is_initial_post
+            }, verify=certifi.where(), timeout=15)
+            
+            return jsonify({"msg": "Unknown intent fallback answer sent"}), 200
 
     except Exception as e:
         print(f"Worker Error: {e}")

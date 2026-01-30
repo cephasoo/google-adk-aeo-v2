@@ -37,7 +37,10 @@ def dispatch_task(payload, target_url):
         },
         "dispatch_deadline": deadline
     }
-    tasks_client.create_task(request={"parent": parent, "task": task})
+    print(f"TELEMETRY: Dispatching to Target URL: {target_url}")
+    response = tasks_client.create_task(request={"parent": parent, "task": task})
+    print(f"TELEMETRY: Task Created Successfully. Name: {response.name}")
+
 
 @functions_framework.http
 def start_story_workflow(request):

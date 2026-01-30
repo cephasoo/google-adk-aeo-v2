@@ -74,8 +74,10 @@ def get_secret(secret_id):
 
 def initialize_secrets():
     global SERPAPI_API_KEY, BROWSERLESS_API_KEY
-    SERPAPI_API_KEY = get_secret("serpapi-api-key")
-    BROWSERLESS_API_KEY = get_secret("browserless-api-key")
+    # Try Secret Manager first, fallback to Environment Variable (Critical for deployment)
+    SERPAPI_API_KEY = get_secret("serpapi-api-key") or os.environ.get("SERPAPI_API_KEY")
+    BROWSERLESS_API_KEY = get_secret("browserless-api-key") or os.environ.get("BROWSERLESS_API_KEY")
+
 
 # --- Initialize Vertex AI ---
 vertexai.init(project=PROJECT_ID, location=LOCATION)
@@ -208,7 +210,7 @@ def handle_tool_call(name, arguments):
     Central dispatcher for all sensory tools.
     Logs every call for real-time debugging and enforces validation/scrubbing.
     """
-    print(f"MCP Hub: Calling Tool [{name}] | Args: {json.dumps(arguments)}")
+    print(f"TELEMETRY: MCP Hub: Calling Tool [{name}] | Args: {json.dumps(arguments)}")
     
     # Tool-Level Input Validation (Architectural Safety)
     if not name or not isinstance(arguments, dict):
@@ -375,7 +377,40 @@ def handle_tool_call(name, arguments):
         geo = arguments.get("geo", DEFAULT_GEO)
         params = {"api_key": SERPAPI_API_KEY, "engine": "google_trends_trending_now", "geo": geo, "hours": "24"}
         results = GoogleSearch(params).get_dict()
-        result = json.dumps(results, indent=2)[:5000]
+        
+        trending_searches = results.get("trending_searches", [])
+        if not trending_searches:
+            result = "No trending searches found for this region."
+        else:
+            # Dynamic Grouping by Category (No hardcoding)
+            categorized_trends = {}
+            for trend in trending_searches:
+                categories = trend.get("categories", [])
+                cat_name = "General"
+                if categories and isinstance(categories, list):
+                    cat_name = categories[0].get("name", "General") if isinstance(categories[0], dict) else "General"
+                
+                if cat_name not in categorized_trends:
+                    categorized_trends[cat_name] = []
+                
+                # Semantic extraction (Stripping tokens/bloat for high signal context)
+                q = trend.get('query', 'Unknown')
+                vol = trend.get('search_volume', 'N/A')
+                trend_entry = f"- {q} (Vol: {vol})"
+                
+                breakdown = trend.get("trend_breakdown", [])
+                if breakdown:
+                    trend_entry += f" | Context: {', '.join(breakdown[:3])}"
+                
+                categorized_trends[cat_name].append(trend_entry)
+            
+            # Construct refined semantic payload
+            output_parts = [f"### GOOGLE TRENDS SUMMARY: {geo} ###"]
+            for cat, items in categorized_trends.items():
+                output_parts.append(f"\n[Category: {cat}]")
+                output_parts.extend(items)
+            
+            result = "\n".join(output_parts)
 
     elif name == "trend_analysis":
         query = arguments.get("query")
@@ -563,7 +598,13 @@ def handle_tool_call(name, arguments):
 
     # Post-Processing: PII Scrubbing (Privacy Safety)
     scrubbed_result = scrub_pii(result)
-    print(f"MCP Hub: Tool [{name}] execution complete. Output size: {len(str(scrubbed_result))} chars.")
+    
+    # 5. Output Telemetry (Precision Observability)
+    print(f"TELEMETRY: MCP Hub: [{name}] execution complete. Size: {len(str(scrubbed_result))} chars.")
+    if scrubbed_result and len(str(scrubbed_result)) > 0:
+        snippet = str(scrubbed_result)[:200].replace('\n', ' ')
+        print(f"  -> Snippet: {snippet}...")
+        
     return scrubbed_result
 
 # --- The Lightweight MCP Messenger ---
@@ -579,7 +620,7 @@ async def messages(request: Request):
     method = body.get("method")
     
     # Log incoming request for traffic monitoring
-    print(f"MCP Hub: Received '{method}' request from Worker.")
+    print(f"TELEMETRY: MCP Hub: Received '{method}' request from Worker.")
     
     if method == "tools/call":
         params = body.get("params", {})
