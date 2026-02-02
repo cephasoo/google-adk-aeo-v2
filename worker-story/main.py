@@ -4,7 +4,7 @@ from flask import jsonify
 import vertexai
 import litellm
 from litellm import completion
-from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, Part
+from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
 import google.cloud.logging
 import logging
 import base64
@@ -21,7 +21,7 @@ import certifi # Explicitly kept to avert legacy SSL issues
 import google.auth
 import google.auth.transport.requests
 from google.oauth2 import id_token
-from google.cloud import firestore
+from google.cloud import firestore, secretmanager
 from google.cloud.firestore_v1.vector import Vector
 import concurrent.futures
 
@@ -41,6 +41,8 @@ FLASH_MODEL_NAME = os.environ.get("FLASH_MODEL_NAME", "gemini-2.5-flash-lite")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL") 
+INGESTION_API_KEY = os.environ.get("INGESTION_API_KEY")
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")  # Explicit fallback for code analysis
 MAX_LOOP_ITERATIONS = 2
 
 # --- Safety Configuration (ADK/RAI Compliant) ---
@@ -58,6 +60,33 @@ specialist_model = None
 search_api_key = None
 db = None
 mcp_client = None
+secret_client = None
+
+# --- SECRET MANAGER ---
+def get_secret(secret_id):
+    """
+    Retrieves a secret from Google Cloud Secret Manager.
+    Includes an environment variable fallback for local development or manual overrides.
+    """
+    global secret_client
+    
+    # 1. Check environment variables first (High Speed / Local Dev)
+    env_key = secret_id.upper().replace("-", "_")
+    env_val = os.environ.get(env_key)
+    if env_val:
+        return env_val
+        
+    # 2. Fallback to Secret Manager
+    try:
+        if secret_client is None:
+            secret_client = secretmanager.SecretManagerServiceClient()
+        
+        name = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest"
+        response = secret_client.access_secret_version(request={"name": name})
+        return response.payload.data.decode("UTF-8")
+    except Exception as e:
+        print(f"⚠️ Secret Manager error for {secret_id}: {e}")
+        return None
 
 # --- MCP CLIENT ---
 class RemoteTools:
@@ -79,7 +108,8 @@ class RemoteTools:
             print(f"Auth Hint: If local, ensure you are authenticated. Error: {e}")
             return None
 
-    def call(self, tool_name, arguments):
+    def call_tool(self, tool_name, arguments):
+        """Standard MCP call interface."""
         print(f"MCP: Calling remote tool '{tool_name}' with args {arguments}")
         
         headers = {}
@@ -113,12 +143,16 @@ class RemoteTools:
             if content:
                 text_out = content[0].get("text", "No text returned.")
                 logging.info(f"MCP Tool Success: {tool_name} (Length: {len(text_out)})")
-                print(f"  -> MCP OUT [{tool_name}]: {text_out[:150].replace('\n', ' ')}...")
+                print(f"  -> MCP OUT [{tool_name}]: {text_out[:150].replace(chr(10), ' ')}...")
                 return text_out
             logging.warning(f"MCP Tool '{tool_name}' returned empty content.")
             return "Empty response from tool."
         except Exception as e:
             return f"MCP Error: {str(e)}"
+
+    def call(self, tool_name, arguments):
+        """Backward compatibility for legacy calls in the codebase."""
+        return self.call_tool(tool_name, arguments)
 
 def get_mcp_client():
     global mcp_client
@@ -210,7 +244,12 @@ class UnifiedModel:
                     def __init__(self, content):
                         self.text = content
                 
-                return MockResponse(response.choices[0].message.content)
+                content = response.choices[0].message.content
+                if not content:
+                    print(f"⚠️ LiteLLM Warning: Received EMPTY content from {self.model_name}")
+                    content = "The model was unable to generate a response. This might be due to a safety filter or an extremely large context."
+                
+                return MockResponse(content)
                 
             except Exception as e:
                 print(f"❌ LiteLLM Error: {e}", flush=True)
@@ -273,6 +312,42 @@ def sanitize_input_text(text):
         return ""
     # Strips leading/trailing whitespace, asterisks (bold), underscores (italics), and tildes (strikethrough)
     return text.strip().strip('*_~')
+
+def fetch_slack_file_content(file_url, file_id, file_mode="hosted"):
+    """
+    Fetches content from Slack file using the private download URL.
+    Improved to handle both snippets and hosted files consistently and detect Slack errors.
+    """
+    try:
+        slack_token = get_secret("slack-bot-token")
+        if not slack_token:
+            print(f"❌ Failed to fetch Slack token")
+            return None
+        
+        # We always use the file_url (url_private_download) for high reliability
+        # Note: if it's a snippet, n8n/slack still provides a valid private download URL
+        response = requests.get(
+            file_url,
+            headers={"Authorization": f"Bearer {slack_token}"},
+            timeout=30,
+            verify=certifi.where()
+        )
+        
+        response.raise_for_status()
+        content = response.text
+        
+        # CONTENT VALIDATION: Check if we downloaded a Slack error JSON instead of code
+        # Example: {"ok":false,"error":"unknown_method"}
+        if content.strip().startswith('{"ok":false') or '"error":"' in content[:100]:
+            print(f"⚠️ Slack API Error detected in content for file {file_id}: {content[:100]}")
+            return None
+
+        print(f"✅ Downloaded file content ({len(content)} chars)")
+        return content
+        
+    except Exception as e:
+        print(f"❌ Failed to fetch file: {e}")
+        return None
 
 def extract_core_topic(user_prompt, history=""):
     """
@@ -496,6 +571,14 @@ def fetch_article_content(url):
 def search_long_term_memory(query, session_id):
     return get_mcp_client().call("rag_search", {"query": query, "session_id": session_id})
 
+# 2.5 The Compliance Knowledge Retrieval Tool (MCP Refactored)
+def search_compliance_knowledge(query, doc_type=None, geo_scope=None):
+    return get_mcp_client().call("compliance_rag_search", {
+        "query": query,
+        "doc_type": doc_type,
+        "geo_scope": geo_scope
+    })
+
 # --- [Removed unused local parser _parse_serp_features (now handled by MCP Server)] ---
 
 #4. The Specialist Google Web Search Tool (MCP Refactored)
@@ -578,7 +661,7 @@ def analyze_deep_navigation(links_text, mission_topic, history_context):
         return None
 
 # 10. The Router (Updated with "Double-Tap" Analysis)
-def find_trending_keywords(raw_topic, history_context="", session_id=None, images=None, mission_topic=None, session_metadata=None):
+def find_trending_keywords(raw_topic, history_context="", session_id=None, images=None, mission_topic=None, session_metadata=None, initial_context=None):
     """
     An intelligent meta-tool that routes a query to the best specialized search tool.
     Uses 'raw_topic' for routing to allow for "USE_CONVERSATIONAL_CONTEXT" selection on conversational turns.
@@ -596,7 +679,8 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     if images: print(f"TELEMETRY: Grounding with {len(images)} images.")
     
     tool_logs = []
-    context_snippets = []
+    context_snippets = [] # Return ONLY novel results found in this phase
+    base_grounding = (initial_context or []).copy() # For internal decision making
     
     # 1. Internal RAG (We use the grounding_subject here)
     internal_context = search_long_term_memory(grounding_subject, session_id) if session_id else "No session_id provided for memory search."
@@ -609,6 +693,7 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
         rag_text = rag_content_str
         
         context_snippets.append(internal_context)
+        base_grounding.append(internal_context)
         tool_logs.append({"event_type": "tool_call", "tool_name": "internal_knowledge_retrieval", "status": "success", "content": rag_text})
 
     # 1.5 Visual Grounding (Recollective Vision)
@@ -654,7 +739,9 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
                     deep_data = get_mcp_client().call("scrape_article", {"url": deep_url})
                     if deep_data:
                          # Append the recursive finding as high-value context
-                        context_snippets.append(f"[DEEP_NAVIGATOR_INSIGHT (Source: {deep_url})]:\n{deep_data[:8000]}")
+                        insight = f"[DEEP_NAVIGATOR_INSIGHT (Source: {deep_url})]:\n{deep_data[:8000]}"
+                        context_snippets.append(insight)
+                        base_grounding.append(insight)
                         tool_logs.append({"event_type": "tool_call", "tool_name": "deep_navigator_scrape", "status": "success", "content": f"Recursively scraped: {deep_url}"})
                     else:
                         print("Sensory Router: Deep click returned no data.")
@@ -670,8 +757,10 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
                 continue
                 
             visual_context = analyze_image(img, prompt=f"Analyze this image in the context of: {grounding_subject}")
-            context_snippets.append(f"[VISUAL_INSIGHT]: {visual_context}")
-            tool_logs.append({"event_type": "tool_call", "tool_name": "analyze_image", "status": "success", "content": f"[VISUAL_INSIGHT]: {visual_context}"})
+            insight = f"[VISUAL_INSIGHT]: {visual_context}"
+            context_snippets.append(insight)
+            base_grounding.append(insight)
+            tool_logs.append({"event_type": "tool_call", "tool_name": "analyze_image", "status": "success", "content": insight})
     # 2. Automated Signal Detection (Always-On Parallel + Smart Fallback)
     print("Sensory Router: Detecting Signals (Geo & Intent) via MCP Hub...")
     
@@ -734,10 +823,10 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     
     USER REQUEST: "{raw_topic}"
     
-    COLLECTED KNOWLEDGE (RAG + HISTORY + VISUALS):
+    COLLECTED KNOWLEDGE (RAG + HISTORY + VISUALS + CODE ANALYSIS):
     {history_context}
     ---
-    {context_snippets}
+    {base_grounding}
     
     RULES:
     1. If the user is asking to reorganize, summarize, edit, or COMPOSE (create a draft/outline) based on information whose COMPLETE context has already been retrieved and is visible in the history or snippets, it is SUFFICIENT.
@@ -770,6 +859,9 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     CONVERSATION HISTORY:
     {history_context}
 
+    GROUNDING ASSETS (Code Analysis / Visuals / Prior RAG):
+    {base_grounding}
+
     LONG-TERM MEMORY (RAG Results):
     {rag_text}
 
@@ -798,10 +890,11 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
         *   Examples: "Research X", "Find data on Y", "Ground this in technical specifics", "Use latest signals".
     - IMAGES: For visual inspiration.
     - VIDEOS: For tutorials/clips.
-    - SCHOLAR: For academic research.
     - TRENDS: For viral awareness. Select ONLY for measuring "What is trending" or "Viral topics" in a specific region.
     - ANALYSIS: For historical trajectory. Select ONLY for "Interest over time" or "Growth metrics".
     - SIMPLE: General web searches for broad definitions.
+    - COMPLIANCE: **CRITICAL.** Select this for ANY question involving **Data Privacy**, **Breach Reporting**, **Laws**, or **Regulations** (GDPR, NDPA, SOC2, etc.).
+        *   Trigger this whenever the user asks "What do I need to do?", "How long do I have?", or "What are the rules?" in a business or technical context.
     - USE_CONVERSATIONAL_CONTEXT: Select this for **Composition**, **Formatting**, or **Incremental Refinement** using information already established in the conversation.
         *   Examples: "Write a draft", "Create an outline", "Summarize our notes", "Refine the tone", "Include more detail on [Topic A]", write about a hypothetical or user-defined entity.
 
@@ -883,6 +976,15 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
         if research_context:
             context_snippets.append(research_context)
             tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": raw_topic, "status": "success"})
+
+    # --- 1.5 COMPLIANCE KNOWLEDGE TOOLS ---
+    if "COMPLIANCE" in selected_tools:
+        print("Sensory Router: Category [COMPLIANCE] active. Searching Regulatory Hub...")
+        # We pass detected_geo as geo_scope to filter results relevant to that region
+        compliance_context = search_compliance_knowledge(grounding_subject, geo_scope=detected_geo)
+        if compliance_context:
+            context_snippets.append(compliance_context)
+            tool_logs.append({"event_type": "tool_call", "tool_name": "compliance_knowledge_retrieval", "input": raw_topic, "status": "success", "content": str(compliance_context)[:500]})
 
     # --- 2. REGIONAL TREND TOOLS (Region-Specific Discovery) ---
     trend_tools = [t.split(':')[0].strip() for t in selected_tools if t.split(':')[0].strip() in ["TRENDS", "ANALYSIS"]]
@@ -1121,8 +1223,13 @@ def generate_natural_answer(topic, context, history=""):
     2. **Avoid "Sports Blindness"**: High-volume categories like 'Sports' often dominate trend feeds. You must look past global volume to find signals that relate to the user's specific query. 
     3. **Nuance**: If the grounding data contains niche items like 'Iyabo Obasanjo' or 'NELFUND', prioritize explaining their context over simply reporting high-volume sports scores.
     
-    Use **bold** for key concepts.
-    Ensure paragraphs are separated by blank lines.
+    ### FORMATTING RULES:
+    1. Use **bold** for key concepts.
+    2. Ensure paragraphs are separated by blank lines.
+    3. **Code Blocks**: For any code snippets, use markdown fenced code blocks:
+       - Use triple backticks with language identifier: ```language
+       - Example: ```python\ndef hello(): return \"world\"\n```
+       - Supported languages: javascript, python, java, go, rust, typescript, html, css, json, yaml, bash, sql, etc.
     """
     
     try:
@@ -1207,7 +1314,12 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     ### FORMATTING GUIDANCE:
     {intent_instruction}
     
-    Generate a response that directly addresses the LATEST INSTRUCTION while using the GROUNDING DATA as supporting evidence.
+    ### CRITICAL RULES:
+    1. Generate a response that directly addresses the LATEST INSTRUCTION while using the GROUNDING DATA as supporting evidence.
+    2. **Code Blocks**: For any code snippets, use markdown fenced code blocks:
+       - Use triple backticks with language identifier: ```language
+       - Example: ```python\ndef hello(): return \"world\"\n```
+       - Always specify the language for proper syntax highlighting.
     """
 
     try:
@@ -1287,7 +1399,14 @@ def generate_pseo_article(topic, context, history="", history_events=None):
     STRUCTURE REQUIREMENTS (HTML Format):
     1.  **<section class="intro">**: A compelling, simple hook connecting the topic to the reader.
     2.  **<section class="body">**: Detailed analysis using <h2> and <h3> tags. Use specific data/facts from the context.
-    3.  **<section class="methodology">**: A TRANSPARENCY FOOTER. 
+    3.  **Code Blocks**: When including code snippets, use Ghost's markdown fenced code block format:
+        - Use triple backticks with language identifier: ```language
+        - Example for JavaScript: ```javascript\\nfunction example() {{ return true; }}\\n```
+        - Example for Python: ```python\\ndef hello(): return "world"\\n```
+        - Supported languages: javascript, python, java, go, rust, typescript, html, css, json, yaml, bash, sql, etc.
+        - CRITICAL: Always specify the language for proper Prism.js syntax highlighting
+        - The language identifier must be lowercase and immediately follow the opening backticks
+    4.  **<section class="methodology">**: A TRANSPARENCY FOOTER. 
         - Must be titled "## Methodology & Sources".
         - Explicitly list the domains/articles found in the research.
         - Explain *why* you selected them.
@@ -1296,7 +1415,9 @@ def generate_pseo_article(topic, context, history="", history_events=None):
     - Do NOT hallucinate.
     - Return ONLY the HTML content (no ```html``` markdown wrappers).
     - Do NOT include labels like 'Intro', 'Body', or 'Methodology' as text.
-    - Ensure it is ready for Ghost CMS.
+    - For code snippets, use markdown fenced code blocks (```language) NOT HTML <pre><code> tags.
+    - Always specify the programming language for syntax highlighting (e.g., ```javascript, ```python).
+    - Ensure it is ready for Ghost CMS (Ghost will convert markdown code blocks to HTML automatically).
 
     CONTEXTUAL DATA:
     Conversation History: 
@@ -1309,6 +1430,7 @@ def generate_pseo_article(topic, context, history="", history_events=None):
     
     Article Draft:
     """
+    
     
     return unimodel.generate_content(prompt, generation_config={"temperature": 0.3}).text.strip()
 
@@ -1492,6 +1614,95 @@ def refine_proposal(topic, current_proposal, critique):
     """
     return extract_json(unimodel.generate_content(prompt).text)
 
+# 18. Phase 1: Sales-to-Content Pipeline
+def process_sales_transcript(transcript_text, session_id=None):
+    """
+    Extracts customer objections and generates solution brief.
+    """
+    global specialist_model, db
+    
+    # Step 1: Extract objections using Claude
+    objection_prompt = f"""
+    Analyze this sales call transcript and extract the following (omit any field if not mentioned):
+    1. Core customer objections (max 5)
+    2. Pain points mentioned
+    3. Competitor comparisons
+    4. Budget/timeline concerns
+    
+    Transcript:
+    {transcript_text}
+    
+    Format as JSON (omit fields if not present in transcript):
+    {{
+      "objections": ["objection 1", "objection 2"],
+      "pain_points": ["pain 1", "pain 2"],
+      "competitors": ["competitor 1"],
+      "budget_timeline": "summary"
+    }}
+    
+    CRITICAL: Return ONLY valid JSON. If a category has no data, use an empty array [] or "Not discussed".
+    """
+    
+    try:
+        objections_raw = specialist_model.generate_content(objection_prompt).text.strip()
+        # Handle potential markdown wrapping
+        if "```json" in objections_raw:
+            objections_raw = objections_raw.split("```json")[1].split("```")[0].strip()
+        elif "```" in objections_raw:
+            objections_raw = objections_raw.split("```")[1].split("```")[0].strip()
+            
+        objections = json.loads(objections_raw)
+    except Exception as e:
+        print(f"Error extracting objections: {e}")
+        objections = {}
+    
+    # Normalize with defaults (defensive programming)
+    objections_list = objections.get("objections", [])
+    pain_points = objections.get("pain_points", [])
+    competitors = objections.get("competitors", [])
+    budget_timeline = objections.get("budget_timeline", "Not discussed")
+    
+    # Step 2: Generate solution brief
+    brief_prompt = f"""
+    Create a "Solution Brief" that addresses these customer insights:
+    
+    Objections: {objections_list if objections_list else "None identified"}
+    Pain Points: {pain_points if pain_points else "None identified"}
+    Competitors: {competitors if competitors else "None mentioned"}
+    Budget/Timeline: {budget_timeline}
+    
+    Format:
+    # Solution Brief
+    ## Executive Summary
+    ## Objection Responses
+    ## Competitive Advantages
+    ## Implementation Timeline
+    ## ROI Projection
+    
+    ### FORMATTING RULES:
+    1. Use **bold** for emphasis.
+    2. Use markdown tables where appropriate.
+    3. **Code Blocks**: If including technical/code examples, use markdown fenced code blocks:
+       - Use triple backticks with language identifier: ```language
+    """
+    
+    
+    brief_raw = specialist_model.generate_content(brief_prompt).text.strip()
+    brief_html = ensure_slack_compatibility(brief_raw)  # Convert **bold** to *bold*
+    
+    # Step 3: Normalize content for return (Auto-save REMOVED to align with approval logic)
+    normalized_objections = {
+        'objections': objections_list,
+        'pain_points': pain_points,
+        'competitors': competitors,
+        'budget_timeline': budget_timeline
+    }
+    
+    return {
+        'objections': normalized_objections,
+        'brief': brief_html
+    }
+
 # --- THE STATEFUL MAIN WORKER FUNCTION (FINAL V6 - SOCIAL AWARE) ---
 @functions_framework.http
 def process_story_logic(request):
@@ -1522,6 +1733,7 @@ def process_story_logic(request):
     session_id, original_topic, slack_context = req['session_id'], req.get('topic', ""), req['slack_context']
     feedback_text = req.get('feedback_text') # Captured from worker-feedback
     images = req.get('images', [])
+    code_files = req.get('code_files', []) # ADD: Extract code_files
     
     # Use the Slack-mimicking logic: if there's no thread_ts AND no feedback_text, it's the root message (initial).
     is_initial_post = not slack_context.get('thread_ts') and not feedback_text
@@ -1568,7 +1780,11 @@ def process_story_logic(request):
         if etype == 'user_request':
             formatted_history.append(f"USER: {event.get('text')}")
         elif etype == 'user_feedback':
-            formatted_history.append(f"USER FEEDBACK: {event.get('text')}")
+            # FIX: Include code analysis in history text if it was part of feedback
+            code_context = ""
+            if event.get('code_files'):
+                code_context = f" (Attached Files: {', '.join([f['file_name'] for f in event['code_files']])})"
+            formatted_history.append(f"USER FEEDBACK: {event.get('text')}{code_context}")
         elif etype in ['agent_answer', 'agent_reply', 'agent_proposal']:
             content = event.get('text') or event.get('content') or str(event.get('data', ''))
             formatted_history.append(f"AGENT: {content}") 
@@ -1618,12 +1834,20 @@ def process_story_logic(request):
             5.  **PSEO_ARTICLE**: **Ghost CMS Content Hook.** Only select this if the message is a NEW request to create a pSEO article or EXPLICITLY mentions "**pSEO**", "**Ghost**", or "**Ghost CMS**" as a command. 
                 *   *CRITICAL:* If the user is asking *about* a previous pSEO article (e.g., "How did you integrate X?", "Explain the delivery", "What's the status?"), **DO NOT** select this. Use **SIMPLE_QUESTION** or **DIRECT_ANSWER** instead.
 
-            6.  **SIMPLE_QUESTION**: **The Efficient Operative/OS Mode.** For fact-checks, definitions, **CREATING OUTLINES**, **BRIEFS**, retrieving information from history, or re-formatting previous points. 
-                *   *Triggers:* "Summarize our progress," "Create a Blog Outline," "Draft an outline," "Format those points as bullets," "Explain your logic."
-                *   *Rule:* If the user asks to **GENERATE A STRUCTURE** (Outline/Brief), you MUST select this. If they ask to **WRITE THE POST** from an outline, select DEEP_DIVE.
+            6.  **SALES_TRANSCRIPT**: **Sales Analysis.** Select this if the user provides a transcript or asks to analyze a sales call for objections, solution briefs, or deal coaching.
+                *   *Triggers:* "Analyze this call", "Create a solution brief", "Extract objections", "What were the pain points?".
+                *   *Rule:* If the user requests a "Solution Brief" from text, select this.
 
-            7.  **DIRECT_ANSWER**: **The Research Architect.** Select this ONLY for **NOVEL SYNTHESIS** or **TECHNICAL AUDITS** that require combining multiple external data sources into a new expert opinion. 
+            7.  **SIMPLE_QUESTION**: **The Factual Scout.** For fact-checks, definitions, or retrieving specific data points that require external grounding or RAG search.
+                *   *Triggers:* "What is...", "Explain the concept of...", "Find me the rules for...", "Check the status of...".
+                *   *Rule:* Use this for initial questions about the world. If the user asks for a STRUCTURE (Outline/Brief), pick **OPERATIONAL_REFORMAT** instead.
+
+            8.  **DIRECT_ANSWER**: **The Research Architect.** Select this ONLY for **NOVEL SYNTHESIS** or **TECHNICAL AUDITS** that require combining multiple external data sources into a new expert opinion. 
                 *   *Example:* "Analyze the security layer of AP2 vs standard PCI-DSS." 
+
+            9.  **OPERATIONAL_REFORMAT**: **The Efficiency Engine.** Select this for any structural command whose COMPLETE context is already available in the history.
+                *   *Triggers:* "Summarize our progress", "Create an outline from our discussion", "Reformat these points as bullets", "Make it more professional", "Convert this into a brief".
+                *   *CRITICAL:* If the request is purely about structural formatting of existing knowledge, select this.
 
             ### NEGATIVE CONSTRAINTS (DO NOT CLASSIFY AS DEEP_DIVE IF):
             - The word "Outline" is present.
@@ -1636,7 +1860,7 @@ def process_story_logic(request):
             USER REQUEST (THE COMMAND): "{sanitized_topic}"
             MISSION SUBJECT: "{original_topic}"
 
-            CRITICAL: Respect the "No Outlines in Deep_Dive" rule. Select SIMPLE_QUESTION for all Outlines, history retrieval, or formatting requests. Select DIRECT_ANSWER ONLY for new, complex synthesis of external data. Respond with ONLY the category name.
+            CRITICAL: Respect the "No Outlines in Deep_Dive" rule. Select OPERATIONAL_REFORMAT for Outlines, checklists, or formatting requests using existing data. Select DIRECT_ANSWER ONLY for new, complex synthesis of external data. Respond with ONLY the category name.
 
             """
         # --- EXECUTION: Triage Model Selection ---
@@ -1686,13 +1910,172 @@ def process_story_logic(request):
             requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": reply_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=True, timeout=10)
             return jsonify({"msg": "Social reply sent"}), 200
 
+        # === PATH B: OPERATIONAL REFORMAT / FAST FOLLOW-UP (Fast Exit) ===
+        elif intent == "OPERATIONAL_REFORMAT":
+            # GROUNDING GUARD: We only "Fast-Exit" if we actually have history to reformat.
+            # If this is the first turn and the topic is new, we MUST research.
+            has_substantive_history = len(history_events) > 0 or len(sanitized_topic) > 100 
+            
+            if has_substantive_history:
+                print(f"Executing Operational Reformat (Fast Exit) for command: {sanitized_topic[:50]}")
+                # Use natural answer generation with full context but NO research
+                answer_data = generate_natural_answer(sanitized_topic, "COMPLETE_CONTEXT_IN_HISTORY", history=history_text)
+                answer_text = answer_data['text']
+                research_intent = answer_data['intent']
+                
+                new_events.append({"event_type": "agent_answer", "text": answer_text, "intent": "OPERATIONAL_REFORMAT"})
+                
+                # Writing to Session Memory
+                session_ref = db.collection('agent_sessions').document(session_id)
+                events_ref = session_ref.collection('events')
+                for event in new_events:
+                    if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
+                    events_ref.add(event)
+
+                session_ref.update({
+                    "status": "completed",
+                    "type": "operational_answer",
+                    "last_updated": expire_time
+                })
+                
+                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                    "session_id": session_id, 
+                    "type": "social", 
+                    "message": answer_text, 
+                    "intent": "OPERATIONAL_REFORMAT",
+                    "channel_id": slack_context['channel'], 
+                    "thread_ts": slack_context['ts'],
+                    "is_initial_post": is_initial_post
+                }, verify=certifi.where(), timeout=15)
+                return jsonify({"msg": "Operational reformat sent"}), 200
+            else:
+                print(f"OPERATIONAL_REFORMAT fallback: Insufficient grounding. Routing to Research Path.")
+                # Fall through to Path D (Work/Research)
+                pass
+
+        # === PATH C: SALES TRANSCRIPT (Fast Exit) ===
+        elif intent == "SALES_TRANSCRIPT" or req.get('type') == 'sales_transcript':
+            print("Executing Sales Transcript Processing (Fast Exit)")
+            transcript_text = req.get('transcript', sanitized_topic)
+            
+            result = process_sales_transcript(transcript_text, session_id=session_id)
+            
+            # SUCCESS: Log the event to subcollection for Feedback Worker retrieval
+            ts = datetime.datetime.now(datetime.timezone.utc)
+            new_events.append({
+                "event_type": "agent_proposal", 
+                "proposal_type": "solution_brief", 
+                "text": result['brief'],
+                "proposal_data": {
+                    "objections": result['objections'],
+                    "brief": result['brief']
+                },
+                "timestamp": ts
+            })
+            
+            # Persist to Firestore
+            print(f"DEBUG: Persisting Solution Brief event for session {session_id}")
+            session_ref = db.collection('agent_sessions').document(session_id)
+            events_ref = session_ref.collection('events')
+            for event in new_events:
+                if 'timestamp' not in event: event['timestamp'] = ts
+                events_ref.add(event)
+
+            # Update session status
+            session_ref.update({
+                "status": "awaiting_feedback",
+                "type": "solution_brief",
+                "last_updated": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+            })
+
+            # Send to N8N for distribution
+            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                "session_id": session_id,
+                "type": "solution_brief",
+                "objections": result['objections'],
+                "brief": result['brief'],
+                "channel_id": slack_context.get('channel'),
+                "thread_ts": slack_context.get('ts'),
+                "is_initial_post": is_initial_post
+            }, verify=certifi.where(), timeout=30)
+            
+            return jsonify({"msg": "Solution brief generated"}), 200
+
 
         # === PATH B: WORK/RESEARCH (The Heavy Lifting) ===
         # Only now do we pay the cost to distill and research.
 
+        # 0. CODE FILE ANALYSIS (New Priority Path)
+        code_files = req.get('code_files', [])
+        code_analysis_context = []
+        
+        # Initialize MCP Client
+        mcp = get_mcp_client()
+        
+        # 0.1 Pull in previous code analysis from history (Multi-turn Persistence)
+        if history_events:
+            recovered_count = 0
+            for event in history_events:
+                if event.get('event_type') == 'code_analysis' and event.get('analysis_result'):
+                    code_analysis_context.append(event['analysis_result'])
+                    recovered_count += 1
+            if recovered_count > 0:
+                print(f"TELEMETRY: Recovered {recovered_count} code analysis results from thread history.")
+        
+        if code_files:
+            print(f"TELEMETRY: Code File Analysis Mode detected ({len(code_files)} files)")
+            
+            for file_info in code_files:
+                file_name = file_info.get('name', 'unknown_file')
+                file_url = file_info.get('url')
+                file_id = file_info.get('id')
+                file_mode = file_info.get('mode', 'hosted')
+                
+                # Download file content from Slack
+                file_content = fetch_slack_file_content(file_url, file_id, file_mode)
+                
+                if not file_content:
+                    print(f"⚠️ No content downloaded for {file_name}")
+                    code_analysis_context.append(f"CODE_FILE ({file_name}): [Download failed]")
+                    continue
+                
+                # Analyze code file via MCP tool
+                try:
+                    analysis_context = mcp.call_tool(
+                        "analyze_code_file",
+                        {
+                            "file_content": file_content,
+                            "file_name": file_name,
+                            "user_prompt": sanitized_topic,
+                            "history_context": history_text
+                        }
+                    )
+                    
+                    code_analysis_context.append(analysis_context)
+                    
+                    # Log the analysis event (with result for persistence)
+                    new_events.append({
+                        "event_type": "code_analysis",
+                        "file_name": file_name,
+                        "analysis_result": analysis_context,
+                        "status": "success",
+                        "timestamp": datetime.datetime.now(datetime.timezone.utc)
+                    })
+                except Exception as e:
+                    print(f"⚠️ Code analysis failed for {file_name}: {e}")
+                    # Add raw file info as fallback
+                    code_analysis_context.append(f"CODE_FILE ({file_name}): [Analysis failed: {str(e)}]")
+            
+            print(f"✅ Code analysis complete. Adding {len(code_analysis_context)} code insights to research context.")
+
         # 1. Research (Distinguishing between Direct URLs and Exploratory Keywords)
         urls = extract_urls_from_text(sanitized_topic)
         combined_context = []
+        
+        # Add code analysis context first (highest priority grounding)
+        if code_analysis_context:
+            combined_context.extend(code_analysis_context)
+            print(f"TELEMETRY: Added {len(code_analysis_context)} code analysis insights to grounding context")
         
         if urls:
             print(f"TELEMETRY: URL Mode detected ({len(urls)} links). Bypassing exploratory search.")
@@ -1719,7 +2102,7 @@ def process_story_logic(request):
         if images or urls:
             print(f"TELEMETRY: Media-Rich Request detected. Analyzing signals and grounding assets...")
             # We call find_trending_keywords to get Geo/Intent signals and analyze any direct images
-            r_result = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images, mission_topic=original_topic, session_metadata=session_data)
+            r_result = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images, mission_topic=original_topic, session_metadata=session_data, initial_context=code_analysis_context)
             
             # Merge context: URL scrapes (combined_context) + keyword/image insights (r_result)
             combined_context.extend(r_result['context'])
@@ -1732,8 +2115,11 @@ def process_story_logic(request):
 
         else:
             print(f"TELEMETRY: Keyword Mode detected. Launching Sensory Array Router...")
-            r_result = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images, mission_topic=original_topic, session_metadata=session_data)
+            # FIX: Pass code_analysis_context so the hub can see what we already know
+            r_result = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images, mission_topic=original_topic, session_metadata=session_data, initial_context=code_analysis_context)
             research_data = r_result
+            # Unified Merging: Base context (Code Analysis) + Novel Findings (r_result)
+            research_data['context'] = code_analysis_context + r_result['context']
             # Ensure Key Persistence
             if "research_intent" not in research_data: research_data["research_intent"] = "KEYWORD_SENSORY"
         
@@ -2113,6 +2499,7 @@ def process_story_logic(request):
                 requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=certifi.where(), timeout=15)
                 return jsonify({"msg": "pSEO Fallback Answer sent"}), 200
 
+
         else: 
             # ROBUST FALLBACK: If intent is unknown, default to a natural answer rather than crashing with 500
             print(f"TELEMETRY: ⚠️ Unknown Intent Detected: '{intent}'. Defaulting to Natural Answer fallback.")
@@ -2169,26 +2556,28 @@ def ingest_knowledge(request):
     vertexai.init(project=PROJECT_ID, location=LOCATION)
     embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
 
-    req = request.get_json(silent=True)
-    session_id = req.get('session_id')
-    final_story = req.get('story')
-    topic = req.get('topic') 
+    # Unified Ingestion Router (Determines destination collection)
+    ingest_type = req.get('type', 'knowledge') # 'knowledge' or 'solution_brief'
     
-    if not final_story: return jsonify({"error": "Missing story"}), 400
+    if ingest_type == 'solution_brief':
+        # Solution Briefs are structured, not chunked for vector search (Session Memory focus)
+        db.collection('solution_briefs').add({
+            'session_id': session_id,
+            'topic': topic,
+            'objections': req.get('objections'),
+            'brief': req.get('story'),
+            'created_at': datetime.datetime.now(datetime.timezone.utc)
+        })
+        return jsonify({"msg": "Solution brief ingested."}), 200
 
-    # Call the helper function (Global Scope)
+    # Knowledge Base Path: Chunk and Embed
     chunks = chunk_text(final_story)
     embeddings = embedding_model.get_embeddings([c for c in chunks])
     
-    # Firestore Batch Write with Safety Check Limits
     batch = db.batch()
     count = 0
-    
-    # Iterate and add to batch
     for i, (text_segment, embedding_obj) in enumerate(zip(chunks, embeddings)):
         doc_ref = db.collection('knowledge_base').document(f"{session_id}_{i}")
-        
-        # 1. Set the data (Add to batch) - WITH PII SCRUBBING
         batch.set(doc_ref, {
             "content": scrub_pii(text_segment),
             "embedding": Vector(embedding_obj.values),
@@ -2197,17 +2586,122 @@ def ingest_knowledge(request):
             "chunk_index": i,
             "created_at": datetime.datetime.now(datetime.timezone.utc)
         })
-        
         count += 1
-        
-        # 2. The Safety Check
         if count >= 499:
             batch.commit()
-            batch = db.batch() # Start fresh
+            batch = db.batch()
             count = 0
 
-    # 3. Commit leftovers (e.g., the last 12 items of 512)
     if count > 0: batch.commit()
 
     print(f"Ingested {len(chunks)} chunks.")
     return jsonify({"msg": "Knowledge ingested."}), 200
+
+
+
+# --- COMPLIANCE DOCUMENT INGESTION ENDPOINT ---
+@functions_framework.http
+def ingest_compliance_docs(request):
+    """
+    Ingests compliance PDFs from external URLs.
+    Zero-cost implementation: No backup storage, re-run script if URLs fail.
+    Secured with API key authentication.
+    """
+    # Security check: Validate API key
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({"error": "Missing or invalid Authorization header"}), 401
+    
+    provided_key = auth_header.replace('Bearer ', '')
+    if provided_key != INGESTION_API_KEY:
+        print(f"⚠️ Unauthorized access attempt from IP: {request.remote_addr}")
+        return jsonify({"error": "Invalid API key"}), 403
+    
+    # Initialize clients
+    db = firestore.Client(project=PROJECT_ID)
+    vertexai.init(project=PROJECT_ID, location=LOCATION)
+    embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
+    
+    req = request.get_json(silent=True)
+    doc_url = req.get('doc_url')
+    doc_type = req.get('doc_type')
+    doc_version = req.get('version', '1.0')
+    tenant_id = req.get('tenant_id', 'global')
+    geo_scope = req.get('geo_scope', [])
+    industry_scope = req.get('industry_scope', ['all'])
+    
+    if not doc_url or not doc_type:
+        return jsonify({"error": "Missing doc_url or doc_type"}), 400
+    
+    # Fetch PDF content via optimized MCP sensory hub (Hybrid HTML/PDF scraper)
+    try:
+        print(f"Fetching {doc_type} via Smart MCP Hub: {doc_url}")
+        mcp_endpoint = "https://mcp-sensory-server-gjkm6kxlea-uc.a.run.app/messages"
+        
+        mcp_payload = {
+            "method": "tools/call",
+            "params": {
+                "name": "scrape_article",
+                "arguments": {"url": doc_url}
+            }
+        }
+        
+        mcp_response = requests.post(mcp_endpoint, json=mcp_payload, timeout=90) # Extended timeout for Gemini OCR
+        
+        if mcp_response.status_code != 200:
+            return jsonify({"error": f"MCP Hub Error ({mcp_response.status_code})", "details": mcp_response.text}), 500
+            
+        mcp_data = mcp_response.json()
+        pdf_content = mcp_data.get("result", {}).get("content", [{}])[0].get("text", "")
+        
+        if not pdf_content or len(pdf_content) < 100:
+            raise ValueError("Smart Hub failed to extract meaningful text")
+            
+        print(f"✅ Successfully fetched {len(pdf_content)} characters via Smart Hub")
+        
+    except Exception as e:
+        error_msg = f"Failed to fetch content via Smart Hub: {str(e)}"
+        print(f"❌ {error_msg}")
+        return jsonify({"error": error_msg}), 500
+    
+    # Chunk and embed (reuse existing logic)
+    chunks = chunk_text(pdf_content)
+    embeddings = embedding_model.get_embeddings(chunks)
+    
+    # Store in Firestore with multi-tenant metadata
+    batch = db.batch()
+    count = 0
+    
+    for i, (chunk, embedding_obj) in enumerate(zip(chunks, embeddings)):
+        doc_ref = db.collection('compliance_knowledge').document(f"{doc_type}_{doc_version}_{i}")
+        batch.set(doc_ref, {
+            "content": scrub_pii(chunk),
+            "embedding": Vector(embedding_obj.values),
+            "doc_type": doc_type,
+            "doc_source": doc_url,
+            "doc_version": doc_version,
+            "tenant_id": tenant_id,
+            "geo_scope": geo_scope,
+            "industry_scope": industry_scope,
+            "chunk_index": i,
+            "created_at": datetime.datetime.now(datetime.timezone.utc)
+        })
+        
+        count += 1
+        
+        if count >= 499:
+            batch.commit()
+            batch = db.batch()
+            count = 0
+    
+    if count > 0:
+        batch.commit()
+    
+    print(f"✅ Ingested {len(chunks)} chunks from {doc_type}")
+    
+    return jsonify({
+        "msg": f"Ingested {len(chunks)} chunks from {doc_type}",
+        "doc_type": doc_type,
+        "chunks_count": len(chunks),
+        "doc_source": doc_url
+    }), 200

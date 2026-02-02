@@ -12,3 +12,5 @@ litellm
 vertexai
 certifi
 google-api-python-client
+tenacity
+anthropic

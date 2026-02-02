@@ -1,5 +1,6 @@
 import os
 import re
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import json
 import requests
 import certifi
@@ -10,12 +11,15 @@ from bs4 import BeautifulSoup
 from google.cloud import secretmanager, firestore
 from google.cloud.firestore_v1.vector import Vector
 from google.cloud.firestore_v1.base_vector_query import DistanceMeasure
+from google.cloud.firestore_v1.base_query import FieldFilter
 from vertexai.language_models import TextEmbeddingModel
 from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, Part
 from vertexai.preview.vision_models import ImageGenerationModel
 from serpapi import GoogleSearch
 from googleapiclient.discovery import build
 import base64
+import litellm
+from litellm import completion
 
 # --- Configuration ---
 PROJECT_ID = os.environ.get("PROJECT_ID")
@@ -25,6 +29,7 @@ SEARCH_ENGINE_ID = os.environ.get("SEARCH_ENGINE_ID")
 SERPAPI_API_KEY = None
 BROWSERLESS_API_KEY = None
 FLASH_MODEL_NAME = os.environ.get("FLASH_MODEL_NAME", "gemini-2.0-flash-exp")
+ANTHROPIC_API_KEY = None
 DEFAULT_GEO = os.environ.get("DEFAULT_GEO", "NG") # Default to Nigeria as primary operating region, but configurable
 
 # --- SEMRush-Based Power Player Benchmarking ---
@@ -85,7 +90,9 @@ vertexai.init(project=PROJECT_ID, location=LOCATION)
 @app.on_event("startup")
 async def startup_event():
     """Initializes external services and secrets on startup."""
+    global ANTHROPIC_API_KEY
     initialize_secrets()
+    ANTHROPIC_API_KEY = get_secret("anthropic-api-key") or os.environ.get("ANTHROPIC_API_KEY")
 
 def get_flash_model():
     global flash_model
@@ -205,6 +212,55 @@ def extract_acronym_definitions(text):
         
     return list(set(definitions))
 
+def intelligent_sample_code(content, max_chars=120000):
+    """
+    Preserves structural integrity of large files by keeping Head, Tail,
+    and a skeleton of the middle section.
+    """
+    if not isinstance(content, str) or len(content) <= max_chars:
+        return content
+    
+    print(f"MCP Hub: Sampling large file ({len(content)} chars) for intelligence preservation...")
+    
+    # Head: 40% (Imports, Globals, Configs)
+    # Tail: 25% (Main entry points, execution logic)
+    head_limit = int(max_chars * 0.4)
+    tail_limit = int(max_chars * 0.25)
+    
+    head = content[:head_limit]
+    tail = content[-tail_limit:]
+    middle = content[head_limit:-tail_limit]
+    
+    # Extract Structural Skeleton from the Middle
+    # We look for class and function signatures to maintain "Map Awareness"
+    skeleton_lines = []
+    lines = middle.splitlines()
+    
+    # Regex to catch Python class/def signatures (including async)
+    # Allows for multi-line but we only take the first line for the skeleton
+    structural_pattern = re.compile(r'^\s*(async\s+)?(def|class)\s+[\w\d_]+.*')
+    
+    for line in lines:
+        if structural_pattern.match(line):
+            # Clean up the line and add a marker
+            skeleton_lines.append(f"  {line.strip()} ...")
+            if len(skeleton_lines) > 200: # Safety cap for extremely dense files
+                skeleton_lines.append("  [... further skeleton truncated for brevity ...]")
+                break
+    
+    skeleton_text = "\n".join(skeleton_lines)
+    
+    final_content = (
+        head + 
+        f"\n\n[--- MIDDLE SECTION OMITTED ({len(middle)} chars) ---]\n" +
+        f"[--- STRUCTURAL SKELETON OF OMITTED SECTION ---]\n" +
+        skeleton_text + 
+        f"\n\n[--- END OF SKELETON ---]\n\n" + 
+        tail
+    )
+    
+    return final_content
+
 def handle_tool_call(name, arguments):
     """
     Central dispatcher for all sensory tools.
@@ -218,11 +274,11 @@ def handle_tool_call(name, arguments):
 
     # Namespacing / Allowed List check
     allowed_tools = [
-        "google_web_search", "scrape_article", "rag_search", "google_trends", 
-        "trend_analysis", "google_images_search", "google_videos_search", 
+        "google_web_search", "scrape_article", "rag_search", "compliance_rag_search",
+        "google_trends", "trend_analysis", "google_images_search", "google_videos_search", 
         "google_scholar_search", "google_news_search", "google_simple_search",
         "detect_geo", "detect_intent", "analyze_image", "generate_image",
-        "google_ai_overview"
+        "google_ai_overview", "analyze_code_file"
     ]
     if name not in allowed_tools:
         return f"Error: Tool '{name}' is not in the allowed list."
@@ -272,79 +328,89 @@ def handle_tool_call(name, arguments):
     elif name == "scrape_article":
         url = arguments.get("url")
         if not url or not url.startswith("http"): return "Error: Invalid URL."
-        endpoint = f"https://production-sfo.browserless.io/content?token={BROWSERLESS_API_KEY}&stealth=true"
-        # Removed "image" from rejectResourceTypes to allow visual assets to load
-        payload = {"url": url, "rejectResourceTypes": ["media", "font"], "gotoOptions": {"timeout": 15000, "waitUntil": "networkidle2"}}
-        response = requests.post(endpoint, json=payload, timeout=20, verify=certifi.where())
-        soup = BeautifulSoup(response.content, 'html.parser')
         
-        # CLEANUP FIRST: Remove noise elements (nav, footer, ads) BEFORE extraction
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "ad"]): tag.decompose()
-
-        # Extract high-value image URLs (Social-Media Aware Detection)
-        found_images = []
-        exclude_patterns = ["profile_images", "avatar", "icon", "logo", "header_photo", "normal", "mini"]
+        # --- HYBRID DETECTION: Check if PDF or HTML ---
+        is_pdf = url.lower().endswith(".pdf")
         
-        # Social media platforms often use 'format=jpg' in query-strings instead of extensions
-        img_ext_pattern = re.compile(r'\.(jpg|jpeg|png|webp|gif|pdf)', re.I)
-        social_media_fmt_pattern = re.compile(r'format=(jpg|jpeg|png|webp|gif)', re.I)
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            }
+            # Initial head request to check content-type if not obviously .pdf
+            if not is_pdf:
+                head_resp = requests.head(url, headers=headers, timeout=10, allow_redirects=True)
+                content_type = head_resp.headers.get("Content-Type", "").lower()
+                if "application/pdf" in content_type:
+                    is_pdf = True
 
-        for img in soup.find_all("img"):
-            # Check all common source attributes
-            img_src = img.get("src") or img.get("data-src") or img.get("srcset") or img.get("data-original")
-            if img_src and img_src.startswith("http"):
-                # Handle srcset which might contain multiple URLs
-                clean_src = img_src.split(',')[0].split(' ')[0].strip()
+            if is_pdf:
+                print(f"MCP Hub: High-Fidelity PDF Detection. Using Gemini for {url}")
+                pdf_resp = requests.get(url, headers=headers, timeout=30, verify=certifi.where())
+                pdf_resp.raise_for_status()
                 
-                # Check for standard extension OR social media query-string format
-                has_valid_ext = img_ext_pattern.search(clean_src) or social_media_fmt_pattern.search(clean_src)
+                model = get_flash_model() # Uses gemini-2.0-flash-exp (or whichever is configured)
+                pdf_part = Part.from_data(data=pdf_resp.content, mime_type="application/pdf")
                 
-                if not has_valid_ext:
-                    continue
+                # Optimized prompt for regulatory and technical extraction
+                extraction_prompt = """
+                Extract all text from this document verbatim. 
+                Keep the structure (Headings, Articles, Sections).
+                Ensure Article numbers and specific legal clauses are perfectly captured.
+                Format as clean Markdown.
+                """
+                
+                response = model.generate_content([extraction_prompt, pdf_part])
+                result = f"[HIGH_FIDELITY_PDF_EXTRACTION]\n\n{response.text}"
+                
+            else:
+                # Standard HTML Scrape via Browserless
+                endpoint = f"https://production-sfo.browserless.io/content?token={BROWSERLESS_API_KEY}&stealth=true"
+                payload = {"url": url, "rejectResourceTypes": ["media", "font"], "gotoOptions": {"timeout": 15000, "waitUntil": "networkidle2"}}
+                response = requests.post(endpoint, json=payload, timeout=20, verify=certifi.where())
+                soup = BeautifulSoup(response.content, 'html.parser')
+                
+                for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "ad"]): tag.decompose()
 
-                # High-Value Check: Skip images that look like UI elements or profile pics
-                if any(p in clean_src.lower() for p in exclude_patterns):
-                    # Exception: If it's on a known media host (like pbs.twimg.com/media), keep it anyway
-                    if "twimg.com/media" not in clean_src.lower():
-                        continue
-                    
-                if clean_src not in found_images:
-                    found_images.append(clean_src)
-            if len(found_images) >= 5: break
+                found_images = []
+                exclude_patterns = ["profile_images", "avatar", "icon", "logo", "header_photo", "normal", "mini"]
+                img_ext_pattern = re.compile(r'\.(jpg|jpeg|png|webp|gif|pdf)', re.I)
+                social_media_fmt_pattern = re.compile(r'format=(jpg|jpeg|png|webp|gif)', re.I)
 
-        # --- NEW: Extract Hyperlinks for Recursive "Turbo" Navigation ---
-        found_links = []
-        skip_domains = ["twitter.com", "x.com", "facebook.com", "instagram.com", "linkedin.com", "youtube.com"]
-        for link in soup.find_all("a", href=True):
-            href = link.get("href", "").strip()
-            text = link.get_text().strip()
-            
-            # Filter noise
-            if not href.startswith("http"): continue # Skip relative/internal links for now to avoid broken fragments
-            if len(text) < 5: continue # Skip "Click here", "More", icons
-            if any(d in href for d in skip_domains): continue # Skip generic social shares
-            
-            # Format: "Link Text (URL)"
-            entry = f"- {text} ({href})"
-            if entry not in found_links:
-                found_links.append(entry)
-            
-            if len(found_links) >= 8: break # Limit context window usage
+                for img in soup.find_all("img"):
+                    img_src = img.get("src") or img.get("data-src") or img.get("srcset") or img.get("data-original")
+                    if img_src and img_src.startswith("http"):
+                        clean_src = img_src.split(',')[0].split(' ')[0].strip()
+                        has_valid_ext = img_ext_pattern.search(clean_src) or social_media_fmt_pattern.search(clean_src)
+                        if not has_valid_ext: continue
+                        if any(p in clean_src.lower() for p in exclude_patterns):
+                            if "twimg.com/media" not in clean_src.lower(): continue
+                        if clean_src not in found_images:
+                            found_images.append(clean_src)
+                    if len(found_images) >= 5: break
 
-        # (Decompose moved to top)
-        text = soup.get_text(separator='\n\n')
-        clean_text = re.sub(r'\n\s*\n', '\n\n', text).strip()
-        
-        # Append images AND links as grounded context
-        image_context = "\n\n[DETECTED_IMAGES]:\n" + "\n".join(found_images) if found_images else ""
-        link_context = "\n\n[DETECTED_LINKS]:\n" + "\n".join(found_links) if found_links else ""
-        
-        # --- ACROYNM SAFEGUARD ---
-        # Extract explicit definitions found in the text so they don't get buried
-        acronym_defs = extract_acronym_definitions(clean_text)
-        def_context = "\n\n[DETECTED_DEFINITIONS]:\n" + "\n".join(acronym_defs) if acronym_defs else ""
-        
-        result = (def_context + "\n\n" + clean_text[:18000] + image_context + link_context).strip()
+                found_links = []
+                skip_domains = ["twitter.com", "x.com", "facebook.com", "instagram.com", "linkedin.com", "youtube.com"]
+                for link in soup.find_all("a", href=True):
+                    href = link.get("href", "").strip()
+                    text = link.get_text().strip()
+                    if not href.startswith("http"): continue
+                    if len(text) < 5: continue
+                    if any(d in href for d in skip_domains): continue
+                    entry = f"- {text} ({href})"
+                    if entry not in found_links: found_links.append(entry)
+                    if len(found_links) >= 8: break
+
+                text = soup.get_text(separator='\n\n')
+                clean_text = re.sub(r'\n\s*\n', '\n\n', text).strip()
+                image_context = "\n\n[DETECTED_IMAGES]:\n" + "\n".join(found_images) if found_images else ""
+                link_context = "\n\n[DETECTED_LINKS]:\n" + "\n".join(found_links) if found_links else ""
+                acronym_defs = extract_acronym_definitions(clean_text)
+                def_context = "\n\n[DETECTED_DEFINITIONS]:\n" + "\n".join(acronym_defs) if acronym_defs else ""
+                
+                result = (def_context + "\n\n" + clean_text[:18000] + image_context + link_context).strip()
+
+        except Exception as e:
+            result = f"Error in hybrid scrape: {str(e)}"
 
     elif name == "rag_search":
         query = arguments.get("query")
@@ -372,6 +438,89 @@ def handle_tool_call(name, arguments):
                 trigger = data.get('topic_trigger', 'Unknown Topic')
                 memories.append(f"PAST SUCCESSFUL OUTPUT (Trigger: '{trigger}'):\n{data.get('content')}")
         result = "\n".join(memories) if memories else "No relevant memories found."
+
+    elif name == "compliance_rag_search":
+        query = arguments.get("query")
+        doc_type = arguments.get("doc_type")
+        geo_scope = arguments.get("geo_scope")
+        limit = arguments.get("limit", 5)
+        
+        if not query: return "Error: Missing query."
+        
+        try:
+            db = get_db()
+            embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
+            query_embedding = embedding_model.get_embeddings([query[:6000]])[0].values
+            
+            collection = db.collection('compliance_knowledge')
+            
+            # Use modern FieldFilter for robust query construction
+            filters = [FieldFilter("tenant_id", "==", "global")]
+            
+            if doc_type:
+                filters.append(FieldFilter("doc_type", "==", doc_type))
+            if geo_scope:
+                filters.append(FieldFilter("geo_scope", "array_contains", geo_scope))
+                
+            # Filtered Vector Search
+            try:
+                # We combine filters into a single query
+                query_ref = collection
+                for f in filters:
+                    query_ref = query_ref.where(filter=f)
+                    
+                results = query_ref.find_nearest(
+                    vector_field="embedding",
+                    query_vector=Vector(query_embedding),
+                    distance_measure=DistanceMeasure.COSINE,
+                    limit=limit
+                ).get()
+            except Exception as e:
+                print(f"WARNING: Filtered vector search failed: {e}. Falling back to Local Semantic Search.")
+                # Fallback: Fetch chunks and perform local match
+                # This ensures we work even if indexes are building
+                local_query = collection.where(filter=FieldFilter("tenant_id", "==", "global"))
+                if doc_type: local_query = local_query.where(filter=FieldFilter("doc_type", "==", doc_type))
+                if geo_scope: local_query = local_query.where(filter=FieldFilter("geo_scope", "array_contains", geo_scope))
+                
+                # Fetch up to 100 relevant chunks for local processing
+                all_docs = local_query.limit(100).get()
+                
+                # Simple keyword match + relevance boost
+                matched_docs = []
+                query_words = set(query.lower().split())
+                for doc in all_docs:
+                    d = doc.to_dict()
+                    content = d.get('content', '').lower()
+                    score = sum(1 for word in query_words if word in content)
+                    if score > 0:
+                        matched_docs.append((score, d))
+                
+                # Sort by score descending
+                matched_docs.sort(key=lambda x: x[0], reverse=True)
+                results_data = [d for score, d in matched_docs[:limit]]
+                
+                if not results_data:
+                    return "No relevant compliance regulations found (Local Fallback)."
+                
+                snippets = []
+                for d in results_data:
+                    snippet = f"[{d.get('doc_type', 'UNKNOWN').upper()} - {d.get('doc_version', '')}]\nSource: {d.get('doc_source', '')}\nContent: {d.get('content', '')}"
+                    snippets.append(snippet)
+                return "\n\n---\n\n".join(snippets)
+                
+            if not results:
+                return "No relevant compliance regulations found for this query."
+                
+            snippets = []
+            for doc in results:
+                d = doc.to_dict()
+                snippet = f"[{d.get('doc_type', 'UNKNOWN').upper()} - {d.get('doc_version', '')}]\nSource: {d.get('doc_source', '')}\nContent: {d.get('content', '')}"
+                snippets.append(snippet)
+                
+            result = "\n\n---\n\n".join(snippets)
+        except Exception as e:
+            result = f"Error in compliance RAG: {str(e)}"
 
     elif name == "google_trends":
         geo = arguments.get("geo", DEFAULT_GEO)
@@ -592,6 +741,103 @@ def handle_tool_call(name, arguments):
             result = f"[IMAGE_GENERATED]: A high-fidelity visual has been created for: '{prompt}'. (GCS Link Pending Integration)"
         except Exception as e:
             result = f"Error generating image: {str(e)}"
+
+    elif name == "analyze_code_file":
+        file_content = arguments.get("file_content")
+        file_name = arguments.get("file_name", "unknown_file")
+        user_prompt = arguments.get("user_prompt", "")
+        history_context = arguments.get("history_context", "")
+
+        # CONTENT PROTECTION: If content looks like a Slack error or is empty, abort early
+        if not file_content or '{"ok":false' in str(file_content) or '"error":"' in str(file_content)[:100]:
+            print(f"MCP Hub: Aborting analysis for {file_name} due to invalid content (Slack Error or Empty)")
+            return f"CODE_FILE ({file_name}): [Content unavailable or download error from Slack]"
+        
+        print(f"MCP Hub: Analyzing code file: {file_name}")
+        
+        # INTELLIGENT SAMPLING: Preserve structural integrity instead of simple truncation
+        file_content = intelligent_sample_code(file_content, max_chars=120000)
+        print(f"MCP Hub: Prepared analysis content for {file_name} ({len(file_content)} chars)")
+        
+        analysis_prompt = f"""
+        You are a technical code analyst. Analyze this code file to extract insights that will help answer the user's request.
+        
+        **Code File**: `{file_name}`
+        **User Request**: {user_prompt or "Analyze this code"}
+        
+        **Code Content**:
+        ```
+        {file_content}
+        ```
+        
+        **Conversation History** (for context):
+        {history_context[:2000] if history_context else "No prior context"}
+        
+        **Analysis Task**: 
+        Provide a structured analysis covering:
+        
+        1. **Code Summary** (2-3 sentences)
+           - What does this code do?
+           - What problem does it solve?
+        
+        2. **Key Technical Concepts**
+           - Technologies/frameworks used
+           - Design patterns employed
+           - Architecture decisions
+        
+        3. **Notable Features**
+           - Interesting implementations
+           - Performance optimizations
+           - Security considerations
+           - Error handling approaches
+        
+        4. **Potential Content Angles** (based on user's request)
+           - What aspects align with the user's question?
+           - What technical insights would be valuable?
+           - What could be explained or taught?
+        
+        5. **Code Quality Observations**
+           - Strengths of the implementation
+           - Areas that could be improved
+           - Best practices demonstrated
+        
+        **CRITICAL**: 
+        - Write in clear, technical prose (NOT JSON)
+        - Focus on insights relevant to the user's request
+        - This analysis will be used as grounding context for content generation
+        - For any code snippets you include in the analysis, use markdown fenced code blocks (```language).
+        - Be specific and cite actual code patterns you observe
+        """
+        
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=2, max=10),
+            retry=retry_if_exception_type(Exception),
+            reraise=True
+        )
+        def generate_with_retry():
+            # specialist model swap: Switch from Gemini Flash to Claude Sonnet 4.5
+            print(f"MCP Hub: Calling Specialist Model (Claude Sonnet 4.5) for {file_name}...")
+            
+            # Inject key for LiteLLM
+            if ANTHROPIC_API_KEY:
+                os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
+                
+            response = completion(
+                model="anthropic/claude-sonnet-4-5",
+                messages=[{"role": "user", "content": analysis_prompt}],
+                temperature=0.3,
+                max_tokens=4096
+            )
+            return response.choices[0].message.content
+
+        try:
+            analysis_text = generate_with_retry()
+            print(f"MCP Hub: Code analysis complete for {file_name}")
+            result = f"CODE_ANALYSIS ({file_name}):\n{analysis_text}"
+        except Exception as e:
+            print(f"MCP Hub: Code analysis failed after retries: {e}")
+            result = f"CODE_FILE ({file_name}):\n{file_content[:2000]}\n\n[Analysis failed after retries, using raw code]"
 
     else:
         return f"Error: Tool '{name}' implementation logic not found."

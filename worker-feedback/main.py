@@ -143,9 +143,10 @@ def process_feedback_logic(request):
             "event_type": "user_feedback",
             "text": user_feedback,
             "images": images,
+            "code_files": req.get('code_files', []), # FIX: Include code files
             "timestamp": datetime.datetime.now(datetime.timezone.utc)
         })
-        dispatch_task({"session_id": session_id, "topic": session_data.get('topic'), "feedback_text": user_feedback, "slack_context": slack_context, "images": images}, STORY_WORKER_URL)
+        dispatch_task({"session_id": session_id, "topic": session_data.get('topic'), "feedback_text": user_feedback, "slack_context": slack_context, "images": images, "code_files": req.get('code_files', [])}, STORY_WORKER_URL)
         return jsonify({"msg": "Delegated (URL detected)"}), 200
 
     # --- ADK FIX 2: CONTEXTUAL LLM TRIAGE ---
@@ -214,6 +215,7 @@ def process_feedback_logic(request):
             "event_type": "user_feedback",
             "text": user_feedback,
             "images": req.get('images', []),
+            "code_files": req.get('code_files', []), # FIX: Include code files
             "timestamp": datetime.datetime.now(datetime.timezone.utc)
         })
         # No-Strip: Pass full payload forward, but preserve mission topic
@@ -223,7 +225,7 @@ def process_feedback_logic(request):
             "ts": req.get('slack_ts'),
             "thread_ts": req.get('slack_thread_ts')
         })
-        payload.update({"topic": session_data.get('topic'), "feedback_text": user_feedback, "slack_context": slack_context})
+        payload.update({"topic": session_data.get('topic'), "feedback_text": user_feedback, "slack_context": slack_context, "code_files": req.get('code_files', [])})
         dispatch_task(payload, STORY_WORKER_URL)
         return jsonify({"msg": "Delegated to Research Worker"}), 200
         
@@ -274,11 +276,34 @@ def process_feedback_logic(request):
         if not target_content:
             return jsonify({"msg": "Nothing to approve found."}), 404
 
-        # --- RAG INGESTION ---
+        # --- RAG INGESTION (Choice-Based Promotion) ---
         if INGEST_KNOWLEDGE_URL:
-             # Prepend Mission Context for better future retrieval
-            rag_content = f"MISSION: {session_data.get('topic', 'General Inquiry')}\n\nCONTENT:\n{target_content}"
-            dispatch_task({"session_id": session_id, "topic": session_data.get('topic'), "story": rag_content}, INGEST_KNOWLEDGE_URL)
+            # Check if we were approving a solution brief (Structured)
+            is_solution_brief = False
+            objections_data = None
+            
+            # Find the event we categorized earlier
+            for event in reversed(full_history):
+                if event.get('event_type') == 'agent_proposal' and event.get('proposal_type') == 'solution_brief':
+                    is_solution_brief = True
+                    objections_data = event.get('proposal_data', {}).get('objections')
+                    break
+            
+            if is_solution_brief:
+                print("Promoting Solution Brief to permanent storage...")
+                payload = {
+                    "session_id": session_id,
+                    "topic": session_data.get('topic'),
+                    "type": "solution_brief",
+                    "story": target_content, # The brief HTML/MD
+                    "objections": objections_data
+                }
+                dispatch_task(payload, INGEST_KNOWLEDGE_URL)
+            else:
+                # Standard Knowledge Base Path
+                print("Promoting General Knowledge to vector base...")
+                rag_content = f"MISSION: {session_data.get('topic', 'General Inquiry')}\n\nCONTENT:\n{target_content}"
+                dispatch_task({"session_id": session_id, "topic": session_data.get('topic'), "story": rag_content, "type": "knowledge"}, INGEST_KNOWLEDGE_URL)
         
         # FIX: Update parent status, but write events to subcollection
         doc_ref.update({
@@ -321,7 +346,7 @@ def process_feedback_logic(request):
         if isinstance(last_prop_data, str) or (isinstance(last_prop_data, dict) and 'interlinked_concepts' not in last_prop_data):
             print("Refine target is Text/HTML Article. Delegating to Story Worker for Repurposing...")
             payload = req.copy()
-            payload.update({"topic": session_data.get('topic'), "feedback_text": user_feedback, "slack_context": slack_context})
+            payload.update({"topic": session_data.get('topic'), "feedback_text": user_feedback, "slack_context": slack_context, "code_files": req.get('code_files', [])})
             dispatch_task(payload, STORY_WORKER_URL)
             return jsonify({"msg": "Delegated (Article Refinement)"}), 200
 
