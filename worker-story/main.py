@@ -33,11 +33,18 @@ except Exception:
     pass # Fallback to standard logging if local
 
 # --- Configuration ---
-PROJECT_ID = os.environ.get("PROJECT_ID")
+# --- Configuration ---
+try:
+    _, project_id_auth = google.auth.default()
+    PROJECT_ID = os.environ.get("PROJECT_ID", project_id_auth)
+except:
+    PROJECT_ID = os.environ.get("PROJECT_ID")
+
 LOCATION = os.environ.get("LOCATION")
 MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.5-pro") 
 MODEL_PROVIDER = os.environ.get("MODEL_PROVIDER", "vertex_ai")
 FLASH_MODEL_NAME = os.environ.get("FLASH_MODEL_NAME", "gemini-2.5-flash-lite")
+RESEARCH_MODEL_NAME = os.environ.get("RESEARCH_MODEL_NAME", "gemini-2.5-flash-lite") # NEW: For High Context
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL") 
@@ -56,6 +63,7 @@ safety_settings = {
 # --- Global Clients ---
 unimodel = None
 flash_model = None
+research_model = None # NEW: The High-Context Specialist
 specialist_model = None
 search_api_key = None
 db = None
@@ -1199,9 +1207,22 @@ def generate_natural_answer(topic, context, history=""):
     Handles SIMPLE_QUESTION and DIRECT_ANSWER with native intelligence.
     Bypasses the heavy 'Strategist' persona for a more natural flow.
     """
-    global unimodel
+    global unimodel, research_model
     print(f"DEBUG: generate_natural_answer (Native) starting... [Topic: {topic[:50]}]")
     
+    # --- ROUTING LOGIC: Context Size Check ---
+    # Smart Switch: If context is massive (Likely Research/Code), use Gemini Flash (Research Model)
+    # If context is small/conversational, use GPT-5 (Unimodel) for nuance.
+    total_context_size = len(str(context)) + len(str(history))
+    
+    # FIX: Check BOTH context and history for the [CODE_ANALYSIS] tag
+    has_code = "[CODE_ANALYSIS]" in str(context) or "[CODE_ANALYSIS]" in str(history)
+    use_research_model = total_context_size > 30000 or has_code
+    
+    active_model = research_model if (use_research_model and research_model) else unimodel
+    model_name = "Research Model (Flash)" if active_model == research_model else "Unimodel (GPT-5)"
+    print(f"DEBUG: Routing Natural Answer to [{model_name}] | Context Size: {total_context_size} chars")
+
     prompt = f"""
     You are a helpful, knowledgeable AI assistant.
     
@@ -1233,8 +1254,14 @@ def generate_natural_answer(topic, context, history=""):
     """
     
     try:
-        response = unimodel.generate_content(prompt, generation_config={"temperature": 0.4})
-        final_text = ensure_slack_compatibility(response.text.strip())
+        response = active_model.generate_content(prompt, generation_config={"temperature": 0.4})
+        text = response.text
+        
+        # Check for Mock Error Response from UnifiedModel
+        if "I encountered a safety limit" in text or "unable to generate" in text:
+             raise ValueError("Model returned Error Mock")
+
+        final_text = ensure_slack_compatibility(text.strip())
         
         # Simple intent detection for metadata consistency
         intent = "SIMPLE_QUESTION"
@@ -1246,8 +1273,23 @@ def generate_natural_answer(topic, context, history=""):
             "directive": ""
         }
     except Exception as e:
-        print(f"Native Gen Error: {e}")
-        return {"text": f"I encountered an error generating a natural response: {e}", "intent": "ERROR", "directive": ""}
+        print(f"⚠️ Primary Model Failed ({active_model.model_name}): {e}")
+        
+        if specialist_model:
+            print(f"🔄 FAILOVER: Switching to Specialist Model (Anthropic)...")
+            try:
+                # Ensure Anthropic Key is present
+                if not os.environ.get("ANTHROPIC_API_KEY") and ANTHROPIC_API_KEY:
+                     os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
+                
+                fallback_resp = specialist_model.generate_content(prompt, generation_config={"temperature": 0.4})
+                final_text = ensure_slack_compatibility(fallback_resp.text.strip())
+                return {"text": final_text, "intent": "DIRECT_ANSWER_FALLBACK", "directive": ""}
+            except Exception as e2:
+                print(f"❌ Specialist Failover also failed: {e2}")
+                return {"text": "I am currently experiencing high traffic on all neural pathways (429). Please try again in a minute.", "intent": "ERROR", "directive": ""}
+        else:
+             return {"text": "Service is busy (429). Please try again later.", "intent": "ERROR", "directive": ""}
 
 
 # 13b. The Comprehensive Answer Generator (AEO-AWARE CONTENT STRATEGIST)
@@ -1256,8 +1298,19 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     Standardizes the logic for generating a direct answer.
     Uses 'detect_research_intent' signal to adjust formatting (Tables/Lists).
     """
-    global model, unimodel
+    global model, unimodel, research_model
     print(f"DEBUG: generate_comprehensive_answer starting... [Topic: {topic[:50]}]")
+    
+    # --- ROUTING LOGIC: Context Size Check ---
+    total_context_size = len(str(context)) + len(str(history))
+    
+    # FIX: Check BOTH context and history for the [CODE_ANALYSIS] tag
+    has_code = "[CODE_ANALYSIS]" in str(context) or "[CODE_ANALYSIS]" in str(history)
+    use_research_model = total_context_size > 30000 or has_code
+    
+    active_model = research_model if (use_research_model and research_model) else unimodel
+    model_name = "Research Model (Flash)" if active_model == research_model else "Unimodel (GPT-5)"
+    print(f"DEBUG: Routing Comprehensive Answer to [{model_name}] | Context Size: {total_context_size} chars")
     
     # NEW: Context check includes history if researchers marked it as sufficient
     context_str = str(context)
@@ -1323,8 +1376,8 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     """
 
     try:
-        # Use unimodel (which has backoff) for the final synthesis
-        response = unimodel.generate_content(prompt, generation_config={"temperature": target_temp})
+        # Use active_model (Dynamic routing) for the final synthesis
+        response = active_model.generate_content(prompt, generation_config={"temperature": target_temp})
         
         # Enforce spacing on the output
         final_text = ensure_slack_compatibility(response.text.strip())
@@ -1337,7 +1390,7 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     except Exception as e:
         print(f"Synthesis Error: {e}")
         # Final fallback
-        fallback = unimodel.generate_content(prompt).text.strip()
+        fallback = active_model.generate_content(prompt).text.strip()
         return {"text": fallback, "intent": research_intent, "directive": formatting_directive}
 
 # 14. The Dedicated pSEO Article Generator (High Trust & Transparency)
@@ -1706,7 +1759,7 @@ def process_sales_transcript(transcript_text, session_id=None):
 # --- THE STATEFUL MAIN WORKER FUNCTION (FINAL V6 - SOCIAL AWARE) ---
 @functions_framework.http
 def process_story_logic(request):
-    global unimodel, flash_model, specialist_model, db
+    global unimodel, flash_model, research_model, specialist_model, db
 
     # 0. ENTRY TELEMETRY (Observability)
     now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -1719,6 +1772,11 @@ def process_story_logic(request):
         # Initialize Vertex AI explicitly for the Flash Model (Triage)
         vertexai.init(project=PROJECT_ID, location=LOCATION)
         flash_model = GenerativeModel(FLASH_MODEL_NAME, safety_settings=safety_settings)
+
+    if research_model is None:
+        # Initialize Vertex AI explicitly for the Research Model (High Context)
+        vertexai.init(project=PROJECT_ID, location=LOCATION)
+        research_model = UnifiedModel("vertex_ai", RESEARCH_MODEL_NAME)
         
     if specialist_model is None:
         # Initialize Anthropic Specialist explicitly
@@ -1730,7 +1788,47 @@ def process_story_logic(request):
     req = request.get_json(silent=True)
     if isinstance(req, list): req = req[0] # Add safety for n8n list payloads
     print(f"DEBUG: Story Worker received payload keys: {list(req.keys()) if req else 'None'}")
-    session_id, original_topic, slack_context = req['session_id'], req.get('topic', ""), req['slack_context']
+    
+    # --- IDEMPOTENCY CHECK (Prevent Double-Trigger) ---
+    # Construct a unique event ID from the Slack Timestamp (which is unique to the message)
+    # Use request-provided ID if available, otherwise fallback to signature
+    slack_context = req.get('slack_context', {})
+    unique_event_id = slack_context.get('ts') or req.get('event_ts') or req.get('client_msg_id')
+    
+    if unique_event_id:
+        # Check if we've already seen this event ID in the last 5 minutes
+        # We store processed events in a separate 'processed_requests' collection or within the session
+        # For simplicity and speed, we'll check a centralized deduplication log
+        dedup_ref = db.collection('processed_events').document(str(unique_event_id))
+        doc = dedup_ref.get()
+        if doc.exists:
+            # Check timestamp to allow re-runs after 5 minutes (for testing/dev)
+            data = doc.to_dict()
+            last_run = data.get('timestamp')
+            
+            # Simple timezone-aware check
+            if last_run:
+                # Firestore timestamps come back as datetime with tz
+                cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)
+                if last_run > cutoff:
+                    print(f"🔒 IDEMPOTENCY: Skipping duplicate event {unique_event_id} (Processed < 5m ago)")
+                    return "Event already processed", 200
+                else:
+                    print(f"🔄 IDEMPOTENCY: Reprocessing old event {unique_event_id} (Age > 5m)")
+            else:
+                 pass # No timestamp? Overwrite it.
+        
+        # Mark as pending immediately (TTL handled by expiration policy or ignored for now)
+        try:
+            dedup_ref.set({
+                'timestamp': datetime.datetime.now(datetime.timezone.utc),
+                'status': 'processing',
+                'session_id': req.get('session_id')
+            })
+        except Exception as e:
+            print(f"⚠️ Warning: Failed to set idempotency lock: {e}")
+            
+    session_id, original_topic = req['session_id'], req.get('topic', "")
     feedback_text = req.get('feedback_text') # Captured from worker-feedback
     images = req.get('images', [])
     code_files = req.get('code_files', []) # ADD: Extract code_files
@@ -1783,7 +1881,8 @@ def process_story_logic(request):
             # FIX: Include code analysis in history text if it was part of feedback
             code_context = ""
             if event.get('code_files'):
-                code_context = f" (Attached Files: {', '.join([f['file_name'] for f in event['code_files']])})"
+                # Use .get('name') to handle raw Slack file objects or normalized ones safely
+                code_context = f" (Attached Files: {', '.join([f.get('name', f.get('file_name', 'unknown_file')) for f in event['code_files']])})"
             formatted_history.append(f"USER FEEDBACK: {event.get('text')}{code_context}")
         elif etype in ['agent_answer', 'agent_reply', 'agent_proposal']:
             content = event.get('text') or event.get('content') or str(event.get('data', ''))
@@ -1794,6 +1893,70 @@ def process_story_logic(request):
     # --- MONITORING: Context Loading Statistics ---
     print(f"DEBUG: Worker loading {len(history_events)} events for session: {session_id}")
     print(f"DEBUG: Active Grounding assets manually passed: {len(images or [])}")
+
+    # --- Step 2.5: Code Perception (HOISTED) ---
+    # We analyze code files BEFORE Triage to ensure "Fast Exit" paths like Structural Formatting
+    # still have access to the code context.
+    code_analysis_snippets = []
+    
+    # Initialize MCP Client (Early Init)
+    mcp = get_mcp_client()
+
+    # 1. Recover from history
+    if history_events:
+        recovered_count = 0
+        for event in history_events:
+            if event.get('event_type') == 'code_analysis' and event.get('analysis_result'):
+                code_analysis_snippets.append(event['analysis_result'])
+                recovered_count += 1
+        if recovered_count > 0:
+            print(f"TELEMETRY: Recovered {recovered_count} code analysis results from thread history.")
+
+    # 2. Analyze New Files
+    if code_files:
+        print(f"TELEMETRY: Code File Analysis Mode detected ({len(code_files)} files) - Pre-Triage Execution")
+        
+        for file_info in code_files:
+            file_name = file_info.get('name', 'unknown_file')
+            file_url = file_info.get('url')
+            file_id = file_info.get('id')
+            file_mode = file_info.get('mode', 'hosted')
+            
+            # Download file content from Slack
+            file_content = fetch_slack_file_content(file_url, file_id, file_mode)
+            
+            if not file_content:
+                print(f"⚠️ No content downloaded for {file_name}")
+                code_analysis_snippets.append(f"CODE_FILE ({file_name}): [Download failed]")
+                continue
+            
+            # Analyze code file via MCP tool
+            try:
+                analysis_context = mcp.call_tool(
+                    "analyze_code_file",
+                    {
+                        "file_content": file_content,
+                        "file_name": file_name,
+                        "user_prompt": sanitized_topic,
+                        "history_context": history_text
+                    }
+                )
+                
+                # Prepend special tag for Routing Logic detection
+                tagged_context = f"[CODE_ANALYSIS] (File: {file_name})\n{analysis_context}"
+                code_analysis_snippets.append(tagged_context)
+                
+                # Log the analysis event (with result for persistence)
+                # Note: We append to new_events later, but we need to track it now
+                # We'll just define the event dict here and append it after new_events is init
+                # Actually, we can just append to history_text immediately for Triage visibility
+                history_text += f"\n[SYSTEM: Analyzed Code File '{file_name}'. Content Summary: {analysis_context[:500]}...]"
+                
+            except Exception as e:
+                print(f"⚠️ Code analysis failed for {file_name}: {e}")
+                code_analysis_snippets.append(f"CODE_FILE ({file_name}): [Analysis failed: {str(e)}]")
+        
+        print(f"✅ Code analysis complete. Adding {len(code_analysis_snippets)} code insights to working context.")
 
     try:
         # --- STEP 3: TRIAGE (Now includes SOCIAL category) ---
@@ -1807,6 +1970,11 @@ def process_story_logic(request):
             1.  **Fresh Start Rule**: Treat every message as a fresh decision point. Do not assume the goal remains the same as the previous turn just because a specific mode (like pSEO) was active previously.
             2.  **Post-Artifact Default**: If the conversation history shows a major artifact (pSEO Draft, Deep Dive, Topic Cluster) was delivered in the previous turn, the user's next message is usually seeking **feedback, clarification, or minor refinement**. Favor **SIMPLE_QUESTION** or **DIRECT_ANSWER** in these cases.
             3.  **Intent Overlap**: If a request could be multiple categories, pick the one that represents the *simplest* necessary action based on the USER REQUEST text.
+
+            ### HYBRID REQUEST RULE (CRITICAL):
+            - If the request contains NEW URLs, Attached Files (Code), or asks to "Research" something new, **DO NOT** select OPERATIONAL_REFORMAT.
+            - Even if the user asks for an "Outline" or "Checklist", if there are NEW signals (links/files), select **DIRECT_ANSWER** or **WEB** so the agent performs the necessary grounding first.
+            - Select **OPERATIONAL_REFORMAT** *only* if the context is ALREADY fully present in the history or code analysis snippets.
 
             1.  **SOCIAL_CONVERSATION**: Greetings, small talk, simple feedback, or **casual replies to the agent's questions**.
                 *   *Triggers:* "Okay", "Thanks", "Hello", "How are you", or providing a short answer to an agent's conversational prompt (e.g., answering "What's brewing?" with "Heineken").
@@ -1865,11 +2033,26 @@ def process_story_logic(request):
             """
         # --- EXECUTION: Triage Model Selection ---
         # Triage on the Command (sanitized_topic) but with history context
-        intent = unimodel.generate_content(triage_prompt).text.strip()
+        # Use Flash Model for Speed/Cost Efficiency (Gemini 2.0 Flash)
+        intent = flash_model.generate_content(triage_prompt).text.strip()
         print(f"TELEMETRY: Triage V6.0 -> Intent classified as: [{intent}] for command: '{sanitized_topic[:50]}...'")
 
         # Initialize variables for the response
         new_events = [] 
+        
+        # Retroactive Event Logging for Code Analysis (since we ran it early)
+        if code_files and code_analysis_snippets:
+             for i, snippet in enumerate(code_analysis_snippets):
+                # reconstruct filename from input if possible, or generic
+                f_name = code_files[i].get('name') if i < len(code_files) else "unknown_code"
+                new_events.append({
+                    "event_type": "code_analysis",
+                    "file_name": f_name,
+                    "analysis_result": snippet,
+                    "status": "success",
+                    "timestamp": datetime.datetime.now(datetime.timezone.utc)
+                })
+
         expire_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
         
         # --- STEP 4: ROUTING & EXECUTION ---
@@ -2004,70 +2187,13 @@ def process_story_logic(request):
 
         # === PATH B: WORK/RESEARCH (The Heavy Lifting) ===
         # Only now do we pay the cost to distill and research.
-
-        # 0. CODE FILE ANALYSIS (New Priority Path)
-        code_files = req.get('code_files', [])
-        code_analysis_context = []
         
-        # Initialize MCP Client
-        mcp = get_mcp_client()
+        # 0. CODE FILE ANALYSIS (Legacy Slot - Now Handled in Step 2.5)
+        # We assume code_analysis_context is already populated from the hoisted block.
+        code_analysis_context = code_analysis_snippets 
         
-        # 0.1 Pull in previous code analysis from history (Multi-turn Persistence)
-        if history_events:
-            recovered_count = 0
-            for event in history_events:
-                if event.get('event_type') == 'code_analysis' and event.get('analysis_result'):
-                    code_analysis_context.append(event['analysis_result'])
-                    recovered_count += 1
-            if recovered_count > 0:
-                print(f"TELEMETRY: Recovered {recovered_count} code analysis results from thread history.")
+        # (Legacy loop removed, as we did it pre-triage)
         
-        if code_files:
-            print(f"TELEMETRY: Code File Analysis Mode detected ({len(code_files)} files)")
-            
-            for file_info in code_files:
-                file_name = file_info.get('name', 'unknown_file')
-                file_url = file_info.get('url')
-                file_id = file_info.get('id')
-                file_mode = file_info.get('mode', 'hosted')
-                
-                # Download file content from Slack
-                file_content = fetch_slack_file_content(file_url, file_id, file_mode)
-                
-                if not file_content:
-                    print(f"⚠️ No content downloaded for {file_name}")
-                    code_analysis_context.append(f"CODE_FILE ({file_name}): [Download failed]")
-                    continue
-                
-                # Analyze code file via MCP tool
-                try:
-                    analysis_context = mcp.call_tool(
-                        "analyze_code_file",
-                        {
-                            "file_content": file_content,
-                            "file_name": file_name,
-                            "user_prompt": sanitized_topic,
-                            "history_context": history_text
-                        }
-                    )
-                    
-                    code_analysis_context.append(analysis_context)
-                    
-                    # Log the analysis event (with result for persistence)
-                    new_events.append({
-                        "event_type": "code_analysis",
-                        "file_name": file_name,
-                        "analysis_result": analysis_context,
-                        "status": "success",
-                        "timestamp": datetime.datetime.now(datetime.timezone.utc)
-                    })
-                except Exception as e:
-                    print(f"⚠️ Code analysis failed for {file_name}: {e}")
-                    # Add raw file info as fallback
-                    code_analysis_context.append(f"CODE_FILE ({file_name}): [Analysis failed: {str(e)}]")
-            
-            print(f"✅ Code analysis complete. Adding {len(code_analysis_context)} code insights to research context.")
-
         # 1. Research (Distinguishing between Direct URLs and Exploratory Keywords)
         urls = extract_urls_from_text(sanitized_topic)
         combined_context = []
