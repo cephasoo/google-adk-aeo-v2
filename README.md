@@ -1,103 +1,90 @@
-# 'Sonnet & Prose' — The Autonomous Content Strategist 🎭🌐
+# 'Sonnet & Prose' — The Autonomous Content Strategist
 
-**Sonnet & Prose** is a production-grade, multi-agent AI system designed for **Answer Engine Optimization (AEO)** and strategic content synthesis. It transforms simple user inquiries into rich, data-grounded narratives, research reports, and deep-dive articles.
-
-Built as an **ADK-Compliant** modular architecture, it leverages a centralized "Sensory Hub" via the **Model Context Protocol (MCP)** to provide specialized, high-fidelity research capabilities.
+**Sonnet & Prose** is a production-grade, multi-agent AI system designed for **Answer Engine Optimization (AEO)** and strategic content synthesis. It transforms complex inquiries into data-grounded narratives, research reports, and deep-dive articles optimized for both human clarity and LLM extraction.
 
 ---
 
-## 🚀 1. The Strategy: From "SEO" to "AEO"
-In a world of Answer Engines (Perplexity, SearchGPT, Gemini), standard SEO isn't enough. **Sonnet & Prose** is built to win the "Zero-Click" SERP. It doesn't just write; it architecturally designs content to satisfy both human curiosity and AI grounding requirements.
+## 1. The Strategy: Modular Intelligence
+The system has evolved from a single script into a **decoupled multi-agent architecture**. It separates the "Hearing" (Intent Detection), "Refinement" (Human-in-the-loop), and "Scribe" (Synthesis) into specialized workers.
 
-### The Value Loop
-1.  **Conversational Triage (Hearing Restoration)**: Distinguishes between casual banter, discovery research, and recursive drafting by analyzing raw user intent in context.
-2.  **Centralized Sensory Hub (MCP)**: Separates "Sensory Tools" from "Orchestration Logic." A dedicated Hub handles multi-region searches, web scraping, and RAG retrieval.
-3.  **Multi-Region Intelligence**: Automatically detects and searches across multiple geographic locations simultaneously for comparative research.
-4.  **Action-Oriented Deliverables**: Detects intent for specialized formats like **Timelines** and **Comparison Tables**, delivering them immediately in a structured AEO-ready format.
-5.  **Long-Term Memory (Hippocampus)**: Ingests every interaction into a vectorized knowledge base (Firestore RAG) to ensure the agent maintains cross-thread continuity.
+### Core Strategic Protocols
+1.  **Simplicity Protocol**: A system-wide mandate to prioritize clarity. Complex technical concepts (HSM, PCI-DSS) are automatically grounded using plain-English analogies (Vaults, Fire Codes).
+2.  **Meat-First Protocol**: Articles are architected to deliver high-density technical value or core findings in the opening paragraphs, satisfying "Zero-Click" search requirements.
+3.  **Dynamic Word Budgeting**: The system semantically extracts target lengths (e.g., "1500 words") and uses an **Architect-Scribe** recursive pattern to strategically distribute word counts across sections.
+4.  **Contextual Root Cause Analysis**: Synthesis doesn't just describe a problem; it analyzes systemic factors and regulatory anchors (e.g., NDPA, POPIA) found in the research context.
 
 ---
 
-## 🏗️ 2. High-Level Architecture
-The system follows a modular "Hub-and-Spoke" architecture built on **Google Cloud Functions (2nd Gen)** and **Cloud Run**.
+## 2. High-Level Architecture
+The system utilizes a **Hub-and-Spoke** model built on Google Cloud Gen2 infrastructure and the Model Context Protocol (MCP).
 
 ```mermaid
 graph TD
     A[Slack User] <--> B(n8n Webhook Bus)
-    B <--> C[Dispatcher: Feedback/Story Flow]
+    B <--> C[Worker: Feedback]
     C --> D[Cloud Tasks Queue]
-    D --> E[Worker: Research & Synthesis]
+    D --> E[Worker: Story Synthesis]
     
-    subgraph "The Sensory Hub (MCP)"
-        E <--> F[MCP Hub Server]
-        F --> G[SerpAPI: Web/News]
-        F --> H[Google Scholar: Academic]
-        F --> I[Google Trends: Stats]
-        F --> J[Browserless: Scraper]
-        F --> L[Deep Search Signals: Geo & Intent]
+    subgraph "Sensory Hub (MCP)"
+        E <--> F[MCP Server]
+        F --> G[SerpAPI / Google Trends]
+        F --> H[Academic / Scholar]
+        F --> I[Custom Code Analysis]
     end
 
-    subgraph "The Brain"
-        E --> K[Unified Model: Multi-Provider]
-        K --> M[Firestore: Vector/Session Memory]
+    subgraph "The Brain (Context)"
+        E --> J[Firestore: Vector/Session RAG]
+        C --> J
+        E --> K[Unified Model Gateway]
     end
     
-    E --> N[Slack Output: Premium Markdown]
+    E --> L[Slack/Ghost: AEO-Ready HTML]
 ```
 
 ---
 
-## 🧠 3. Advanced Agentic Features
+## 3. System Modules
 
-### 📡 MCP-Modular Sensory Hub
-Instead of hardcoding APIs into the worker, all "sensory" capability is centralized in the MCP Server:
-- **detect_geo**: Identifies ISO country codes for up to 3 regions simultaneously, minimizing "Default US" bias.
-- **detect_intent**: Identifies requested deliverables (Direct Answer vs. Timeline vs. Table) for automated formatting.
-- **Unified Proxy**: All research tools (Web, Trends, Scholar, Images) are unified under a single MCP interface.
+### worker-story
+The primary synthesis engine. It handles **Deep Dives**, **pSEO Article Generation**, and **Topic Cluster Proposals**. It supports parallelized section drafting for high-speed delivery of long-form content.
 
-### 🏛️ Recursive Expansion (Deep Dives)
-To solve the "One-Shot Trap," the system implements a **Recursive Workflow**:
-- **Dynamic Word Count**: Extracts targets (e.g., "800 words") directly from prompts.
-- **Architectural Blueprinting**: Designs a multi-section structure before writing a single word.
-- **Context Stitching**: Seamlessly links sections together using "tail-end" context from previous chapters.
+### worker-feedback
+The "Hearing" layer. It manages the Human-in-the-loop (HITL) cycle, allowing users to approve, refine, or repurpose drafts. It maintains context through a dedicated triage model that separates casual chat from strategic commands.
 
-### 🎭 Refined "Sonnet & Prose" Persona
-- **Strategic Synthesis**: Connects external trends with internal RAG memory.
-- **Natural Language**: Prohibits robotic structural labels (e.g., "H2 - Intro"). Structure is implied through natural headers and bolding.
-- **AEO-First**: Utilizes "Inverted Pyramid" leads and modular headers to ensure content is optimized for snippets and LLM extraction.
+### mcp-server
+The "Sensory Gateway." It decouples tool execution from orchestration. All external research, code analysis, and geo-aware trend detection are handled via the Model Context Protocol.
+
+### eval-runner
+Validation and benchmarking. It tests system logic against "Golden" responses to ensure zero regression in technical accuracy or pSEO formatting.
 
 ---
 
-## 🛠️ 4. Setup & Deployment
+## 4. Deployment
 
 ### Prerequisites
-- **Google Cloud Platform** (Firestore, Secret Manager, Cloud Run)
-- **n8n** (Webhook orchestration)
-- **Slack App** (Bot Token, Events API)
-- **API Keys**: SerpAPI, OpenAI/Anthropic (Optional), Search Engine ID (CSE).
+- **GCP Service Account** with Firestore, Secret Manager, and Cloud Task permissions.
+- **n8n** for Slack webhook management.
+- **API Keys**: Anthropic (Sonnet 3.5/4.5), SerpAPI, Ghost Admin Key.
 
-### 1. Deploy the MCP Hub (Cloud Run)
+### Commands
 ```bash
-gcloud run deploy mcp-server --source . --no-allow-unauthenticated
-```
+# Deploy Sensory Hub
+gcloud run deploy mcp-server --source ./mcp-server
 
-### 2. Deploy the Story Worker (Cloud Functions)
-```bash
-gcloud functions deploy process-story-logic \
-     --gen2 --region=$LOCATION --source=. \
-     --entry-point=process_story_logic \
-     --runtime=python312 \
-     --timeout=540s \
-     --set-env-vars MCP_SERVER_URL=[YOUR_CLOUD_RUN_URL]
+# Deploy Feedback Triage
+gcloud functions deploy process-feedback-logic --gen2 --source ./worker-feedback
+
+# Deploy Synthesis Engine
+gcloud functions deploy process-story-logic --gen2 --source ./worker-story
 ```
 
 ---
 
-## 📖 5. How to Use
-1.  **Multi-Region Trends**: `"Compare tech adoption trends in Nigeria versus Kenya."` (Signals detected: `NG, KE`).
-2.  **Structured Timeline**: `"Create a timeline of AI developments in 2024."` (Deliverable detected: `TIMELINE`).
-3.  **Long-Form Article**: `"Write an 800-word deep-dive on [Topic] for my Ghost CMS."`
-4.  **Conversational Banter**: `"Hey, how are you today?"` (Intent detected: `SOCIAL` - zero research cost).
+## 5. Key Use Cases
+1.  **pSEO Synthesis**: Repurpose existing drafts or code snippets into Ghost CMS-ready HTML articles.
+2.  **Comparative Regional Trends**: Query multiple markets (Lagos vs. Nairobi) simultaneously with ISO-enforced grounding.
+3.  **Human-in-the-loop Editing**: Refine a 2000-word outline via Slack before the Scribe begins the draft.
+4.  **Technical-to-Regulatory Mapping**: Automatically link technical features to compliance frameworks like NDPA/POPIA.
 
 ---
-
+*Note: This project is ADK-compliant and follows a strict Zero-Markdown leakage policy for web publishing.*
