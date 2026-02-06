@@ -428,7 +428,7 @@ def handle_tool_call(name, arguments):
             vector_field="embedding",
             query_vector=Vector(query_embedding),
             distance_measure=DistanceMeasure.COSINE,
-            limit=3
+            limit=8
         ).get()
         
         memories = []
@@ -621,7 +621,8 @@ def handle_tool_call(name, arguments):
         query = arguments.get("query")
         if not query: return "Error: Missing query."
         history = arguments.get("history", "")
-        model = get_flash_model()
+        # model = get_flash_model() # DEPRECATED
+        
         prompt = f"""
         Identify the ISO 3166-1 alpha-2 country code(s) for the geographic focus of the user's request.
         
@@ -639,7 +640,17 @@ def handle_tool_call(name, arguments):
         """
         try:
             # We remove spaces and non-alphanumeric characters (except commas) to ensure clean codes
-            raw_geo = model.generate_content(prompt).text.strip().upper()
+             # Inject key for LiteLLM
+            if ANTHROPIC_API_KEY:
+                os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
+                
+            response = completion(
+                model="anthropic/claude-sonnet-4-5",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=10
+            ) 
+            raw_geo = response.choices[0].message.content.strip().upper()
             clean_geo = re.sub(r'[^A-Z,]', '', raw_geo)
             result = clean_geo if clean_geo else DEFAULT_GEO
         except Exception:
@@ -648,7 +659,8 @@ def handle_tool_call(name, arguments):
     elif name == "detect_intent":
         query = arguments.get("query")
         if not query: return "Error: Missing query."
-        model = get_flash_model()
+        # model = get_flash_model() # DEPRECATED
+        
         prompt = f"""
         Analyze the user's request to identify the primary structural goal or specific deliverable requested.
         
@@ -672,7 +684,18 @@ def handle_tool_call(name, arguments):
         JSON:
         """
         try:
-            raw_response = model.generate_content(prompt).text.strip()
+             # Inject key for LiteLLM
+            if ANTHROPIC_API_KEY:
+                os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
+                
+            response = completion(
+                model="anthropic/claude-sonnet-4-5",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=150,
+                response_format={"type": "json_object"}
+            )
+            raw_response = response.choices[0].message.content.strip()
             # Basic cleanup in case the model adds markdown code blocks
             clean_response = re.sub(r'```json|```', '', raw_response).strip()
             result = clean_response

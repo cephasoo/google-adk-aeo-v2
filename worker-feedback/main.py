@@ -10,7 +10,9 @@ import uuid
 import datetime
 import certifi
 import requests
-from google.cloud import firestore, tasks_v2
+from google.cloud import firestore, tasks_v2, secretmanager, logging as cloud_logging
+import time
+import random
 
 # --- UNIFIED MODEL ADAPTER (The Brain Switch) ---
 class UnifiedModel:
@@ -33,6 +35,7 @@ class UnifiedModel:
     def generate_content(self, prompt, generation_config=None, max_retries=3):
         import time
         import random
+        
         if self.provider == "vertex_ai":
             retries = 0
             while retries <= max_retries:
@@ -48,6 +51,23 @@ class UnifiedModel:
                             retries += 1
                             continue
                     raise e
+        elif self.provider == "anthropic":
+            # LiteLLM failover style for Feedback Worker parity
+            import litellm
+            # Ensure litellm doesn't throw if billing is weird
+            litellm.drop_params = True
+            
+            # Setup API Key (Prefer secret if available)
+            api_key = get_secret("anthropic-api-key")
+            if api_key:
+                os.environ["ANTHROPIC_API_KEY"] = api_key
+            
+            response = litellm.completion(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=generation_config.get("temperature", 0.7) if generation_config else 0.7
+            )
+            return response.choices[0].message
         return None
 
 # --- Config ---
@@ -60,10 +80,14 @@ QUEUE_NAME = "story-worker-queue"
 FUNCTION_IDENTITY_EMAIL = os.environ.get("FUNCTION_IDENTITY_EMAIL")
 # PROPOSAL_KEYWORDS = ["outline", "draft", "proposal", "story", "brief"]
 INGEST_KNOWLEDGE_URL = os.environ.get("INGEST_KNOWLEDGE_URL")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY") # Shared via secret manager if needed
 
 unimodel = None
+specialist_model = None
 db = None
 tasks_client = None
+secret_client = None
+logging_v_client = None
 
 # --- Utils ---
 def extract_json(text):
@@ -76,6 +100,86 @@ def extract_url_from_text(text):
     match = re.search(url_pattern, text)
     if match: return match.group(1)
     return None
+
+def get_secret(secret_id):
+    """Unified secret retrieval with env fallback."""
+    try:
+        global secret_client
+        if secret_client is None:
+            secret_client = secretmanager.SecretManagerServiceClient()
+        name = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest"
+        response = secret_client.access_secret_version(request={"name": name})
+        return response.payload.data.decode("UTF-8")
+    except Exception as e:
+        print(f"Secret {secret_id} failed: {e}. Falling back to ENV.")
+        return os.environ.get(secret_id.upper().replace("-", "_"))
+
+def log_safety_event(event_name, data):
+    """Standardized safety event logger with payload clamping."""
+    global logging_v_client
+    try:
+        if logging_v_client is None:
+            logging_v_client = cloud_logging.Client()
+        logger = logging_v_client.logger("safety_audit_feedback")
+        
+        # CLAMPING: Stay under 256KB Cloud Logging limit
+        safe_data = {}
+        for k, v in data.items():
+            if isinstance(v, str) and len(v) > 50000:
+                safe_data[k] = f"{v[:50000]}... [TRUNCATED]"
+            else:
+                safe_data[k] = v
+
+        logger.log_struct({
+            "event": event_name,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            **safe_data
+        }, severity="WARNING")
+    except Exception as e:
+        print(f"Safety Event Logged (Local): {event_name} - {data} | Error: {e}")
+
+def safe_generate_content(model, prompt):
+    """
+    Robust wrapper for ALL LLM calls.
+    Handles:
+    1. Exceptions (Vertex/SDK Errors)
+    2. Soft Refusals ("Error generating content" strings)
+    3. Failover to Specialist Model (Claude)
+    """
+    global specialist_model
+    try:
+        response = model.generate_content(prompt)
+        text_out = response.text.strip()
+        
+        # Detect soft refusal
+        if not text_out or any(fail_str in text_out.lower() for fail_str in ["error generating content", "i cannot fulfill", "internal error"]):
+            raise ValueError(f"Soft refusal detected: {text_out[:50]}...")
+            
+        return text_out
+    except Exception as e:
+        print(f"⚠️ Primary Model Failed: {e}. Attempting Specialist Failover...")
+        log_safety_event("llm_failover", {"error": str(e), "prompt_snippet": prompt[:500]})
+        
+        if specialist_model is None:
+            # Initialize Anthropic Specialist explicitly (User Config: 4.5)
+            specialist_model = UnifiedModel(provider="anthropic", model_name="claude-sonnet-4-5")
+
+        # ADK FIX: Add explicit delay for 429 mitigation (Parity with worker-story)
+        print(f"🔄 SafeGen FAILOVER: Cooling down for 2s before Anthropic call...")
+        time.sleep(2)
+        
+        # Retry with backup
+        fallback_resp = specialist_model.generate_content(prompt, generation_config={"temperature": 0.4})
+        return fallback_resp.content.strip() if hasattr(fallback_resp, 'content') else fallback_resp.text.strip()
+    except Exception as e2:
+        # Catch Anthropic 429 specifically
+        if "rate_limit_error" in str(e2).lower():
+            print("⚠️ Anthropic Rate Limit hit in Feedback. Ultimate fallback triggered.")
+            return "Cognitive overload (429). Triage/Approval request received but requires higher quota."
+            
+        print(f"❌ SafeGen Feedback Fallback Failed: {e2}")
+        return "The feedback system is currently maximizing its cognitive load. Please try again in 60 seconds."
+
 
 def dispatch_task(payload, target_url):
     global tasks_client
@@ -100,10 +204,11 @@ def dispatch_task(payload, target_url):
 
 def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None):
     if not tool_confirmation or not tool_confirmation.get("confirmed"): raise PermissionError("Wait for approval.")
-    return unimodel.generate_content(f"Tell a 'Then and Now' story using: {interlinked_concepts}").text
+    return safe_generate_content(unimodel, f"Tell a 'Then and Now' story using: {interlinked_concepts}")
 
 def refine_proposal(topic, current_proposal, critique):
-    return extract_json(unimodel.generate_content(f"REWRITE proposal... Draft: {json.dumps(current_proposal)}...").text)
+    raw_text = safe_generate_content(unimodel, f"REWRITE proposal... Draft: {json.dumps(current_proposal)}...")
+    return extract_json(raw_text)
 
 # --- THE STATEFUL AND HARDENED FEEDBACK WORKER ---
 @functions_framework.http
@@ -127,6 +232,13 @@ def process_feedback_logic(request):
     session_data = session_doc.to_dict()
     slack_context = session_data.get('slack_context', {})
 
+    # --- SYSTEM FILTER: Prevent Infinite Loops & Redundant Ingestion ---
+    # Case: The message is a confirmation notification (e.g., from N8N/Ghost)
+    is_system_confirmation = "created in ghost" in user_feedback.lower() or "ready for ghost" in user_feedback.lower()
+    if is_system_confirmation:
+        print(f"🛑 SYSTEM FILTER: Ignoring Ghost/N8N status notification: {user_feedback[:50]}...")
+        return jsonify({"msg": "Status notification ignored"}), 200
+
     # --- CALCULATE THE EXPIRATION TIMESTAMP ---
     expire_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
     
@@ -146,7 +258,22 @@ def process_feedback_logic(request):
             "code_files": req.get('code_files', []), # FIX: Include code files
             "timestamp": datetime.datetime.now(datetime.timezone.utc)
         })
-        dispatch_task({"session_id": session_id, "topic": session_data.get('topic'), "feedback_text": user_feedback, "slack_context": slack_context, "images": images, "code_files": req.get('code_files', [])}, STORY_WORKER_URL)
+        
+        # FIX: Inject precise Slack Timestamps to prevent Idempotency Clashing in Worker Story
+        # Worker Story deduplicates based on slack_context['ts']. If we send the stale session ts, it skips.
+        if req.get('slack_ts'):
+            slack_context['ts'] = req.get('slack_ts')
+        if req.get('slack_thread_ts'):
+            slack_context['thread_ts'] = req.get('slack_thread_ts')
+            
+        dispatch_task({
+            "session_id": session_id, 
+            "topic": session_data.get('topic'), 
+            "feedback_text": user_feedback, 
+            "slack_context": slack_context, 
+            "images": images, 
+            "code_files": req.get('code_files', [])
+        }, STORY_WORKER_URL)
         return jsonify({"msg": "Delegated (URL detected)"}), 200
 
     # --- ADK FIX 2: CONTEXTUAL LLM TRIAGE ---
@@ -158,7 +285,9 @@ def process_feedback_logic(request):
 
 
     # 2. Stream and then REVERSE the list to get chronological order (Oldest -> Newest)
-    recent_events = [doc.to_dict() for doc in recent_events_query.stream()][::-1]
+    all_raw_events = [doc.to_dict() for doc in recent_events_query.stream()]
+    # CLAMPING: Only take the last 10 events (5 turns) for feedback triage
+    recent_events = all_raw_events[:10][::-1] if len(all_raw_events) > 10 else all_raw_events[::-1]
     
     # MEMORY EXPANSION: Removed char limits (was 500) to ensure full context for triage
     formatted_history = []
@@ -175,7 +304,12 @@ def process_feedback_logic(request):
     tokens = re.sub(r'[^\w\s]', '', user_feedback).strip().lower().split()
     is_quick_approval = len(tokens) <= 3 and any(t in ["approved", "approve"] for t in tokens)
 
-    if is_quick_approval:
+    # ADK FIX: Explicitly DELEGATE pSEO/Ghost requests to the Story Worker engine.
+    # The pSEO pipeline is NOT an approval flow; it's a closed-ended provisioning directive.
+    if any(kw in user_feedback.lower() for kw in ["pseo", "ghost", "cms", "publish as"]):
+        intent = "DELEGATE"
+        print(f"pSEO/Ghost intent detected. Forcing DELEGATE to Story Worker.")
+    elif is_quick_approval:
         intent = "APPROVE"
         print(f"Quick Approval detected. Forcing APPROVE intent.")
     else:
@@ -198,7 +332,7 @@ def process_feedback_logic(request):
 
         Respond with ONLY the category name (APPROVE, REFINE, or DELEGATE).
         """
-        intent = unimodel.generate_content(feedback_triage_prompt).text.strip().upper()
+        intent = safe_generate_content(unimodel, feedback_triage_prompt).upper()
     
     print(f"Feedback Triage classified intent as: {intent}")
     

@@ -118,6 +118,19 @@ class EvalRunner:
         AEO scoring is restricted to specific technical intents.
         """
         
+        # --- HARD FAILURE CHECK ---
+        # Don't ask LLM to judge an error message. It wastes money and skews stats.
+        fatal_errors = ["Error generating content", "I cannot generate", "Internal Server Error", "Safety block applied", "Unknown Intent"]
+        if any(err.lower() in str(response).lower() for err in fatal_errors):
+            print(f"🚨 Hard Failure Detected in response: {response[:50]}...")
+            return {
+                "grounding": 0, 
+                "aeo_alignment": 0, 
+                "trajectory_integrity": 0, 
+                "tone": 0, 
+                "reasoning": f"AUTOMATIC FAIL: Critical error detected in output: {response[:100]}"
+            }
+        
         apply_aeo = intent in ['work_answer', 'work_proposal']
         
         aeo_rubric = ""
@@ -291,7 +304,7 @@ def evaluate_session_trigger(cloud_event):
     # (Here we read from 'fields' structure in Firestore Change Event)
     status = event_data.get('value', {}).get('fields', {}).get('status', {}).get('stringValue', '')
     
-    if status == "completed" or "awaiting" in status:
+    if status == "completed" or "awaiting" in status or status == "failed" or status == "blocked":
         print(f"Trigger: Evaluating session {session_id} based on status '{status}'")
         runner = EvalRunner()
         runner.evaluate_session(session_id)

@@ -3,4 +3,8 @@ vertexai
 google-cloud-firestore
 google-cloud-tasks
 requests
-certifi==2024.7.4 
+certifi==2024.7.4
+litellm
+google-cloud-logging
+google-cloud-secret-manager
+flask
