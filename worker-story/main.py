@@ -27,10 +27,10 @@ import concurrent.futures
 
 # --- Logging Setup ---
 try:
-    client = google.cloud.logging.Client()
-    client.setup_logging()
+    logging_v_client = google.cloud.logging.Client()
+    logging_v_client.setup_logging()
 except Exception:
-    pass # Fallback to standard logging if local
+    logging_v_client = None # Fallback to standard logging if local
 
 # --- Configuration ---
 # --- Configuration ---
@@ -51,6 +51,9 @@ N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL")
 INGESTION_API_KEY = os.environ.get("INGESTION_API_KEY")
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")  # Explicit fallback for code analysis
 MAX_LOOP_ITERATIONS = 2
+DEFAULT_GEO = os.environ.get("DEFAULT_GEO", "Global")
+TRACKER_SERVER_URL = os.environ.get("TRACKER_SERVER_URL", "http://localhost:8081")
+MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8080")
 
 # --- Safety Configuration (ADK/RAI Compliant) ---
 safety_settings = {
@@ -59,6 +62,7 @@ safety_settings = {
     HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
 }
+
 
 # --- Global Clients ---
 unimodel = None
@@ -138,7 +142,7 @@ class RemoteTools:
                     }
                 },
                 headers=headers,
-                timeout=60,
+                timeout=300,
                 verify=certifi.where()
             )
             if response.status_code != 200:
@@ -165,7 +169,7 @@ class RemoteTools:
 def get_mcp_client():
     global mcp_client
     if mcp_client is None:
-        url = os.environ.get("MCP_SERVER_URL", "http://localhost:8080")
+        url = MCP_SERVER_URL
         logging.info(f"MCP CLIENT INIT: Connecting to {url}")
         mcp_client = RemoteTools(url)
     return mcp_client
@@ -197,6 +201,10 @@ class UnifiedModel:
             retries = 0
             while retries <= max_retries:
                 try:
+                    # Ensure max_output_tokens is set for Vertex AI
+                    if generation_config is None: generation_config = {}
+                    if "max_output_tokens" not in generation_config: generation_config["max_output_tokens"] = 8192
+                    
                     response = self._native_model.generate_content(prompt, generation_config=generation_config)
                     
                     # Robust Safety Check: Some SDK versions throw exceptions, others return empty candidates
@@ -238,12 +246,18 @@ class UnifiedModel:
             temp = generation_config.get('temperature', 0.7) if generation_config else 0.7
             
             try:
+                # ADK FIX: Inject Beta Header for 8k Output (Required for 20240620)
+                extra_headers = {}
+                if "claude-sonnet-4-5" in self.model_name or "claude-3-5-sonnet" in self.model_name:
+                    extra_headers = {"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"}
+
                 # LiteLLM Call
                 response = completion(
                     model=self.model_name, 
                     messages=[{"role": "user", "content": prompt}],
                     temperature=temp,
-                    max_tokens=2048
+                    max_tokens=8192,
+                    extra_headers=extra_headers
                 )
                 
                 # Create a Mock Response Object to mimic Vertex AI's SDK
@@ -267,8 +281,19 @@ class UnifiedModel:
                 return MockResponse("Error generating content.")
 
     def analyze_citation(self, prompt_text, scrape_content):
-        # Compatibility stub for worker-tracker alignment
-        return {"cited": False, "snippet": "Feature not active in worker-story."}
+        """Calls the Sensory Tracker service to audit citations."""
+        try:
+            url = f"{TRACKER_SERVER_URL.rstrip('/')}/analyze"
+            response = requests.post(url, json={
+                "prompt": prompt_text,
+                "content": scrape_content
+            }, timeout=30, verify=certifi.where())
+            if response.status_code == 200:
+                return response.json()
+            return {"cited": False, "error": f"Tracker status {response.status_code}"}
+        except Exception as e:
+            print(f"⚠️ Sensory Tracker Error: {e}")
+            return {"cited": False, "error": str(e)}
 
 
 # --- Safety Utils ---
@@ -286,7 +311,7 @@ def detect_audience_context(history):
     Search conversation history for tone or audience instructions (e.g., "8th-grader").
     Returns a string describing the target audience.
     """
-    default = "Senior Marketers, CTOs, and Founders. They value depth, nuance, and honesty over hype."
+    default = "Likely Senior Marketers, CTOs, and Founders, but you must value clarity and simplicity above all. Use plain English and avoid dense jargon even when discussing complex technical concepts."
     if not history: return default
     
     hist_lower = history.lower()
@@ -299,16 +324,83 @@ def detect_audience_context(history):
 
 def log_safety_event(event_name, data):
     """Logs safety events to Google Cloud Logging for audit traces."""
+    global logging_v_client
     try:
-        logging_client = google.cloud.logging.Client()
-        logger = logging_client.logger("safety_audit")
-        logger.log_struct({
-            "event": event_name,
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            **data
-        }, severity="WARNING")
+        if logging_v_client:
+            logger = logging_v_client.logger("safety_audit")
+            # CLAMPING: Truncate large payloads to stay under 256KB Cloud Logging limit
+            safe_data = {}
+            for k, v in data.items():
+                if isinstance(v, str) and len(v) > 50000:
+                    safe_data[k] = f"{v[:50000]}... [TRUNCATED]"
+                else:
+                    safe_data[k] = v
+
+            logger.log_struct({
+                "event": event_name,
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                **safe_data
+            }, severity="WARNING")
+        else:
+            print(f"Safety Event Logged (Local): {event_name} - {data}")
     except Exception as e:
         print(f"Logging Block: {e}")
+
+# --- SYSTEM HARDENING: Centralized Safe Generator ---
+def safe_generate_content(model, prompt, generation_config=None):
+    """
+    A robust wrapper for model.generate_content that:
+    1. Catches Exceptions (Legacy Vertex Failures)
+    2. Catches Soft Failures (GPT-5 Refusal Strings like 'Error generating content')
+    3. Handles Automatic Fallback to Specialist Model (Claude)
+    """
+    global specialist_model
+    
+    # Default config if None
+    if generation_config is None: generation_config = {"temperature": 0.4}
+    
+    # 1. Primary Attempt
+    try:
+        response = model.generate_content(prompt, generation_config=generation_config)
+        text = response.text
+        
+        # 2. Refusal Trap (The "Soft Failure" Check)
+        refusal_triggers = ["I encountered a safety limit", "unable to generate", "Error generating content"]
+        if any(err in text for err in refusal_triggers):
+             raise ValueError(f"Model returned Soft Refusal: {text[:50]}...")
+             
+        return text.strip()
+
+    except Exception as e:
+        print(f"⚠️ SafeGen Primary Failed ({getattr(model, 'model_name', 'Unknown')}): {e}")
+        
+        # 3. Fallback to Specialist (Claude)
+        if specialist_model and model != specialist_model:
+            print(f"🔄 SafeGen FAILOVER: Switching to Specialist Model (Anthropic)...")
+            try:
+                # Ensure Key
+                if not os.environ.get("ANTHROPIC_API_KEY") and ANTHROPIC_API_KEY:
+                     os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
+                
+                # ADK FIX: Add explicit delay for 429 mitigation
+                import time
+                print(f"🔄 SafeGen FAILOVER: Cooling down for 2s before Anthropic call...")
+                time.sleep(2)
+                
+                # Retry with backup
+                fallback_resp = specialist_model.generate_content(prompt, generation_config={"temperature": 0.4})
+                return fallback_resp.text.strip()
+            except Exception as e2:
+                # Catch Anthropic 429 specifically
+                if "rate_limit_error" in str(e2).lower():
+                    print("⚠️ Anthropic Rate Limit hit. Ultimate fallback triggered.")
+                    return "Cognitive overload (429). Repurpose/Draft command received but requires higher quota. Please try a smaller file or wait 60s."
+                
+                print(f"❌ SafeGen Fallback Failed: {e2}")
+                # Ultimate Safety Net: Allow clean failure handled by caller or return generic error
+                return "The system is currently maximizing its cognitive load. Please try again in 60 seconds."
+        else:
+             return "Service is busy (429). Please try again later."
 
 # --- Utils ---
 # (Moved ensure_markdown_spacing to line ~960 for consolidation as ensure_slack_compatibility)
@@ -397,12 +489,12 @@ def extract_core_topic(user_prompt, history=""):
     SEARCH QUERY:
     """
     
-    core_topic = unimodel.generate_content(extraction_prompt).text.strip()
+    core_topic = safe_generate_content(unimodel, extraction_prompt)
 
     print(f"Distilled Core Topic: '{core_topic}'")
     return core_topic
 
-def extract_target_word_count(text):
+def extract_target_word_count(text, history=""):
     """
     Semantically extracts the user's desired word count using a Dedicated Anthropic Model (Claude).
     Handles nuance: "1600+", "at least 2000", "short summary", "< 500".
@@ -414,12 +506,17 @@ def extract_target_word_count(text):
         
         # 1. Use the Global Specialist Brain (Anthropic)
         prompt = f"""
-        Analyze the user's request: "{text}"
+        Analyze the current user request: "{text}"
         
+        And the conversation history:
+        {history}
+        
+        TASK:
         Extract the implied target word count as a single integer.
         
         ### INTERPRETATION RULES:
-        1. **Explicit Numbers**: '1500 words' -> 1500.
+        1. **Preference Persistence**: If the history shows an earlier length preference (e.g., 'Make all these 2000 words'), and the current request doesn't override it, INHERIT that preference.
+        2. **Explicit Numbers (Current)**: If the current request specifies a number (e.g., '1500 words'), use it as the primary target.
         2. **Floors/Expansion (+, >, at least)**: If the user implies a minimum (e.g., '1600+', '>1500', 'at least 2000'), provide a target slightly ABOVE that number to satisfy the request.
         3. **Ceilings/Constraint (<, less than, max)**: If the user implies a limit (e.g., '<1000', 'max 500'), provide a target BELOW that number.
         4. **Vague Descriptors**: 
@@ -431,7 +528,7 @@ def extract_target_word_count(text):
         """
         
         # 2. Generate
-        response = specialist_model.generate_content(prompt).text.strip()
+        response = safe_generate_content(specialist_model, prompt)
         
         # 3. Clean and Parse
         digits = re.sub(r'\D', '', response)
@@ -466,14 +563,29 @@ def convert_html_to_markdown(html):
     text = text.replace('</section>', '\n\n---\n\n')
     text = re.sub(r'<section[^>]*>', '', text)
     
-    # 3. Lists (Simple conversion)
-    text = text.replace('<ul>', '').replace('</ul>', '')
-    text = text.replace('<li>', '• ').replace('</li>', '\n')
+    # 3. Code Blocks (<pre><code> to markdown backticks)
+    text = re.sub(r'<pre><code[^>]*>(.*?)</code></pre>', r'```\n\1\n```', text, flags=re.DOTALL)
+
+    # 4. Lists (Improved conversion)
+    def list_item_handler(match):
+        content = match.group(1).strip()
+        # If content already starts with a number or bullet, just indent it
+        if re.match(r'^(\d+\.|•|-|\*)', content):
+            return f"  {content}\n"
+        return f"  • {content}\n"
+
+    text = re.sub(r'<li>(.*?)</li>', list_item_handler, text, flags=re.DOTALL)
+    text = text.replace('<ul>', '\n').replace('</ul>', '\n').replace('<ol>', '\n').replace('</ol>', '\n')
     
-    # 4. Final Strip of remaining tags
+    # 5. Paragraphs & Line Breaks
+    text = text.replace('<p>', '').replace('</p>', '\n\n')
+    text = text.replace('<br>', '\n').replace('<br/>', '\n')
+    
+    # 6. Final Strip of remaining tags
     text = re.sub(r'<[^>]+>', '', text)
     
     # Clean up excess newlines (Max 2)
+    text = re.sub(r'\n{4,}', '\n\n', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
@@ -510,7 +622,7 @@ def extract_trend_term(user_prompt, history=""):
     """
     try:
         # Use unimodel for speed/cost since this is a simple extraction
-        entity = unimodel.generate_content(prompt).text.strip().replace('"', '').replace("'", "")
+        entity = safe_generate_content(unimodel, prompt).replace('"', '').replace("'", "")
         print(f"Distilled Trend Entity: '{entity}'")
         return entity
     except Exception as e:
@@ -528,9 +640,7 @@ def mcp_detect_intent(query):
 def get_search_api_key():
     global search_api_key
     if search_api_key is None:
-        client = secretmanager.SecretManagerServiceClient()
-        response = client.access_secret_version(name=f"projects/{PROJECT_ID}/secrets/google-search-api-key/versions/latest")
-        search_api_key = response.payload.data.decode("UTF-8")
+        search_api_key = get_secret("google-search-api-key")
     return search_api_key
 
 def extract_json(text):
@@ -553,8 +663,17 @@ def extract_json(text):
     try:
         return json.loads(content)
     except Exception as e:
-        print(f"FAILED JSON PARSE: {e}\nRaw Content: {content[:200]}")
-        return None
+        print(f"FAILED INITIAL JSON PARSE: {e}. Attempting repair...")
+        # REPAIR STRATEGY: Handle unescaped internal quotes
+        # We look for quotes that are NOT part of a "key": or "value",/,"value"} pair
+        try:
+            # Simple heuristic: Escape quotes that aren't preceded by : or followed by , or }
+            repaired = re.sub(r'(?<![:])\s*"\s*(?![,}])', r'\"', content)
+            # Second attempt at parsing after repair
+            return json.loads(repaired)
+        except:
+            print(f"FAILED REPAIRED JSON PARSE: Raw Content: {content[:200]}")
+            return None
 
 def extract_urls_from_text(text):
     """Extracts ALL URLs from a given string."""
@@ -657,7 +776,7 @@ def analyze_deep_navigation(links_text, mission_topic, history_context):
     """
     
     try:
-        response = specialist_model.generate_content(prompt).text.strip()
+        response = safe_generate_content(specialist_model, prompt)
         if "http" in response and "NO_ACTION" not in response:
             # Extract clean URL (handling potential markdown wrapper)
             url_match = re.search(r'(https?://[^\s<>"]+)', response)
@@ -669,7 +788,7 @@ def analyze_deep_navigation(links_text, mission_topic, history_context):
         return None
 
 # 10. The Router (Updated with "Double-Tap" Analysis)
-def find_trending_keywords(raw_topic, history_context="", session_id=None, images=None, mission_topic=None, session_metadata=None, initial_context=None):
+def find_trending_keywords(raw_topic, history_context="", session_id=None, images=None, mission_topic=None, session_metadata=None, initial_context=None, triage_intent=None):
     """
     An intelligent meta-tool that routes a query to the best specialized search tool.
     Uses 'raw_topic' for routing to allow for "USE_CONVERSATIONAL_CONTEXT" selection on conversational turns.
@@ -719,42 +838,91 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
             all_images.extend(history_images[:2])
             
     # DEEP RECOLLECTION: If no images found, we use a semantic check to see if we SHOULD look for them in history.
-    visual_check_prompt = f"Analyze if the user's query requires seeing an image, PDF, or visual asset to answer accurately. Query: '{raw_topic}'. Respond ONLY with 'YES' or 'NO'."
-    is_recollective_visual_query = "YES" in unimodel.generate_content(visual_check_prompt).text.upper()
+    # 2. Automated Signal Detection (Smart Triage Inheritance)
+    print("Sensory Router: Detecting Signals (Geo & Intent) via MCP Hub...")
     
+    if session_metadata is None: session_metadata = {}
+    prev_geo = session_metadata.get('detected_geo', DEFAULT_GEO)
+    
+    # ADK FIX: Use the flash-classified intent from Triage (triage_intent) if available, 
+    # falling back to session metadata only if it's a cold restart.
+    prev_intent = triage_intent or session_metadata.get('intent', 'FORMAT_GENERAL')
+
+    # 3. CONSOLIDATED INTELLIGENCE ROUTER (Triple-Threat Prompt)
+    router_prompt = f"""
+    You are the 'Intelligence Router'. Assess the user's command and decide the path.
+    USER COMMAND: '{raw_topic}'
+    MISSION SUBJECT: '{grounding_subject}'
+    CURRENT INTENT: '{prev_intent}'
+    CURRENT GEO: '{prev_geo}'
+    
+    COLLECTED KNOWLEDGE:
+    {history_context[:8000]}
+    ---
+    RESEARCH/MEMORY SAMPLES: 
+    {str(base_grounding)[:15000]}
+    
+    PROTOCOL:
+    1. VISUAL_INTENT: Require seeing asset? [YES/NO]
+    2. GEO_PIVOT: If the user refers to a specific country, you MUST return the **ISO-3166-1 alpha-2** code.
+       EXAMPLES: Nigeria=NG, South Africa=ZA, United States=US, United Kingdom=GB, Ghana=GH, Kenya=KE, India=IN, Germany=DE, France=FR, Canada=CA.
+       If no pivot, return 'Inherit'.
+    3. ADEQUACY_AUDIT: Have enough info? [SUFFICIENT/INSUFFICIENT]
+    4. TOOL_RECRUITMENT: List tools (WEB, IMAGES, VIDEOS, TRENDS, ANALYSIS, COMPLIANCE, USE_CONVERSATIONAL_CONTEXT).
+    
+    OUTPUT FORMAT (Raw JSON Only):
+    {{"visual_intent": "YES/NO", "new_geo": "...", "adequacy": "...", "selected_tools": [], "rationale": "..."}}
+    """
+    
+    router_raw = safe_generate_content(specialist_model, router_prompt, generation_config={"temperature": 0.2})
+    try:
+        router_data = extract_json(router_raw)
+        is_recollective_visual_query = router_data.get("visual_intent") == "YES"
+        new_geo_signal = router_data.get("new_geo", "Inherit")
+        
+        # --- GEO NORMALIZATION (ISO-2 Enforcement for Trends/Analysis) ---
+        if new_geo_signal == "Inherit":
+            detected_geo = prev_geo
+            target_geos = [prev_geo] if prev_geo else ["NG"]
+        else:
+            # Extract ALL 2-letter ISO codes using word boundaries
+            iso_codes = re.findall(r'\b([A-Z]{2})\b', str(new_geo_signal).upper())
+            if iso_codes:
+                target_geos = iso_codes
+                detected_geo = iso_codes[0] # Use the first one as a primary signal for single-use logic
+                print(f"  -> Geo Pivots Detected: {target_geos} (Extracted from '{new_geo_signal}')")
+            else:
+                # Fallback to the raw string if no ISO codes found (Search might still use it)
+                detected_geo = new_geo_signal
+                target_geos = [new_geo_signal]
+                print(f"  ⚠️ Warning: Non-ISO Geo detected: '{detected_geo}'. This may impact Trends/Analysis tools.")
+
+        adequacy_score = router_data.get("adequacy")
+        selected_tools = router_data.get("selected_tools", [])
+        research_intent_raw = json.dumps({"intent": prev_intent, "rationale": router_data.get("rationale")})
+        print(f"  -> Intelligence Router: {router_data.get('rationale')} | Target Geo: {detected_geo}")
+    except Exception as e:
+        print(f"⚠️ Router failed: {e}. Falling back.")
+        is_recollective_visual_query = False
+        detected_geo = prev_geo
+        target_geos = [prev_geo] if prev_geo else ["NG"]
+        adequacy_score = "INSUFFICIENT"
+        selected_tools = ["WEB"]
+        research_intent_raw = json.dumps({"intent": prev_intent})
+    
+    # 4. EXECUTION BRANCHING
+    
+    # 4.1 Recollective Vision (Conditional)
     if not all_images and is_recollective_visual_query and history_context:
-        print("Sensory Router: Semantic visual intent detected. Attempting Deep Recollection (Re-scraping URLs)...")
-        # ... (rest of the logic remains the same)
+        print("Sensory Router: Visual intent detected. Attempting Deep Recollection...")
         history_web_links = re.findall(r'(https?://[^\s<>|]+(?:twitter\.com|x\.com|instagram\.com|facebook\.com|threads\.net|tiktok\.com|youtube\.com|status/|p/)[^\s<>|]*)', history_context)
         if history_web_links:
             top_link = history_web_links[0].strip('><')
-            print(f"Sensory Router: Re-scraping historical link for visual assets: {top_link}")
             scrape_data = get_mcp_client().call("scrape_article", {"url": top_link})
             found_img_links = re.findall(img_pattern, scrape_data)
             if found_img_links:
-                print(f"Sensory Router: Deep Recollection successful. Found {len(found_img_links)} assets.")
                 all_images.extend(found_img_links[:2])
-                tool_logs.append({"event_type": "tool_call", "tool_name": "recollective_scrape", "status": "success", "content": f"Found images: {found_img_links[:2]}"})
-
-            # --- TURBO CHARGED: Deep Navigator (Recursive Link Analysis) ---
-            # If the scrape was successful, check if we should go deeper
-            if scrape_data and "[DETECTED_LINKS]:" in scrape_data:
-                links_section = scrape_data.split("[DETECTED_LINKS]:")[1]
-                deep_url = analyze_deep_navigation(links_section, grounding_subject, history_context)
-                
-                if deep_url:
-                    print(f"Sensory Router: Deep Navigator decided to click: {deep_url}")
-                    deep_data = get_mcp_client().call("scrape_article", {"url": deep_url})
-                    if deep_data:
-                         # Append the recursive finding as high-value context
-                        insight = f"[DEEP_NAVIGATOR_INSIGHT (Source: {deep_url})]:\n{deep_data[:8000]}"
-                        context_snippets.append(insight)
-                        base_grounding.append(insight)
-                        tool_logs.append({"event_type": "tool_call", "tool_name": "deep_navigator_scrape", "status": "success", "content": f"Recursively scraped: {deep_url}"})
-                    else:
-                        print("Sensory Router: Deep click returned no data.")
-                else:
-                    print("Sensory Router: Deep Navigator decided NO_ACTION (No critical link found).")
+                tool_logs.append({"event_type": "tool_call", "tool_name": "recollective_scrape", "status": "success"})
 
     if all_images:
         print(f"Sensory Router: Analyzing {len(all_images)} images for visual grounding...")
@@ -769,161 +937,11 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
             context_snippets.append(insight)
             base_grounding.append(insight)
             tool_logs.append({"event_type": "tool_call", "tool_name": "analyze_image", "status": "success", "content": insight})
-    # 2. Automated Signal Detection (Always-On Parallel + Smart Fallback)
-    print("Sensory Router: Detecting Signals (Geo & Intent) via MCP Hub...")
-    
-    # SAFETY: Ensure session_metadata is a dict to prevent NoneType errors
-    if session_metadata is None:
-        session_metadata = {}
-    
-    prev_geo = session_metadata.get('detected_geo', 'Global')
-    prev_intent = session_metadata.get('intent', 'FORMAT_GENERAL')
-    
-    # ALWAYS EXECUTE PARALLEL: Use ThreadPoolExecutor for concurrent MCP Hub calls
-    # This ensures we are ALWAYS listening for pivots (e.g. "Why is it different in France?")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        future_geo = executor.submit(mcp_detect_geo, raw_topic, history=history_context)
-        future_intent = executor.submit(mcp_detect_intent, raw_topic)
-        
-        try:
-            detected_geo = future_geo.result(timeout=8)  # Reduced from 10s to prevent cascading timeouts
-            research_intent_raw = future_intent.result(timeout=8)
-        except concurrent.futures.TimeoutError:
-            print(f"⚠️ Parallel Signal Detection timed out. Using graceful fallback to session memory.")
-            # GRACEFUL DEGRADATION: If MCP is slow, inherit from session memory entirely
-            detected_geo = prev_geo
-            research_intent_raw = json.dumps({"intent": prev_intent, "directive": "Fallback due to timeout"})
-        except Exception as e:
-            print(f"⚠️ Parallel Signal Detection failed: {e}. Attempting sequential fallback...")
-            try:
-                detected_geo = mcp_detect_geo(raw_topic, history=history_context)
-                research_intent_raw = mcp_detect_intent(raw_topic)
-            except Exception as fallback_error:
-                print(f"❌ Sequential fallback also failed: {fallback_error}. Using session memory.")
-                detected_geo = prev_geo
-                research_intent_raw = json.dumps({"intent": prev_intent, "directive": "Fallback due to error"})
 
-    # --- SMART INHERITANCE LOGIC ---
-    # Rule: If new signal is generic ("Global") but memory is specific, inherit.
-    # Rule: If new signal is specific, prioritize it (Pivot).
-    if detected_geo == "Global" and prev_geo != "Global":
-        print(f"  -> Smart Inheritance: New signal is Global. Falling back to session memory: '{prev_geo}'")
-        detected_geo = prev_geo
-    elif detected_geo != "Global" and detected_geo != prev_geo:
-        print(f"  -> Topic Pivot: New specific Geo signal detected: '{detected_geo}'. Overriding memory.")
-
-    print(f"  -> Signal Detected | Geo: '{detected_geo}' | Intent: '{research_intent_raw}'")
-    
-    # Parse for the prompt context to avoid JSON clutter
-    try:
-        intent_json = json.loads(research_intent_raw)
-        detected_intent_key = intent_json.get("intent", "FORMAT_GENERAL")
-    except:
-        detected_intent_key = "FORMAT_GENERAL"
-        
-    print(f"  -> Signal Detected | Geo: '{detected_geo}' | Intent: '{detected_intent_key}'")
-    
-    # --- 2.5 SENSORY GATEKEEPER: Grounding Adequacy Audit ---
-    # We check if we ALREADY have enough info in context_snippets + history to satisfy the request.
-    # This specifically addresses the "Token Economy" requirement.
-    audit_prompt = f"""
-    Evaluate if the following knowledge is SUFFICIENT to answer the user's request without further web research.
-    
-    USER REQUEST: "{raw_topic}"
-    
-    COLLECTED KNOWLEDGE (RAG + HISTORY + VISUALS + CODE ANALYSIS):
-    {history_context}
-    ---
-    {base_grounding}
-    
-    RULES:
-    1. If the user is asking to reorganize, summarize, edit, or COMPOSE (create a draft/outline) based on information whose COMPLETE context has already been retrieved and is visible in the history or snippets, it is SUFFICIENT.
-    2. WEB RESEARCH VS COMPOSITION: If the user commands an action (e.g., "Draft a post") that can be fulfilled using the EXISTING history or MISSION SUBJECT knowledge, select SUFFICIENT. We only need more research (INSUFFICIENT) if the request requires fresh signals or facts not yet established.
-    3. PROFUNDITY MATCH: Surface-level context is INSUFFICIENT if the user request demands high-fidelity technical depth not already grounded in history.
-    4. If the user's query is purely conversational/social, it is SUFFICIENT.
-
-    OUTPUT FORMAT:
-    RATIONALE: <1-sentence explanation>
-    DECISION: [SUFFICIENT or INSUFFICIENT]
-    """
-    audit_raw = specialist_model.generate_content(audit_prompt).text.strip().upper()
-    print(f"SENSORY GATEKEEPER: {audit_raw}")
-    
-    adequacy_score = "INSUFFICIENT"
-    if "DECISION: SUFFICIENT" in audit_raw:
-        adequacy_score = "SUFFICIENT"
-    elif "DECISION: INSUFFICIENT" in audit_raw:
-        adequacy_score = "INSUFFICIENT"
-
-    if adequacy_score == "SUFFICIENT" and "TRENDS" not in detected_intent_key:
-        print("SENSORY GATEKEEPER: Knowledge is sufficient. Skipping AI Router and forcing CONVERSATIONAL_CONTEXT.")
-        selected_tools = ["USE_CONVERSATIONAL_CONTEXT"]
+    # 4.2 Gatekeeper Short-Circuit
+    if adequacy_score == "SUFFICIENT" and "TRENDS" not in str(selected_tools):
+        print("SENSORY GATEKEEPER: Knowledge is sufficient. Skipping search.")
         return {"context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent_raw, "detected_geo": detected_geo}
-
-    # 3. Sensory Array Router (Decides based on RAW input)
-    tool_choice_prompt = f"""
-    Analyze the user's query to select the most appropriate research tool(s).
-
-    CONVERSATION HISTORY:
-    {history_context}
-
-    GROUNDING ASSETS (Code Analysis / Visuals / Prior RAG):
-    {base_grounding}
-
-    LONG-TERM MEMORY (RAG Results):
-    {rag_text}
-
-    USER'S CORE QUERY (THE COMMAND): '{raw_topic}'
-    MISSION SUBJECT (THE CONTEXT): '{grounding_subject}'
-    
-    ### DETECTED CONTEXT (MCP Hub Signals):
-    - PRIMARY GEO TARGET: '{detected_geo}'
-    - REQUESTED FORMAT INTENT: '{detected_intent_key}'
-
-    ### DECISION PROTOCOL (CHECK IN ORDER):
-    1. **CHECK HISTORY (Priority #1):**
-        - If the user is asking for information (or a REFORMATTING like an OUTLINE) that CAN BE GATHERED from the "LONG-TERM MEMORY" or "CONVERSATION HISTORY", select **USE_CONVERSATIONAL_CONTEXT**.
-        - If the history contains the FACTUAL CONTENT needed but the user wants a new structure (e.g. "Create an outline for the above"), select **USE_CONVERSATIONAL_CONTEXT**.
-        - **INTERPRETIVE EXCEPTION:** If the user asks for **REASONS**, **DRIVERS**, **CAUSES**, or **"WHY"** (and the history only contains stats/numbers), **DO NOT** select USE_CONVERSATIONAL_CONTEXT. Proceed to research.
-
-    2. **CHECK CREATIVE INTENT (Priority #2):**
-        - If the user asks you to **DRAFT**, **CREATE**, or **WRITE** content for an entity that is clearly **INVENTED**, **FICTIONAL**, or defined in history, select **USE_CONVERSATIONAL_CONTEXT**.
-
-    3. **NEW RESEARCH (Priority #3):**
-        - If the user wants you to gather NEW information not in history, use a tool below.
-        - If the user wants you to explain a trend (and the history contains only numbers/stats but not the *explanation*), select a tool below.
-
-    ### AVAILABLE TOOLS:
-    - WEB: Use this whenever the request requires **Factual Discovery** or **External Grounding** not available in history.
-        *   Examples: "Research X", "Find data on Y", "Ground this in technical specifics", "Use latest signals".
-    - IMAGES: For visual inspiration.
-    - VIDEOS: For tutorials/clips.
-    - TRENDS: For viral awareness. Select ONLY for measuring "What is trending" or "Viral topics" in a specific region.
-    - ANALYSIS: For historical trajectory. Select ONLY for "Interest over time" or "Growth metrics".
-    - SIMPLE: General web searches for broad definitions.
-    - COMPLIANCE: **CRITICAL.** Select this for ANY question involving **Data Privacy**, **Breach Reporting**, **Laws**, or **Regulations** (GDPR, NDPA, SOC2, etc.).
-        *   Trigger this whenever the user asks "What do I need to do?", "How long do I have?", or "What are the rules?" in a business or technical context.
-    - USE_CONVERSATIONAL_CONTEXT: Select this for **Composition**, **Formatting**, or **Incremental Refinement** using information already established in the conversation.
-        *   Examples: "Write a draft", "Create an outline", "Summarize our notes", "Refine the tone", "Include more detail on [Topic A]", write about a hypothetical or user-defined entity.
-
-    ### DECISION REASONING:
-    - If a request combines **Drafting** with **Research Intent** (e.g. "Draft a deep-dive based on new research"), the priority is to select **WEB** + any other necessary tools.
-    - If a request is purely about **Execution/Form** based on existing knowledge, select **USE_CONVERSATIONAL_CONTEXT**.
-
-    Respond ONLY with the tool selection(s), comma-separated (e.g., "WEB, ANALYSIS" or "IMAGES" or "USE_CONVERSATIONAL_CONTEXT").
-    Do not add country codes; the system handles locations via the MCP signals.
-    """
-    # 4. Robust Parsing Logic
-    try:
-        raw_response = specialist_model.generate_content(tool_choice_prompt).text.strip().upper()
-        clean_response = raw_response.replace("*", "").replace("`", "").replace("'", "").replace('"', "").rstrip(".")
-        
-        selected_tools = [t.strip() for t in clean_response.split(',')]
-        logging.info(f"TELEMETRY: Router decided on Strategy: {selected_tools} | Target Geo: {detected_geo}")
-    except Exception as e:
-
-        logging.error(f"Router Parse Error: {e}. Defaulting to SIMPLE.")
-        selected_tools = ["SIMPLE"]
 
     # --- 0. CONVERSATIONAL SHORT-CIRCUIT ---
     # We only return early if USE_CONVERSATIONAL_CONTEXT is the ONLY tool selected.
@@ -987,18 +1005,25 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
 
     # --- 1.5 COMPLIANCE KNOWLEDGE TOOLS ---
     if "COMPLIANCE" in selected_tools:
-        print("Sensory Router: Category [COMPLIANCE] active. Searching Regulatory Hub...")
-        # We pass detected_geo as geo_scope to filter results relevant to that region
-        compliance_context = search_compliance_knowledge(grounding_subject, geo_scope=detected_geo)
-        if compliance_context:
-            context_snippets.append(compliance_context)
-            tool_logs.append({"event_type": "tool_call", "tool_name": "compliance_knowledge_retrieval", "input": raw_topic, "status": "success", "content": str(compliance_context)[:500]})
+        print("Sensory Router: Category [COMPLIANCE] active. Searching Regulatory Hub (Multi-Geo)...")
+        # We iteration through all detected geos for compliance grounding
+        for geo_code in target_geos:
+            print(f"  + Fetching Compliance Data for Region: {geo_code}")
+            compliance_context = search_compliance_knowledge(grounding_subject, geo_scope=geo_code)
+            if compliance_context and "No relevant" not in str(compliance_context):
+                context_snippets.append(f"[Compliance Info - {geo_code}]:\n{compliance_context}")
+                tool_logs.append({
+                    "event_type": "tool_call", 
+                    "tool_name": f"compliance_knowledge_retrieval_{geo_code}", 
+                    "input": raw_topic, 
+                    "status": "success"
+                })
 
     # --- 2. REGIONAL TREND TOOLS (Region-Specific Discovery) ---
     trend_tools = [t.split(':')[0].strip() for t in selected_tools if t.split(':')[0].strip() in ["TRENDS", "ANALYSIS"]]
     
     if trend_tools:
-        target_geos = [detected_geo] if detected_geo else ["NG"]
+        # Use target_geos list gathered by the Intelligence Router
         for geo_code in target_geos:
             print(f"--- Processing Regional Trends: '{geo_code}' ---")
             for choice in trend_tools:
@@ -1057,10 +1082,10 @@ def generate_topic_cluster(topic, context, history="", is_initial=True):
     HISTORY: {history}
     
     ### EXPERT SEO PRINCIPLES:
-    1. **Semantic Ecosystems (Entities over Strings):** Do not just match keywords. Identify the core concepts and entities (vocabulary of authority) required to be seen as an expert.
-    2. **User Journey Maps:** Align clusters with the user's path from "Problem Awareness" (Informational/Top-of-funnel) to "Solution" (Transactional/Middle/Bottom-of-funnel).
-    3. **Topical Authority Graphs:** Cover the topic's "nooks and crannies" to prove comprehensive expertise and create a defensive moat.
-    4. **Information Architecture (The Library Model):** Ensure the structure follows a logical internal linking blueprint from the Master Pillar to supporting sub-topics.
+    1. **Semantic Ecosystems (Entities over Strings):** Do not just match keywords. Identify the core concepts and entities required to be seen as an expert.
+    2. **User Journey Maps:** Align clusters with the user's path from "Problem Awareness" (Top-of-funnel) to "Conversion/Solution" (Middle/Bottom-of-funnel).
+    3. **Topical Authority Graphs:** Cover the topic's "nooks and crannies" to prove comprehensive expertise.
+    4. **Information Architecture (The Library Model):** Ensure structure follows logical internal linking from the Pillar to sub-topics.
     
     ### GUIDELINES:
     1. If this is a REVISION (is_initial=False), you MAY start with a header like ":robot_face: The proposal has been REVISED" or similar context-aware greetings if appropriate.
@@ -1081,8 +1106,7 @@ def generate_topic_cluster(topic, context, history="", is_initial=True):
       ]
     }}
     """
-    response = model.generate_content(prompt)
-    return extract_json(response.text)
+    return extract_json(safe_generate_content(unimodel, prompt))
 
 # 12. The SEO Metadata Generator (Using Specialist Model)
 def generate_seo_metadata(article_html, topic):
@@ -1091,11 +1115,20 @@ def generate_seo_metadata(article_html, topic):
     """
     print(f"Tool: Delegating SEO Metadata to Specialist Model (Anthropic)...")
     
+    # TITLE PERSISTENCE: Try to extract a title from the HTML <h1> or the topic
+    title_hint = ""
+    h1_match = re.search(r'<h1[^>]*>(.*?)</h1>', article_html, re.IGNORECASE)
+    if h1_match:
+        title_hint = h1_match.group(1).strip()
+    elif len(topic) > 15 and "publish" not in topic.lower() and "repurpose" not in topic.lower():
+        title_hint = topic
+        
     prompt = f"""
     You are a World-Class SEO Strategist and Copywriter.
     
     INPUT CONTEXT:
     Topic: "{topic}"
+    Title Hint (Priority): "{title_hint}"
     Article Content (HTML):
     {article_html[:15000]} # Truncate to avoid context limits
     
@@ -1103,8 +1136,8 @@ def generate_seo_metadata(article_html, topic):
     Generate highly optimized, click-worthy metadata for this article.
     
     REQUIREMENTS:
-    1. **title**: A catchy H1 title (Max 70 chars). different from the input if needed for better CTR.
-    2. **meta_title**: The SEO Title tag (Max 60 chars). Must include primary keyword near the front.
+    1. **title**: The primary H1 title. If a clear, substantive title exists in the provided HTML (<h1>) or the 'Topic', PRESERVE IT EXACTLY. Do not rewrite if the input is high-quality.
+    2. **meta_title**: The SEO Title tag (Max 60 chars). Try to align this with the main title but ensure the primary keyword is at the front.
     3. **meta_description**: A compelling summary for SERPs (Max 155 chars). Must include a call-to-action or hook.
     4. **custom_excerpt**: A social-media friendly summary (Max 200 chars).
     5. **featured_image_prompt**: A detailed Midjourney/DALL-E prompt. 
@@ -1120,13 +1153,15 @@ def generate_seo_metadata(article_html, topic):
 
     OUTPUT FORMAT:
     Return ONLY a raw JSON object. Do not use Markdown blocks.
+    CRITICAL: You MUST escape any double quotes inside string values (e.g., "title": "The \"Big\" Deal").
+    Example:
     {{
-        "title": "...",
-        "meta_title": "...",
-        "meta_description": "...",
-        "custom_excerpt": "...",
-        "featured_image_prompt": "...",
-        "tags": ["...", "..."]
+        "title": "A Title with \"Quotes\"",
+        "meta_title": "SEO Title",
+        "meta_description": "Description...",
+        "custom_excerpt": "Social summary...",
+        "featured_image_prompt": "Prompt...",
+        "tags": ["AI-Era Search"]
     }}
     """
     
@@ -1135,8 +1170,7 @@ def generate_seo_metadata(article_html, topic):
         
         # 2. Generate Content using the Universal Method
         # The adapter returns a response object where .text is the content
-        response = specialist_model.generate_content(prompt, generation_config={"temperature": 0.7})
-        content = response.text.strip()
+        content = safe_generate_content(specialist_model, prompt, generation_config={"temperature": 0.7})
         
         # 3. Use the Unified Super-Listener
         final_json = extract_json(content)
@@ -1147,12 +1181,22 @@ def generate_seo_metadata(article_html, topic):
 
     except Exception as e:
         print(f"⚠️ Specialist Anthropic Model Failed: {e}")
-        # Return a safe fallback schema
+        
+        # 4. Improved Fallback Logic
+        fallback_title = topic.replace("Draft a pSEO article about ", "").replace("Publish as pSEO: ", "").strip('"')
+        
+        # Try to find an H1 in the article HTML if available
+        if article_html:
+            h1_match = re.search(r'<h1[^>]*>(.*?)</h1>', article_html, re.IGNORECASE)
+            if h1_match:
+                fallback_title = h1_match.group(1).strip()
+                print(f"  + Fallback recovered title from H1: {fallback_title}")
+
         return {
-            "title": topic.replace("Draft a pSEO article about ", "").strip('"'),
-            "meta_title": topic[:60],
-            "meta_description": f"Deep dive into {topic}.",
-            "custom_excerpt": f"Analysis of {topic}.",
+            "title": fallback_title,
+            "meta_title": fallback_title[:60],
+            "meta_description": f"Deep dive into {fallback_title}.",
+            "custom_excerpt": f"Analysis of {fallback_title}.",
             "featured_image_prompt": "Abstract digital landscape representing AI ethics.",
             "tags": ["The Leading Edge"]
         }
@@ -1171,7 +1215,7 @@ def ensure_slack_compatibility(text):
     in_code_block = False
     
     for i, line in enumerate(lines):
-        # Toggle code block state
+        # Toggle code block state - RESTORED TO STABLE START-ONLY LOGIC
         if line.strip().startswith("```"):
             in_code_block = not in_code_block
             new_lines.append(line)
@@ -1199,6 +1243,9 @@ def ensure_slack_compatibility(text):
                 new_lines.append("")  
 
     return "\n".join(new_lines)
+
+
+
 
 
 # 13a. The Natural Answer Generator (Conversational & Fluid)
@@ -1247,49 +1294,28 @@ def generate_natural_answer(topic, context, history=""):
     ### FORMATTING RULES:
     1. Use **bold** for key concepts.
     2. Ensure paragraphs are separated by blank lines.
-    3. **Code Blocks**: For any code snippets, use markdown fenced code blocks:
-       - Use triple backticks with language identifier: ```language
-       - Example: ```python\ndef hello(): return \"world\"\n```
+    3. **Code Blocks (CRITICAL)**: 
+       - For any code snippets, use markdown fenced code blocks: ```language ... ```
+       - **NEVER** include normal explanatory text INSIDE a code block.
+       - **ALWAYS** close a code block immediately after the code snippet ends.
+       - If you have multiple snippets, use separate code blocks for each.
        - Supported languages: javascript, python, java, go, rust, typescript, html, css, json, yaml, bash, sql, etc.
     """
     
-    try:
-        response = active_model.generate_content(prompt, generation_config={"temperature": 0.4})
-        text = response.text
-        
-        # Check for Mock Error Response from UnifiedModel
-        if "I encountered a safety limit" in text or "unable to generate" in text:
-             raise ValueError("Model returned Error Mock")
-
-        final_text = ensure_slack_compatibility(text.strip())
-        
-        # Simple intent detection for metadata consistency
-        intent = "SIMPLE_QUESTION"
-        if "```" in final_text: intent = "TECHNICAL_EXPLANATION"
-        
-        return {
-            "text": final_text,
-            "intent": intent,
-            "directive": ""
-        }
-    except Exception as e:
-        print(f"⚠️ Primary Model Failed ({active_model.model_name}): {e}")
-        
-        if specialist_model:
-            print(f"🔄 FAILOVER: Switching to Specialist Model (Anthropic)...")
-            try:
-                # Ensure Anthropic Key is present
-                if not os.environ.get("ANTHROPIC_API_KEY") and ANTHROPIC_API_KEY:
-                     os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
-                
-                fallback_resp = specialist_model.generate_content(prompt, generation_config={"temperature": 0.4})
-                final_text = ensure_slack_compatibility(fallback_resp.text.strip())
-                return {"text": final_text, "intent": "DIRECT_ANSWER_FALLBACK", "directive": ""}
-            except Exception as e2:
-                print(f"❌ Specialist Failover also failed: {e2}")
-                return {"text": "I am currently experiencing high traffic on all neural pathways (429). Please try again in a minute.", "intent": "ERROR", "directive": ""}
-        else:
-             return {"text": "Service is busy (429). Please try again later.", "intent": "ERROR", "directive": ""}
+    # Use Safe Gen Wrapper
+    text = safe_generate_content(active_model, prompt, generation_config={"temperature": 0.4})
+    
+    # Intent detection for metadata consistency
+    # STABILITY: Remove auto-repair here; let ensure_slack_compatibility handle line-by-line
+    final_text = ensure_slack_compatibility(text.strip())
+    intent = "SIMPLE_QUESTION"
+    if "```" in final_text: intent = "TECHNICAL_EXPLANATION"
+    
+    return {
+        "text": final_text,
+        "intent": intent,
+        "directive": ""
+    }
 
 
 # 13b. The Comprehensive Answer Generator (AEO-AWARE CONTENT STRATEGIST)
@@ -1320,9 +1346,8 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     # 1. PERSONA & AUDIENCE
     audience_context = detect_audience_context(history)
     persona_instruction = f"""
-    You are the 'Sonnet & Prose' Senior Content Strategist. 
+    You are a Senior Content Strategist. 
     AUDIENCE: {audience_context}
-    PRINCIPLE: provide technical depth (Prose) wrapped in human-centric perspective (Sonnet).
     """
 
     # 2. INTENT DETECTION
@@ -1375,26 +1400,20 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
        - Always specify the language for proper syntax highlighting.
     """
 
-    try:
-        # Use active_model (Dynamic routing) for the final synthesis
-        response = active_model.generate_content(prompt, generation_config={"temperature": target_temp})
-        
-        # Enforce spacing on the output
-        final_text = ensure_slack_compatibility(response.text.strip())
-        
-        return {
-            "text": final_text,
-            "intent": research_intent,
-            "directive": formatting_directive
-        }
-    except Exception as e:
-        print(f"Synthesis Error: {e}")
-        # Final fallback
-        fallback = active_model.generate_content(prompt).text.strip()
-        return {"text": fallback, "intent": research_intent, "directive": formatting_directive}
+    # Use active_model (Dynamic routing) for the final synthesis
+    text = safe_generate_content(active_model, prompt, generation_config={"temperature": target_temp})
+    
+    # Enforce spacing on the output
+    final_text = ensure_slack_compatibility(text.strip())
+    
+    return {
+        "text": final_text,
+        "intent": research_intent,
+        "directive": formatting_directive
+    }
 
-# 14. The Dedicated pSEO Article Generator (High Trust & Transparency)
-def generate_pseo_article(topic, context, history="", history_events=None):
+# 14. The Dedicated pSEO Article Generator
+def generate_pseo_article(topic, context, history="", history_events=None, is_initial_post=True):
     global unimodel
     print(f"Tool: Generating pSEO Article for '{topic}'")
     
@@ -1404,104 +1423,196 @@ def generate_pseo_article(topic, context, history="", history_events=None):
     # 1. Determine System Instruction (Grounding Logic)
     is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
     
-    # 2. History Check for Repurposing (Adherence)
-    # Check if a structural draft exists in history (proposal_type="deep_dive")
-    has_existing_draft = False
-    is_repurpose_command = any(kw in topic.lower() for kw in ["dump", "repurpose", "convert", "use existing", "use the draft", "publish"])
-    has_markdown_structure = "## " in str(history) or "Title:" in str(history)
+    # 2. History Analysis (Tri-State Logic: REFACTOR vs EXPAND vs AUTHOR)
+    # State A: REFACTOR (Repurpose existing full draft) -> High Strictness, No Synthesis
+    # State B: EXPAND (Synthesize from Outline) -> High Synthesis, Strict Structure
+    # State C: AUTHOR (Greenfield) -> High Synthesis, Free Structure
     
-    if history_events:
-        has_existing_draft = any(e.get('proposal_type') in ['deep_dive', 'pseo_article'] for e in history_events)
-    else:
-        has_existing_draft = False
+    start_mode = "AUTHOR"
+    
+    # Signals
+    topic_lower = topic.lower()
+    has_pseo_keyword = "pseo" in topic_lower
+    
+    # Path A Signals (Verbatim Finalization)
+    is_repurpose_cmd = any(kw in topic_lower for kw in ["dump", "repurpose", "publish the", "provision the", "for the draft", "finalize the"])
+    
+    # Path B Signals (Creative Iteration)
+    is_expand_cmd = any(kw in topic_lower for kw in ["expand", "flesh out", "write from", "based on outline", "refine", "polish", "rewrite"])
+    
+    has_outline_structure = "## " in str(history) and len(str(history)) < 3000 # Rough heuristic: Outlines are shorter
+    has_full_draft_structure = "## " in str(history) and len(str(history)) > 3000
+    
+    # FUTURE-PROOFING: If follow-up, insist on "pseo" keyword for Path A/B to avoid accidental refactors of general feedback
+    if not is_initial_post and not has_pseo_keyword:
+        print("  + Follow-up turn without 'pSEO' keyword. Defaulting to AUTHOR mode for safety.")
+        start_mode = "AUTHOR"
+    elif is_repurpose_cmd and has_full_draft_structure:
+        start_mode = "REFACTOR"
+    elif (is_expand_cmd and "## " in str(history)) or (has_outline_structure and not is_repurpose_cmd):
+        start_mode = "EXPAND"
+    elif is_repurpose_cmd and has_outline_structure:
+        # User said "Repurpose this outline" -> They likely mean "Expand this outline into an article"
+        start_mode = "EXPAND" 
+        
+    print(f"  + Generation Mode Selected: {start_mode}")
 
-    # Combined Check: If explicit command OR strong artifact signals
-    if is_repurpose_command and has_markdown_structure:
-        has_existing_draft = True
-    elif "Deep-Dive Complete" in str(history) or "Here is the draft" in str(history):
-        has_existing_draft = True
-    
-    if has_existing_draft:
-        print("  + Detected existing draft (Structural Check). Switching to REPURPOSE MODE.")
-        system_instruction = """
-        You are a Content Formatter. 
-        TASK: Convert the EXISTING DRAFT found in the 'Conversation History' into the specific HTML structure below.
-        CRITICAL: Do not rewrite the substance. Keep the original content, analogies, and tone. Just apply the requested HTML tags and organization.
+    # --- FAST-TRACK: DIRECT PROVISIONING (Bypass LLM) ---
+    # Case: "Publish this draft" - Extract the existing HTML from history_events.
+    best_source_text = None
+    if is_repurpose_cmd and history_events:
+        for event in reversed(history_events):
+            # 1. Look for recent agent_proposal (pseo_article) with clean HTML
+            proposal_data = event.get('proposal_data')
+            if isinstance(proposal_data, dict) and proposal_data.get('article_html'):
+                print(f"  + FAST-TRACK: Found clean HTML in proposal_data. Provisioning directly.")
+                return proposal_data['article_html']
+            
+            # 2. Look for existing text (Markdown) to REFACTOR
+            content = event.get('text') or event.get('content')
+            if content and isinstance(content, str) and len(content) > 500:
+                # HARDENING: Reject Fast-Track if it contains raw markdown artifacts
+                has_markdown_artifacts = "```" in content or "\n- " in content or "\n* " in content
+                
+                if "<section" in content and "</section>" in content and not has_markdown_artifacts:
+                    print(f"  + FAST-TRACK: Found existing high-fidelity HTML draft. Provisioning directly.")
+                    return content
+            
+                # Otherwise, this is our best source for the Refactor Engine
+                best_source_text = content
+                print(f"  + FAST-TRACK: Found potential source text ({len(content)} chars) for Refactoring.")
+                break
+        
+        if best_source_text:
+            print("  + FAST-TRACK: Shifting to REFACTOR mode using found source text.")
+            start_mode = "REFACTOR"
+        else:
+            print("  + FAST-TRACK: No suitable source found. Falling back to EXPAND/AUTHOR.")
+
+    if start_mode == "REFACTOR":
+        # --- PATH A: STRICT REFACTOR (Specialist Model) ---
+        print("  + Executing PATH A: REFACTOR with Specialist Model (Claude Sonnet 4.5)")
+        
+        # Use best_source_text if found, otherwise the whole history (risky but fallback)
+        source_to_refactor = best_source_text or history
+        
+        refactor_prompt = f"""
+        You are a Content Refactor Engine specializing in high-fidelity Ghost CMS delivery.
+        
+        TARGET AUDIENCE: {audience_context}
+        
+        TASK: Convert the 'SOURCE TEXT' into target GHOST-FRIENDLY HTML format.
+        
+        STRUCTURE REQUIREMENTS (Strict HTML):
+        1.  **Semantic Structuring**: Use <section> wrappers with appropriate classes (e.g., class="intro", class="body", class="deep-dive", class="methodology").
+        2.  **Semantic Headers**: Use <h1> for the main title, <h2> for major sections, and <h3> for sub-sections.
+        3.  **NO NUMBERED HEADINGS**: Do NOT include numbers (e.g., "1. ", "2. ") in your <h2> or <h3> headers.
+        4.  **Code Blocks**: Use semantic HTML: `<pre><code class="language-...">...</code></pre>`.
+        5.  **Lists**: Use semantic `<ul><li>` or `<ol><li>`.
+        6.  **Paragraphs**: Wrap all text in <p> tags.
+        
+        CRITICAL CONTENT RULES:
+        - **Semantic Integrity**: Ensure the article flows logically and follows the structure of the source text.
+        - **Acronym Protocol**: Define all acronyms in parentheses on the first use.
+        
+        CRITICAL FORMATTING RULES:
+        -   **NO MARKDOWN**: Absolutely NO markdown backticks (```), asterisks for bold (**), or hyphens for lists (- or *).
+        -   **CLEAN CONTENT**: Remove any internal instructions, metalabels, or architect-facing strings (e.g., "writing_instruction", "blueprint", "architect notes") found in the source text.
+        -   **NO PREAMBLE**: Start directly with the first HTML tag.
+        
+        SOURCE TEXT:
+        {source_to_refactor}
         """
-    else:
-        print("  + No draft detected. Switching to AUTHOR MODE.")
+        # Use Specialist (Claude Sonnet 4.5) for high-fidelity refactoring
+        raw_html = safe_generate_content(specialist_model, refactor_prompt, generation_config={"temperature": 0.2})
+        
+        # FIX: Strip Conversational Filler (The "Okay, here is..." preamble)
+        # We look for the first occurrence of <h... or <section... and the last occurrence of a major closing tag
+        match = re.search(r'(<(?:h1|section|article)[\s\S]*</(?:section|article|h1|p)>)', raw_html, re.IGNORECASE)
+        if match:
+            print("  + Sanitized pSEO Output: Removed preamble/postscript.")
+            return match.group(1)
+            
+        return raw_html # Fallback if regex fails (likely clean enough)
+
+    # --- PATH B & C: EXPAND / AUTHOR (Creative Synthesis) ---
+    elif start_mode == "EXPAND":
+        # EXPANSION PROMPT: Use history as a skeleton.
+        print("  + Executing PATH B: EXPAND with Unimodel")
+        system_instruction = f"""
+        You are a Specialized Technical Writer.
+        TASK: Write a comprehensive pSEO article based on the provided OUTLINE/BLUEPRINT.
+        
+        RULES:
+        1.  **FOLLOW STRUCTURE**: Strictly follow the headers defined in the 'BLUEPRINT'.
+        2.  **SYNTHESIZE CONTENT**: Flesh out each bullet point into full, detailed paragraphs.
+        3.  **USE RESEARCH**: Use the provided Research Context to fill in facts/data.
+        
+        BLUEPRINT/OUTLINE:
+        {history}
+        """
+        tone_instruction = "Tone: High-authority, professional, and detailed. Match the depth implied by the blueprint."
+        context_block = f"Research Context:\n{context}"
+        
+    else: # AUTHOR MODE
+        print("  + Executing PATH C: AUTHOR with Unimodel")
         if is_grounded:
             system_instruction = "You are a Clear Technical Communicator. Base the article PRIMARILY on the provided 'Research Context'."
         else:
             system_instruction = "You are a Clear Technical Communicator. Use the provided context to write a high-authority article."
+        tone_instruction = "Tone: Clear, engaging, professional English. Use analogies to explain complex ideas."
+        context_block = f"Research Context:\n{context}\n\nConversation History:\n{history}"
 
-    if has_existing_draft:
-        tone_instruction = "Tone: Maintain the exact professional tone and depth of the existing draft."
-    else:
-        tone_instruction = "Tone: Clear, engaging, professional English. Use analogies to explain complex ideas, but maintain technical accuracy. Rule: Define technical acronyms on first use (e.g., 'Hardware Security Module (HSM)')."
-
-    # 3. Strict System Prompt
+    # Shared Prompt for B & C (Creative Paths)
     prompt = f"""
     {system_instruction}
     
     AUDIENCE: 
     {audience_context}
     
+    TONE & STYLE:
     {tone_instruction}
+    - **SIMPLICITY PROTOCOL**: Use simple, accessible terminology. Explain complex concepts using plain English analogies. Avoid academic or overly dense jargon.
     
-    STRUCTURE REQUIREMENTS (HTML Format):
-    1.  **<section class="intro">**: A compelling, simple hook connecting the topic to the reader.
-    2.  **<section class="body">**: Detailed analysis using <h2> and <h3> tags. Use specific data/facts from the context.
-    3.  **Code Blocks**: When including code snippets, use Ghost's markdown fenced code block format:
-        - Use triple backticks with language identifier: ```language
-        - Example for JavaScript: ```javascript\\nfunction example() {{ return true; }}\\n```
-        - Example for Python: ```python\\ndef hello(): return "world"\\n```
-        - Supported languages: javascript, python, java, go, rust, typescript, html, css, json, yaml, bash, sql, etc.
-        - CRITICAL: Always specify the language for proper Prism.js syntax highlighting
-        - The language identifier must be lowercase and immediately follow the opening backticks
-    4.  **<section class="methodology">**: A TRANSPARENCY FOOTER. 
-        - Must be titled "## Methodology & Sources".
-        - Explicitly list the domains/articles found in the research.
-        - Explain *why* you selected them.
+    STRUCTURE REQUIREMENTS (Strict HTML):
+    1.  **<section class="intro">**: A compelling hook. **MEAT-FIRST**: Deliver core findings or high-density technical insights immediately in the first paragraph.
+    2.  **<section class="body">**: Detailed analysis using <h2> and <h3> tags.
+    3.  **NO NUMBERED HEADINGS**: Do NOT include numbers (e.g., "1. ", "2. ") in your <h2> or <h3> headers.
+    4.  **Code Blocks**: Use semantic HTML: `<pre><code class="language-...">...</code></pre>`.
+    5.  **Lists**: Use semantic `<ul><li>` or `<ol><li>`.
+    6.  **<section class="methodology">**: A TECHNICAL TRANSPARENCY FOOTER. 
+    
+    CRITICAL CONTENT RULES:
+    - **Contextual Specificity**: Actively identify and expand on points of interest, debates, cultural markers, or specific real-world examples found in the research context.
+    - **Technical-External Mapping**: Identify relevant external frameworks (regulatory, structural, or conceptual) and explicitly link technical solutions to those specific anchors.
+    - **Technical Accuracy**: Ensure all technical claims are supported by the provided context.
+    - **Acronym Protocol**: Define all acronyms in parentheses on the first use (e.g. "Electronic Data Interchange (EDI)").
     
     CRITICAL RULES:
     - Do NOT hallucinate.
-    - Return ONLY the HTML content (no ```html``` markdown wrappers).
-    - Do NOT include labels like 'Intro', 'Body', or 'Methodology' as text.
-    - For code snippets, use markdown fenced code blocks (```language) NOT HTML <pre><code> tags.
-    - Always specify the programming language for syntax highlighting (e.g., ```javascript, ```python).
-    - Ensure it is ready for Ghost CMS (Ghost will convert markdown code blocks to HTML automatically).
-
-    CONTEXTUAL DATA:
-    Conversation History: 
-    {history}
+    - Return ONLY valid semantic HTML content. Absolutely NO MARKDOWN.
+    - Always specify the programming language in the code class.
     
+    CONTEXTUAL DATA:
     Current Topic: "{topic}"
     
-    Research Context (Grounding Data):
-    {context}
+    {context_block}
     
     Article Draft:
     """
     
-    
-    return unimodel.generate_content(prompt, generation_config={"temperature": 0.3}).text.strip()
+    return safe_generate_content(unimodel, prompt, generation_config={"temperature": 0.4})
 
 # 14.5 The Recursive Deep-Dive Generator (Dynamic Room-by-Room Construction)
-def generate_deep_dive_article(topic, context, history="", history_events=None, target_length=1500):
+def generate_deep_dive_article(topic, context, history="", history_events=None, target_length=1500, target_geo="Global"):
     global unimodel
-    print(f"Tool: Initiating Recursive Deep-Dive for '{topic}' (Target: {target_length} words)")
+    print(f"Tool: Initiating Recursive Deep-Dive for '{topic}' (Region: {target_geo}, Target: {target_length} words)")
     
     # CLAMP: Prevent unbounded generation that crashes SSL/Webhooks
     target_length = min(3500, max(500, target_length))
     
     is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
     audience_context = detect_audience_context(history)
-    
-    # Calculate architecture: Dynamic Range (3-8 sections)
-    # logic: We give the Blueprint Architect the freedom to choose, but provide a heuristic target.
-    # We remove the rigid calc: num_sections = max(3, target_length // 300)
-    words_per_section = 300 # Baseline heuristic for prompting
     
     # PHASE 1: Generate the Blueprint & Title (The Architect)
     blueprint_prompt = f"""
@@ -1522,6 +1633,12 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     ### STEP 3: BLUEPRINT GENERATION
     Design the optimal structure.
     - **Sections**: Create between 3 and 8 H2 sections depending on the complexity of the topic.
+    - **NO REDUNDANCY**: Do NOT include a "Lede", "Introduction", or "Conclusion" section in your list. These parts are handled by special drafting phases. Start directly with the core problem or first technical insight.
+    - **WORD COUNT BUDGETING**: You MUST assign a `target_word_count` to each section. The SUM of all these counts MUST be approximately {target_length - 300} (to allow space for the intro and conclusion). 
+    - **Strategic Allocation**: Allocate more words to complex case studies/ROOT CAUSE analysis and fewer to simple definitions/hooks.
+    - **Contextual Root Cause Analysis**: Mandate exploration of the systemic factors behind the topic's core challenges in the architecture.
+    - **Solution Framing**: Explicitly frame provided technical concepts or solutions as context-sensitive measures.
+    - **Relevant Technical States**: Highlight specific system states (e.g., approval, failure, transitions) that are most critical to the current context.
     - **Flow**: Ensure a logical narrative arc.
     
     AUDIENCE: {audience_context}
@@ -1534,14 +1651,15 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
         "sections": [ 
             {{
                 "title": "Section Title", 
-                "writing_instruction": "Specific instruction for the writer (e.g., 'Tell a story about X', 'List 5 facts about Y'). Ensure it aligns with the detected style."
+                "writing_instruction": "Specific instruction for the writer (e.g., 'Tell a story about X', 'List 5 facts about Y'). Ensure it aligns with the detected style.",
+                "target_word_count": "Optional. Number of words for this section (e.g. 200, 500). If omitted, the system will auto-allocate."
             }} 
         ]
     }}
     """
     
     try:
-        blueprint_raw = unimodel.generate_content(blueprint_prompt).text.strip()
+        blueprint_raw = safe_generate_content(unimodel, blueprint_prompt)
         if "```json" in blueprint_raw: blueprint_raw = blueprint_raw.split("```json")[1].split("```")[0].strip()
         blueprint = json.loads(blueprint_raw)
         title = blueprint.get("title", f"The Analysis of {topic}")
@@ -1549,59 +1667,103 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     except Exception as e:
         print(f"Blueprint Error: {e}")
         # Fallback to pSEO if blueprinting fails
-        return generate_pseo_article(topic, context, history, history_events=history_events)
+        return generate_pseo_article(topic, context, history, history_events=history_events, is_initial_post=True)
 
-    # PHASE 2: Recursive Room Building (The Writer)
+    # PHASE 2: Recursive Room Building (The Writer - PARALLELIZED)
     article_parts = [f"<h1>{title}</h1>"]
     
-    # Intro
-    print(f"  + Drafting Hook Intro...")
+    # Intro (Sequential - Sets the stage)
+    print(f"  + Drafting Hook Intro for {target_geo}...")
+    intro_words = max(150, target_length // (len(sections) + 1))
     intro_prompt = f"""
-    Write a compelling {words_per_section}-word intro for: '{title}'.
+    Write a compelling {intro_words}-word intro for: '{title}'.
+    REGION: {target_geo}
     
     AUDIENCE: {audience_context}
     STYLE: Clear, engaging, professional English. Use analogies for complex ideas.
     GOAL: {topic}
-    """
-    article_parts.append(f'<section class="intro">\n{unimodel.generate_content(intro_prompt).text.strip()}\n</section>')
     
-    for i, section in enumerate(sections):
-        print(f"  + Constructing Room {i+1}/{len(sections)}: {section['title']}...")
-        
-        # CONTEXT STITCHING
-        last_plain = strip_html_tags(article_parts[-1])
-        prev_context = ". ".join(last_plain.split(". ")[-3:]) if ". " in last_plain else last_plain[-150:]
+    OUTPUT: Return ONLY the content in semantic HTML (no markdown). Wrap paragraphs in <p>. Do NOT include <h1> or <h2> headers here.
+    """
+    article_parts.append(f'<section class="intro">\n{safe_generate_content(unimodel, intro_prompt)}\n</section>')
+    
+    # Define Worker Function for Parallel Processing
+    def generate_section(index, section, total_sections, previous_title):
+        print(f"  + [THREAD {index+1}] Drafting Room: {section['title']} (Region: {target_geo})...")
         
         instruction = section.get('writing_instruction', 'Explain this concept clearly.')
         
+        # Determine dynamic word count target
+        section_words = section.get('target_word_count')
+        if not section_words or not str(section_words).isdigit():
+            # Heuristic fallback: Divide remaining length among sections
+            remaining_length = target_length - intro_words
+            section_words = remaining_length // total_sections
+        else:
+            section_words = int(str(section_words).strip())
+            
+        # NOTE: In parallel mode, we rely on the Blueprint logic rather than the literal previous text.
         room_prompt = f"""
-        Write a {words_per_section}-word section for: "{title}".
+        Write a {section_words}-word section for: "{title}".
+        REGION: {target_geo}
         
-        CHAPTER: {section['title']}
+        CHAPTER {index+1}/{total_sections}: {section['title']}
         INSTRUCTION: {instruction}
-        TRANSITION FROM: "...{prev_context}"
+        CONTEXT: This section strictly follows the concept: "{previous_title}". Ensure logical continuity.
         
-        STRICT LIMIT: Stay under {words_per_section + 50} words.
-        
-        GLOBAL CONSTRAINT: Ensure professional but accessible English. Avoid jargon, but do not dumb down technical concepts. Define technical acronyms on first use (e.g., 'Payment Card Industry (PCI)').
+        STRICT LIMIT: Stay under {section_words + 50} words.
+        **MEAT-FIRST PROTOCOL**: Deliver core findings or high-density technical/systemic insights immediately in the first paragraph.
+        **SIMPLICITY MANDATE**: Use simple terms and descriptions. Avoid dense jargon; explain technical concepts using analogies that a non-specialist can grasp.
+        **TECHNICAL-EXTERNAL MAPPING**: Instruct the model to identify relevant external frameworks (regulatory, structural, or conceptual) and explicitly link technical solutions to those specific anchors.
+        **CONTEXTUAL SPECIFICITY**: Actively identify and expand on points of interest, debates, cultural markers, or specific real-world examples found in the research context.
         
         GROUNDING DATA: {context if is_grounded else "Internal Knowledge base"}
         
-        OUTPUT: Start with <h2>{section['title']}</h2> then the content.
+        OUTPUT: Start with <h2>{section['title']}</h2> then the content in semantic HTML (no markdown). Wrap paragraphs in <p>, use <ul>/<li> for lists, and `<pre><code class="language-...">` for code.
         """
-        room_content = unimodel.generate_content(room_prompt).text.strip()
-        article_parts.append(f'<section class="body-part">\n{room_content}\n</section>')
+        content = safe_generate_content(unimodel, room_prompt)
+        return index, f'<section class="body-part">\n{content}\n</section>'
+
+    # Execute Parallel Pool
+    print(f"  + Launching Parallel Construction Crew ({len(sections)} sections)...")
+    body_parts = [None] * len(sections) # Placeholder array
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_index = {}
+        for i, section in enumerate(sections):
+            # Determine "Previous Title" for context simulation
+            prev_title = "Introduction" if i == 0 else sections[i-1]['title']
+            future = executor.submit(generate_section, i, section, len(sections), prev_title)
+            future_to_index[future] = i
+            
+        for future in concurrent.futures.as_completed(future_to_index):
+            idx, content = future.result()
+            body_parts[idx] = content
+            print(f"  + [THREAD {idx+1}] Room Complete.")
+            
+    # Assembly
+    article_parts.extend(body_parts)
 
     # Conclusion
     print("  + Drafting Final Reflection...")
-    conc_prompt = f"Write a {words_per_section // 2}-word concluding thought (Sonnet style) for '{title}'. Audience: {audience_context}. Summary of key impact."
-    article_parts.append(f'<section class="conclusion">\n<h2>Final Reflection</h2>\n{unimodel.generate_content(conc_prompt).text.strip()}\n</section>')
+    conc_words = intro_words // 2
+    conc_prompt = f"""
+    Write a {conc_words}-word concluding thought for '{title}'. 
+    Audience: {audience_context}. 
+    Summary of key impact.
+    
+    OUTPUT: Return ONLY the content in semantic HTML (no markdown). Wrap paragraphs in <p>. Do NOT include a header.
+    """
+    article_parts.append(f'<section class="conclusion">\n<h2>Final Reflection</h2>\n{safe_generate_content(unimodel, conc_prompt)}\n</section>')
 
     # PHASE 3: Methodology
     print("  + Finalizing Methodology & Transparency...")
     if is_grounded:
+        # STRIP DEBRIS: Clean external metadata from grounding context before listing sources
         found_urls = list(set(re.findall(r'https?://[^\s<>"]+', str(context))))
-        source_text = ", ".join(found_urls[:5]) if found_urls else "Verified research sources."
+        # Filter for real article links, avoid ghost-api/image/internal artifacts
+        clean_urls = [u for u in found_urls if not any(x in u for x in ["ghost-api", "image", "google-adk", "localhost"])]
+        source_text = ", ".join(clean_urls[:5]) if clean_urls else "Verified research sources."
     else:
         source_text = "AEO Synthesis from Knowledge Base."
 
@@ -1612,7 +1774,7 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     methodology_text = f"""
     <section class="methodology">
     <h2>Methodology & Transparency</h2>
-    This {est_words}-word analysis was recursively architected for the 'Sonnet & Prose' publication.
+    This {est_words}-word analysis was recursively architected.
     Sources: {source_text}
     </section>
     """
@@ -1649,14 +1811,13 @@ def create_euphemistic_links(keyword_context, is_initial=True):
     CRITICAL SCHEMA: Exact keys: "then_concept", "now_concept", "link".
     Structure: {{ "interlinked_concepts": [ {{ "then_concept": "...", "now_concept": "...", "link": "..." }} ] }}
     """
-    response = unimodel.generate_content(prompt)
-    return extract_json(response.text)
+    return extract_json(safe_generate_content(unimodel, prompt))
 
 #16. The Proposal Critic and Refiner
 def critique_proposal(topic, current_proposal):
     global unimodel
     prompt = f"Review proposal for '{topic}': {json.dumps(current_proposal, indent=2)}. If excellent, respond: APPROVED. Else, provide concise feedback to improve 'Then vs Now' contrast."
-    return unimodel.generate_content(prompt).text.strip()
+    return safe_generate_content(unimodel, prompt)
 
 #17. The Proposal Refiner
 def refine_proposal(topic, current_proposal, critique):
@@ -1665,7 +1826,7 @@ def refine_proposal(topic, current_proposal, critique):
     REWRITE proposal. Topic: {topic}. Draft: {json.dumps(current_proposal)}. Critique: {critique}. 
     Preserve keys: 'then_concept', 'now_concept', 'link'. Ensure JSON format.
     """
-    return extract_json(unimodel.generate_content(prompt).text)
+    return extract_json(safe_generate_content(unimodel, prompt))
 
 # 18. Phase 1: Sales-to-Content Pipeline
 def process_sales_transcript(transcript_text, session_id=None):
@@ -1697,7 +1858,7 @@ def process_sales_transcript(transcript_text, session_id=None):
     """
     
     try:
-        objections_raw = specialist_model.generate_content(objection_prompt).text.strip()
+        objections_raw = safe_generate_content(specialist_model, objection_prompt)
         # Handle potential markdown wrapping
         if "```json" in objections_raw:
             objections_raw = objections_raw.split("```json")[1].split("```")[0].strip()
@@ -1740,7 +1901,7 @@ def process_sales_transcript(transcript_text, session_id=None):
     """
     
     
-    brief_raw = specialist_model.generate_content(brief_prompt).text.strip()
+    brief_raw = safe_generate_content(specialist_model, brief_prompt)
     brief_html = ensure_slack_compatibility(brief_raw)  # Convert **bold** to *bold*
     
     # Step 3: Normalize content for return (Auto-save REMOVED to align with approval logic)
@@ -1765,21 +1926,21 @@ def process_story_logic(request):
     now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n[MISSION START] {now_str} | Function: process_story_logic")
 
+    # 0.5 CORE SERVICES (Pre-flight init)
+    if any(m is None for m in [unimodel, flash_model, research_model, specialist_model]):
+        vertexai.init(project=PROJECT_ID, location=LOCATION)
+
     if unimodel is None:
         unimodel = UnifiedModel(MODEL_PROVIDER, MODEL_NAME)
     
     if flash_model is None:
-        # Initialize Vertex AI explicitly for the Flash Model (Triage)
-        vertexai.init(project=PROJECT_ID, location=LOCATION)
         flash_model = GenerativeModel(FLASH_MODEL_NAME, safety_settings=safety_settings)
 
     if research_model is None:
-        # Initialize Vertex AI explicitly for the Research Model (High Context)
-        vertexai.init(project=PROJECT_ID, location=LOCATION)
         research_model = UnifiedModel("vertex_ai", RESEARCH_MODEL_NAME)
         
     if specialist_model is None:
-        # Initialize Anthropic Specialist explicitly
+        # STRICT: User enforced Claude 3.5 Sonnet (using 4.5 alias as requested)
         specialist_model = UnifiedModel(provider="anthropic", model_name="claude-sonnet-4-5")
         
     if db is None:
@@ -1789,26 +1950,31 @@ def process_story_logic(request):
     if isinstance(req, list): req = req[0] # Add safety for n8n list payloads
     print(f"DEBUG: Story Worker received payload keys: {list(req.keys()) if req else 'None'}")
     
+    # --- SYSTEM FILTER: Prevent Infinite Loops ---
+    # Case: The message is a confirmation notification (e.g., from N8N/Ghost)
+    topic_text = req.get('topic', "").lower() or req.get('feedback_text', "").lower()
+    if "created in ghost" in topic_text or "ready for ghost" in topic_text:
+        print("🛑 SYSTEM FILTER: Ignoring Ghost/N8N status notification.")
+        return jsonify({"msg": "Status notification ignored"}), 200
+    
     # --- IDEMPOTENCY CHECK (Prevent Double-Trigger) ---
-    # Construct a unique event ID from the Slack Timestamp (which is unique to the message)
-    # Use request-provided ID if available, otherwise fallback to signature
+    # Construct a unique event ID from the Slack Timestamp
     slack_context = req.get('slack_context', {})
     unique_event_id = slack_context.get('ts') or req.get('event_ts') or req.get('client_msg_id')
     
+    # ADK FIX: Removed bypass for feedback loops. Slack provides unique 'ts' for every reply, so they MUST be deduced.
+    is_feedback_loop = bool(req.get('feedback_text'))
+    
     if unique_event_id:
-        # Check if we've already seen this event ID in the last 5 minutes
-        # We store processed events in a separate 'processed_requests' collection or within the session
-        # For simplicity and speed, we'll check a centralized deduplication log
+        # Check if we've already seen this event ID in the last 30 minutes
         dedup_ref = db.collection('processed_events').document(str(unique_event_id))
         doc = dedup_ref.get()
         if doc.exists:
-            # Check timestamp to allow re-runs after 5 minutes (for testing/dev)
+            # Check timestamp to allow re-runs after 5 minutes
             data = doc.to_dict()
             last_run = data.get('timestamp')
             
-            # Simple timezone-aware check
             if last_run:
-                # Firestore timestamps come back as datetime with tz
                 cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=5)
                 if last_run > cutoff:
                     print(f"🔒 IDEMPOTENCY: Skipping duplicate event {unique_event_id} (Processed < 5m ago)")
@@ -1816,9 +1982,9 @@ def process_story_logic(request):
                 else:
                     print(f"🔄 IDEMPOTENCY: Reprocessing old event {unique_event_id} (Age > 5m)")
             else:
-                 pass # No timestamp? Overwrite it.
+                 pass 
         
-        # Mark as pending immediately (TTL handled by expiration policy or ignored for now)
+        # Mark as pending immediately
         try:
             dedup_ref.set({
                 'timestamp': datetime.datetime.now(datetime.timezone.utc),
@@ -1864,7 +2030,10 @@ def process_story_logic(request):
         # Chronological order (Old -> New)
         query = events_ref.order_by('timestamp', direction=firestore.Query.ASCENDING)
         
-        history_events = [doc.to_dict() for doc in query.stream()]
+        # CLAMPING: Limit history to last 15 turns to prevent context bloat
+        # 30 matches (15 turns of User/Agent pairs)
+        all_events = [doc.to_dict() for doc in query.stream()]
+        history_events = all_events[-30:] if len(all_events) > 30 else all_events
 
 
     # RESTORED: Removed the MAX_HISTORY_EVENTS limit to preserve the full conversation thread.
@@ -1903,14 +2072,24 @@ def process_story_logic(request):
     mcp = get_mcp_client()
 
     # 1. Recover from history
+    processed_filenames = set() # To prevent redundant re-analysis
     if history_events:
         recovered_count = 0
+        unique_snippets = {} # Deduplication by filename
         for event in history_events:
             if event.get('event_type') == 'code_analysis' and event.get('analysis_result'):
-                code_analysis_snippets.append(event['analysis_result'])
+                fname = event.get('file_name', 'unknown')
+                unique_snippets[fname] = event['analysis_result']
+                processed_filenames.add(fname)
                 recovered_count += 1
+        
+        # CLAMPING: Take only last 5 unique snippets
+        sorted_keys = list(unique_snippets.keys())
+        for k in sorted_keys[-5:]:
+            code_analysis_snippets.append(unique_snippets[k])
+            
         if recovered_count > 0:
-            print(f"TELEMETRY: Recovered {recovered_count} code analysis results from thread history.")
+            print(f"TELEMETRY: Recovered {len(code_analysis_snippets)} unique code insights from history (Clamping: {recovered_count} -> {len(code_analysis_snippets)}).")
 
     # 2. Analyze New Files
     if code_files:
@@ -1918,6 +2097,12 @@ def process_story_logic(request):
         
         for file_info in code_files:
             file_name = file_info.get('name', 'unknown_file')
+            
+            # ADK FIX: Skip analysis if we already recovered it from history
+            if file_name in processed_filenames:
+                print(f"⏭️ Skipping re-analysis of {file_name} (Already in history)")
+                continue
+                
             file_url = file_info.get('url')
             file_id = file_info.get('id')
             file_mode = file_info.get('mode', 'hosted')
@@ -2014,8 +2199,13 @@ def process_story_logic(request):
                 *   *Example:* "Analyze the security layer of AP2 vs standard PCI-DSS." 
 
             9.  **OPERATIONAL_REFORMAT**: **The Efficiency Engine.** Select this for any structural command whose COMPLETE context is already available in the history.
-                *   *Triggers:* "Summarize our progress", "Create an outline from our discussion", "Reformat these points as bullets", "Make it more professional", "Convert this into a brief".
+                *   *Triggers:* "Summarize our progress", "Reformat these points as bullets", "Make it more professional", "Convert this into a brief".
                 *   *CRITICAL:* If the request is purely about structural formatting of existing knowledge, select this.
+                *   *EXCEPTION:* If the user says "Repurpose... for pSEO" or "Create a pSEO article", select **PSEO_ARTICLE**. 
+
+            10. **BLOG_OUTLINE**: **The Content Blueprint.** Select this for requests to create, repurpose, or draft a Blog Outline, Content Structure, or Strategy Document.
+                *   *Triggers:* "Repurpose the strategy into a proper blog outline", "Create an outline", "Develop a content structure", "Draft a plan".
+                *   *Rule:* If the user asks for a structural blueprint (not the full 2500 word article yet), pick this.
 
             ### NEGATIVE CONSTRAINTS (DO NOT CLASSIFY AS DEEP_DIVE IF):
             - The word "Outline" is present.
@@ -2034,7 +2224,7 @@ def process_story_logic(request):
         # --- EXECUTION: Triage Model Selection ---
         # Triage on the Command (sanitized_topic) but with history context
         # Use Flash Model for Speed/Cost Efficiency (Gemini 2.0 Flash)
-        intent = flash_model.generate_content(triage_prompt).text.strip()
+        intent = safe_generate_content(flash_model, triage_prompt)
         print(f"TELEMETRY: Triage V6.0 -> Intent classified as: [{intent}] for command: '{sanitized_topic[:50]}...'")
 
         # Initialize variables for the response
@@ -2071,7 +2261,7 @@ def process_story_logic(request):
             History:
             {history_text}
             """
-            reply_text = ensure_slack_compatibility(unimodel.generate_content(social_prompt).text.strip())
+            reply_text = ensure_slack_compatibility(safe_generate_content(unimodel, social_prompt))
             
             new_events.append({"event_type": "agent_reply", "text": reply_text})
             
@@ -2090,7 +2280,7 @@ def process_story_logic(request):
                 "type": "social",
                 "last_updated": expire_time
             })
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": reply_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=True, timeout=10)
+            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": reply_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=certifi.where(), timeout=10)
             return jsonify({"msg": "Social reply sent"}), 200
 
         # === PATH B: OPERATIONAL REFORMAT / FAST FOLLOW-UP (Fast Exit) ===
@@ -2101,10 +2291,10 @@ def process_story_logic(request):
             
             if has_substantive_history:
                 print(f"Executing Operational Reformat (Fast Exit) for command: {sanitized_topic[:50]}")
-                # Use natural answer generation with full context but NO research
+                # RESTORED: Use simpler natural answer generator to avoid persona-induced bloat
                 answer_data = generate_natural_answer(sanitized_topic, "COMPLETE_CONTEXT_IN_HISTORY", history=history_text)
                 answer_text = answer_data['text']
-                research_intent = answer_data['intent']
+                research_intent = answer_data.get('intent', "OPERATIONAL_REFORMAT")
                 
                 new_events.append({"event_type": "agent_answer", "text": answer_text, "intent": "OPERATIONAL_REFORMAT"})
                 
@@ -2135,6 +2325,38 @@ def process_story_logic(request):
                 print(f"OPERATIONAL_REFORMAT fallback: Insufficient grounding. Routing to Research Path.")
                 # Fall through to Path D (Work/Research)
                 pass
+
+        # === PATH CX: BLOG OUTLINE (High-Fidelity Structure) ===
+        elif intent == "BLOG_OUTLINE":
+            print(f"Executing Blog Outline generation for command: {sanitized_topic[:50]}")
+            # Use Comprehensive Content Strategist for outlines
+            answer_data = generate_comprehensive_answer(sanitized_topic, "BLOG_OUTLINE_MODE", history=history_text, context_topic=original_topic)
+            answer_text = answer_data['text']
+            
+            new_events.append({"event_type": "agent_answer", "text": answer_text, "intent": "BLOG_OUTLINE"})
+            
+            session_ref = db.collection('agent_sessions').document(session_id)
+            events_ref = session_ref.collection('events')
+            for event in new_events:
+                if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
+                events_ref.add(event)
+
+            session_ref.update({
+                "status": "completed",
+                "type": "work_answer",
+                "last_updated": expire_time
+            })
+            
+            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                "session_id": session_id, 
+                "type": "social", 
+                "message": answer_text, 
+                "intent": "BLOG_OUTLINE",
+                "channel_id": slack_context['channel'], 
+                "thread_ts": slack_context['ts'],
+                "is_initial_post": is_initial_post
+            }, verify=certifi.where(), timeout=15)
+            return jsonify({"msg": "Blog outline sent"}), 200
 
         # === PATH C: SALES TRANSCRIPT (Fast Exit) ===
         elif intent == "SALES_TRANSCRIPT" or req.get('type') == 'sales_transcript':
@@ -2228,7 +2450,7 @@ def process_story_logic(request):
         if images or urls:
             print(f"TELEMETRY: Media-Rich Request detected. Analyzing signals and grounding assets...")
             # We call find_trending_keywords to get Geo/Intent signals and analyze any direct images
-            r_result = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images, mission_topic=original_topic, session_metadata=session_data, initial_context=code_analysis_context)
+            r_result = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images, mission_topic=original_topic, session_metadata=session_data, initial_context=code_analysis_context, triage_intent=intent)
             
             # Merge context: URL scrapes (combined_context) + keyword/image insights (r_result)
             combined_context.extend(r_result['context'])
@@ -2242,7 +2464,7 @@ def process_story_logic(request):
         else:
             print(f"TELEMETRY: Keyword Mode detected. Launching Sensory Array Router...")
             # FIX: Pass code_analysis_context so the hub can see what we already know
-            r_result = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images, mission_topic=original_topic, session_metadata=session_data, initial_context=code_analysis_context)
+            r_result = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images, mission_topic=original_topic, session_metadata=session_data, initial_context=code_analysis_context, triage_intent=intent)
             research_data = r_result
             # Unified Merging: Base context (Code Analysis) + Novel Findings (r_result)
             research_data['context'] = code_analysis_context + r_result['context']
@@ -2250,7 +2472,7 @@ def process_story_logic(request):
             if "research_intent" not in research_data: research_data["research_intent"] = "KEYWORD_SENSORY"
         
         # --- METADATA EXTRACTION (Thread Memory Optimization) ---
-        final_geo = research_data.get("detected_geo", session_data.get("detected_geo", "Global"))
+        final_geo = research_data.get("detected_geo", session_data.get("detected_geo", DEFAULT_GEO))
         final_intent_key = "FORMAT_GENERAL"
         try:
             ri = research_data.get("research_intent", "")
@@ -2271,9 +2493,9 @@ def process_story_logic(request):
             if '"intent": "signal_block"' in meta_lower or '"intent": "violation"' in meta_lower:
                 is_blocked = True
             
-            # 2. Check for broad refusal keywords
-            refusal_keywords = ["cannot fulfill", "illegal", "refuse", "harm", "violence", "sensitive", "prohibited", "violate"]
-            if any(kw in meta_lower for kw in refusal_keywords):
+            # 2. Check for broad refusal keywords using word boundaries
+            refusal_keywords = [r"\bharm\b", r"\brefuse\b", r"\billegal\b", r"\bviolence\b", r"\bsensitive\b", r"\bprohibited\b", r"\bviolate\b"]
+            if any(re.search(kw, meta_lower) for kw in refusal_keywords):
                 is_blocked = True
 
         if is_blocked:
@@ -2321,7 +2543,10 @@ def process_story_logic(request):
 
         # 3. Generate Output based on Intent
         # UPGRADE: Handle structural intents (FORMAT_*) and provide a robust fallback
-        if intent in ["DIRECT_ANSWER", "SIMPLE_QUESTION"] or str(intent).startswith("FORMAT_"):
+        # UPGRADE: Handle structural intents (FORMAT_*) and provide a robust fallback
+        if intent in ["DIRECT_ANSWER", "SIMPLE_QUESTION", "BLOG_OUTLINE"] or str(intent).startswith("FORMAT_"):
+            if intent == "BLOG_OUTLINE": print(f"Executing Blog Outline generation for command: {clean_topic[:50]}")
+            
             # ROUTING CHANGE: use generate_natural_answer for fluid interactions
             answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text)
             answer_text = answer_data['text']
@@ -2362,10 +2587,10 @@ def process_story_logic(request):
             return jsonify({"msg": "Answer sent"}), 200
 
         elif intent == "DEEP_DIVE":
-            target_count = extract_target_word_count(sanitized_topic)
+            target_count = extract_target_word_count(sanitized_topic, history=history_text)
             print(f"TELEMETRY: Executing Dynamic Deep-Dive Recursive Expansion (Target: {target_count})...")
             # PASS THE sanitzied_topic as the DIRECTIVE to prioritize feedback
-            article_html = generate_deep_dive_article(sanitized_topic, research_data['context'], history=history_text, history_events=history_events, target_length=target_count)
+            article_html = generate_deep_dive_article(sanitized_topic, research_data['context'], history=history_text, history_events=history_events, target_length=target_count, target_geo=final_geo)
             
             # Use Claude for metadata even for deep dives
             seo_data = generate_seo_metadata(article_html, original_topic)
@@ -2407,9 +2632,8 @@ def process_story_logic(request):
 
         elif intent == "TOPIC_CLUSTER_PROPOSAL":
             try:
-                # Use sanitized_topic (Feedback) for priority cluster subject
                 cluster_data = generate_topic_cluster(sanitized_topic, research_data['context'], history=history_text, is_initial=is_initial_post)
-                if not cluster_data: raise ValueError("Failed to parse cluster JSON.")
+                if not cluster_data or "clusters" not in cluster_data: raise ValueError("Failed to parse valid cluster JSON.")
                 
                 new_events.append({
                     "event_type": "agent_proposal", 
@@ -2471,11 +2695,13 @@ def process_story_logic(request):
                 session_ref.update(update_data)
                 requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=certifi.where(), timeout=15)
                 return jsonify({"msg": "Cluster Fallback Answer sent"}), 200
-
         elif intent == "THEN_VS_NOW_PROPOSAL":
             try:
                 # FIX: Pass original_topic (Mission) for tool consistency
                 current_proposal = create_euphemistic_links({**research_data, "clean_topic": original_topic}, is_initial=is_initial_post)
+                if not current_proposal or "interlinked_concepts" not in current_proposal:
+                     raise ValueError("Failed to generate Then-vs-Now proposal.")
+                
                 approval_id = f"approval_{uuid.uuid4().hex[:8]}"
                 new_events.append({"event_type": "loop_draft", "iteration": 0, "proposal_data": current_proposal})
 
@@ -2483,7 +2709,12 @@ def process_story_logic(request):
                 while loop_count < MAX_LOOP_ITERATIONS:
                     critique = critique_proposal(original_topic, current_proposal)
                     if "APPROVED" in critique.upper(): break
-                    try: current_proposal = refine_proposal(original_topic, current_proposal, critique)
+                    try: 
+                         refined = refine_proposal(original_topic, current_proposal, critique)
+                         if refined and "interlinked_concepts" in refined:
+                              current_proposal = refined
+                         else:
+                              break
                     except Exception: break
                     loop_count += 1
 
@@ -2547,7 +2778,7 @@ def process_story_logic(request):
         elif intent == "PSEO_ARTICLE":
             try:
                 # 1. AGENT A (Gemini): Generate the Body Content (Prioritizing Latest Feedback)
-                article_html = generate_pseo_article(sanitized_topic, research_data['context'], history=history_text, history_events=history_events)
+                article_html = generate_pseo_article(sanitized_topic, research_data['context'], history=history_text, history_events=history_events, is_initial_post=is_initial_post)
                 
                 # 2. AGENT B (Claude): Generate the Semantic Metadata
                 seo_data = generate_seo_metadata(article_html, original_topic)
@@ -2579,12 +2810,12 @@ def process_story_logic(request):
                 if is_initial_post: update_data["topic"] = seo_data.get('title', clean_topic)
                 session_ref.update(update_data)
                 
-                # 5. Send STRUCTURED DATA to N8N
+                # 5. Send STRUCTURED DATA to N8N (Restored Wrapper for GhostNode Harmony)
                 requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
                     "session_id": session_id, 
                     "type": "pseo_draft", 
                     "payload": {
-                        "title": seo_data.get("title"),
+                        "title": seo_data.get("title", "Untitled Draft"),
                         "html": article_html,
                         "tags": seo_data.get("tags", []),
                         "custom_excerpt": seo_data.get("custom_excerpt"),
@@ -2677,11 +2908,30 @@ def process_story_logic(request):
 # --- FUNCTION: Ingest Knowledge ---
 @functions_framework.http
 def ingest_knowledge(request):
+    """
+    Ingests story data and solution briefs into the knowledge base.
+    Secured with API key authentication.
+    """
+    # Security check: Validate API key
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return jsonify({"error": "Missing or invalid Authorization header"}), 401
+    
+    provided_key = auth_header.replace('Bearer ', '')
+    if provided_key != INGESTION_API_KEY:
+        print(f"⚠️ Unauthorized access attempt from IP: {request.remote_addr}")
+        return jsonify({"error": "Invalid API key"}), 403
+
     global db, unimodel
     if db is None: db = firestore.Client(project=PROJECT_ID)
     vertexai.init(project=PROJECT_ID, location=LOCATION)
     embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
 
+    req = request.get_json(silent=True) or {}
+    session_id = req.get('session_id', 'unknown')
+    topic = req.get('topic', 'unknown')
+    final_story = req.get('story', '')
+    
     # Unified Ingestion Router (Determines destination collection)
     ingest_type = req.get('type', 'knowledge') # 'knowledge' or 'solution_brief'
     
@@ -2744,7 +2994,10 @@ def ingest_compliance_docs(request):
         return jsonify({"error": "Invalid API key"}), 403
     
     # Initialize clients
-    db = firestore.Client(project=PROJECT_ID)
+    global db
+    if db is None:
+        db = firestore.Client(project=PROJECT_ID)
+        
     vertexai.init(project=PROJECT_ID, location=LOCATION)
     embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
     
@@ -2762,23 +3015,12 @@ def ingest_compliance_docs(request):
     # Fetch PDF content via optimized MCP sensory hub (Hybrid HTML/PDF scraper)
     try:
         print(f"Fetching {doc_type} via Smart MCP Hub: {doc_url}")
-        mcp_endpoint = "https://mcp-sensory-server-gjkm6kxlea-uc.a.run.app/messages"
+        scrape_data = get_mcp_client().call("scrape_article", {"url": doc_url})
         
-        mcp_payload = {
-            "method": "tools/call",
-            "params": {
-                "name": "scrape_article",
-                "arguments": {"url": doc_url}
-            }
-        }
-        
-        mcp_response = requests.post(mcp_endpoint, json=mcp_payload, timeout=90) # Extended timeout for Gemini OCR
-        
-        if mcp_response.status_code != 200:
-            return jsonify({"error": f"MCP Hub Error ({mcp_response.status_code})", "details": mcp_response.text}), 500
+        if not scrape_data or "Error" in scrape_data:
+            return jsonify({"error": "MCP Hub Error", "details": scrape_data}), 500
             
-        mcp_data = mcp_response.json()
-        pdf_content = mcp_data.get("result", {}).get("content", [{}])[0].get("text", "")
+        pdf_content = scrape_data
         
         if not pdf_content or len(pdf_content) < 100:
             raise ValueError("Smart Hub failed to extract meaningful text")
