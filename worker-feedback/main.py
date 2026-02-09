@@ -78,7 +78,6 @@ N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL")
 STORY_WORKER_URL = os.environ.get("STORY_WORKER_URL") 
 QUEUE_NAME = "story-worker-queue"
 FUNCTION_IDENTITY_EMAIL = os.environ.get("FUNCTION_IDENTITY_EMAIL")
-# PROPOSAL_KEYWORDS = ["outline", "draft", "proposal", "story", "brief"]
 INGEST_KNOWLEDGE_URL = os.environ.get("INGEST_KNOWLEDGE_URL")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY") # Shared via secret manager if needed
 
@@ -88,6 +87,25 @@ db = None
 tasks_client = None
 secret_client = None
 logging_v_client = None
+
+# --- STYLE & SANITIZATION PROTOCOL (Global Constant) ---
+# This ensures 100% linguistic consistency across all generation paths
+# to prevent "Context Pollution" in long-running threads.
+STYLE_PROTOCOL = """
+### STYLE & SANITIZATION PROTOCOL (CRITICAL):
+- **MEAT-FIRST NARRATIVE**: BAN robotic framing and meta-commentary like "Short answer:", "Bottom line:", "In summary:", or "The takeaway is:". Start with the direct insight or data point.
+- **HUMAN FINGERPRINT**: Vary sentence length significantly. Mix short, punchy sentences (5-10 words) with longer, fluid reflections (20-35 words).
+- **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) for related clauses or parentheses ( ) for incidental technicals.
+- **COLON PROTOCOL (ZERO-TOLERANCE)**: EXCISE colons from narrative prose. Do not use them to connect claims to details. Use a period and a new sentence, or "Specifically" / "Markedly". Colons are for vertical bulleted lists ONLY. MANDATE: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED.
+- **LEXICAL VARIETY (ANTI-CLUMPING)**: PROHIBIT repeating the same key noun or verb within the same or adjacent sentences. Use human-centric rephrasing:
+    - *Robotic:* "AI integration carries integration costs."
+    - *Human:* "AI deployment entails significant overhead" or "AI rollouts demand substantial engineering spend."
+- **ZERO-PASSIVE VOICE**: PROHIBIT passive voice structures (e.g., "was broken by"). MANDATE active voice where the subject performs the action (e.g., "The storm broke the window," "CBN reports").
+- **ACTIVE VERB MANDATE**: Replace weak verbs ("is," "has," "carries") with descriptive ones ("catalyzes," "stems," "triggers," "bankrolls").
+- **ANTI-WATERMARK**: BAN robotic buzzwords: 'delve', 'tapestry', 'landscape', 'unlock', 'embark', 'comprehensive', 'robust'. 
+- **TACTICAL TRANSITIONS**: BAN robotic connectors like "Furthermore," "Moreover," or "Additionally." Use "Albeit," "Inasmuch as," "By the same token," or "Markedly."
+- **GRITTY REALISM**: Mention operational friction, specific implementation costs, or localized hurdles. Stop hedging; be decisive.
+"""
 
 # --- Utils ---
 def extract_json(text):
@@ -204,10 +222,20 @@ def dispatch_task(payload, target_url):
 
 def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None):
     if not tool_confirmation or not tool_confirmation.get("confirmed"): raise PermissionError("Wait for approval.")
-    return safe_generate_content(unimodel, f"Tell a 'Then and Now' story using: {interlinked_concepts}")
+    return safe_generate_content(unimodel, f"{STYLE_PROTOCOL}\nTASK: Tell a 'Then and Now' story using these concepts: {interlinked_concepts}")
 
 def refine_proposal(topic, current_proposal, critique):
-    raw_text = safe_generate_content(unimodel, f"REWRITE proposal... Draft: {json.dumps(current_proposal)}...")
+    prompt = f"""
+    REWRITE the following content proposal blueprint based on the user's critique.
+    CRITIQUE: {critique}
+    
+    CURRENT PROPOSAL: {json.dumps(current_proposal)}
+    
+    Return ONLY a valid JSON object matching the input structure.
+    
+    {STYLE_PROTOCOL}
+    """
+    raw_text = safe_generate_content(unimodel, prompt)
     return extract_json(raw_text)
 
 # --- THE STATEFUL AND HARDENED FEEDBACK WORKER ---

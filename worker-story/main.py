@@ -33,7 +33,6 @@ except Exception:
     logging_v_client = None # Fallback to standard logging if local
 
 # --- Configuration ---
-# --- Configuration ---
 try:
     _, project_id_auth = google.auth.default()
     PROJECT_ID = os.environ.get("PROJECT_ID", project_id_auth)
@@ -73,6 +72,26 @@ search_api_key = None
 db = None
 mcp_client = None
 secret_client = None
+
+# --- STYLE & SANITIZATION PROTOCOL (Global Constant) ---
+# This ensures 100% linguistic consistency across all generation paths
+# to prevent "Context Pollution" in long-running threads.
+STYLE_PROTOCOL = """
+### STYLE & SANITIZATION PROTOCOL (CRITICAL):
+- **MEAT-FIRST NARRATIVE**: BAN robotic framing and meta-commentary like "Short answer:", "Bottom line:", "In summary:", or "The takeaway is:". Start with the direct insight or data point.
+- **HUMAN FINGERPRINT**: Vary sentence length significantly. Mix short, punchy sentences (5-10 words) with longer, fluid reflections (20-35 words).
+- **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) for related clauses or parentheses ( ) for incidental technicals.
+- **COLON PROTOCOL (ZERO-TOLERANCE)**: EXCISE colons from narrative prose. Do not use them to connect claims to details. Use a period and a new sentence, or "Specifically" / "Markedly". Colons are for vertical bulleted lists ONLY. MANDATE: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED.
+- **LEXICAL VARIETY (ANTI-CLUMPING)**: PROHIBIT repeating the same key noun or verb within the same or adjacent sentences. Use human-centric rephrasing:
+    - *Robotic:* "AI integration carries integration costs."
+    - *Human:* "AI deployment entails significant overhead" or "AI rollouts demand substantial engineering spend."
+- **ZERO-PASSIVE VOICE**: PROHIBIT passive voice structures (e.g., "was broken by"). MANDATE active voice where the subject performs the action (e.g., "The storm broke the window," "CBN reports").
+- **ACTIVE VERB MANDATE**: Replace weak verbs ("is," "has," "carries") with descriptive ones ("catalyzes," "stems," "triggers," "bankrolls").
+- **ANTI-WATERMARK**: BAN robotic buzzwords: 'delve', 'tapestry', 'landscape', 'unlock', 'embark', 'comprehensive', 'robust'. 
+- **NO COLON CLUMPING**: Do not use "Label: Definition" or "Why: Reason" structures. Use active, descriptive verbs and narrative flow.
+- **TACTICAL TRANSITIONS**: BAN robotic connectors like "Furthermore," "Moreover," or "Additionally." Use "Albeit," "Inasmuch as," "By the same token," or "Markedly."
+- **GRITTY REALISM**: Mention operational friction, specific implementation costs, or localized hurdles where applicable. Stop hedging; be decisive.
+"""
 
 # --- SECRET MANAGER ---
 def get_secret(secret_id):
@@ -1091,6 +1110,8 @@ def generate_topic_cluster(topic, context, history="", is_initial=True):
     1. If this is a REVISION (is_initial=False), you MAY start with a header like ":robot_face: The proposal has been REVISED" or similar context-aware greetings if appropriate.
     2. If this is an INITIAL proposal, be structured and authoritative.
     3. Ensure the output is strictly valid JSON for extraction.
+    
+    {STYLE_PROTOCOL}
 
     JSON SCHEMA:
     {{
@@ -1286,6 +1307,8 @@ def generate_natural_answer(topic, context, history=""):
     Answer naturally and conversationally. 
     Use the GROUNDING DATA to ensure accuracy.
     
+    {STYLE_PROTOCOL}
+    
     ### MULTI-NICHE AUDIT PROTOCOL:
     1. **Signal Sifting**: Carefully examine the entire GROUNDING DATA for signals matching the user's specific sub-topic (e.g., 'Politics', 'Education', 'Law').
     2. **Avoid "Sports Blindness"**: High-volume categories like 'Sports' often dominate trend feeds. You must look past global volume to find signals that relate to the user's specific query. 
@@ -1324,7 +1347,7 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     Standardizes the logic for generating a direct answer.
     Uses 'detect_research_intent' signal to adjust formatting (Tables/Lists).
     """
-    global model, unimodel, research_model
+    global unimodel, research_model
     print(f"DEBUG: generate_comprehensive_answer starting... [Topic: {topic[:50]}]")
     
     # --- ROUTING LOGIC: Context Size Check ---
@@ -1391,6 +1414,8 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     
     ### FORMATTING GUIDANCE:
     {intent_instruction}
+    
+    {STYLE_PROTOCOL}
     
     ### CRITICAL RULES:
     1. Generate a response that directly addresses the LATEST INSTRUCTION while using the GROUNDING DATA as supporting evidence.
@@ -1572,7 +1597,27 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     
     TONE & STYLE:
     {tone_instruction}
+    - **MEAT-FIRST PROTOCOL**: BAN meta-commentary like "Short answer:", "Bottom line:", or "In summary:". Start the first paragraph with direct, high-density technical findings or narrative meat.
     - **SIMPLICITY PROTOCOL**: Use simple, accessible terminology. Explain complex concepts using plain English analogies. Avoid academic or overly dense jargon.
+    - **COLON PROTOCOL (ZERO-TOLERANCE)**: EXCISE colons from narrative prose. Do not use them to connect claims to details. Use a period and a new sentence, or "Specifically" / "Markedly". Colons are for vertical bulleted lists ONLY. MANDATE: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED.
+    - **LEXICAL VARIETY (ANTI-CLUMPING)**: PROHIBIT repeating the same key noun or verb within the same or adjacent sentences. Use human-centric rephrasing:
+        - *Robotic:* "AI integration carries integration costs."
+        - *Human:* "AI deployment entails significant overhead" or "AI rollouts demand substantial engineering spend."
+    - **ZERO-PASSIVE VOICE**: PROHIBIT passive voice. MANDATE active voice (e.g., "CBN reports" instead of "It is reported that").
+        - **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Favor semicolons (;) for related clauses or parentheses ( ) for incidental texture. 
+        - **Punctuation Diversity**: Use varied punctuation to create a natural, human rhythm.
+        - **Rhythmic Variance**: Mix short, punchy sentences (5-10 words) with longer, fluid reflections (20-35 words). Avoid medium-length homogeneity.
+        - **Syntactic Naturalness**: PROHIBIT "Colon Clumping" (robotic `Label: list` or `Term: definition` structures) in inline text; integrate these into flowing prose.
+    - **TACTICAL TRANSITION PROTOCOL**: BAN robotic transitions like "Firstly," "Furthermore," and "Moreover." Use high-value narrative connectors:
+        - *Opposition*: "Be that as it may," "albeit," "notwithstanding."
+        - *Addition*: "By the same token," "coupled with," "uniquely."
+        - *Emphasis*: "Important to realize," "markedly," "chiefly."
+        - *Effect*: "Forthwith," "accordingly," "henceforth."
+        - *Logic*: "Inasmuch as," "seeing that," "with this intention."
+    - **TEXTURE & OPINION PROTOCOL (ANTI-WATERMARK)**:
+        - **Lexical Pruning**: BAN high-frequency AI buzzwords: *delve, tapestry, landscape, unleash, empower, robust, seamlessly, multifaceted, unlock*.
+        - **Gritty Realism**: Mandate the mention of "friction points," "operational costs," or "implementation hurdles" to counter AI's default optimism.
+        - **Hedge Removal**: PROHIBIT non-committal phrasing like "it is worth noting," "it could be argued," or "generally speaking." Use direct, assertive claims.
     
     STRUCTURE REQUIREMENTS (Strict HTML):
     1.  **<section class="intro">**: A compelling hook. **MEAT-FIRST**: Deliver core findings or high-density technical insights immediately in the first paragraph.
@@ -1630,6 +1675,11 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     - **IF DETECTED**: Apply that style to the writing instructions below.
     - **IF SILENT**: Use the DEFAULT STYLE: "Clear, engaging, professional English. Use analogies to explain complex ideas, but maintain technical accuracy."
     
+    ### PROTOCOL:
+    - **HUMAN FINGERPRINT**: Mandate punctuation diversity (semicolons/parentheses).
+    - **ANTI-WATERMARK**: Ban buzzwords (delve, tapestry, robust).
+    - **GRITTY REALISM**: Mandate the mention of "operational friction" or "localized hurdles."
+    
     ### STEP 3: BLUEPRINT GENERATION
     Design the optimal structure.
     - **Sections**: Create between 3 and 8 H2 sections depending on the complexity of the topic.
@@ -1639,6 +1689,7 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     - **Contextual Root Cause Analysis**: Mandate exploration of the systemic factors behind the topic's core challenges in the architecture.
     - **Solution Framing**: Explicitly frame provided technical concepts or solutions as context-sensitive measures.
     - **Relevant Technical States**: Highlight specific system states (e.g., approval, failure, transitions) that are most critical to the current context.
+    - **Asymmetric Weighting**: DO NOT be perfectly balanced. Prioritize the most critical technical finding and spend 70% of the architecture there.
     - **Flow**: Ensure a logical narrative arc.
     
     AUDIENCE: {audience_context}
@@ -1681,6 +1732,15 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     
     AUDIENCE: {audience_context}
     STYLE: Clear, engaging, professional English. Use analogies for complex ideas.
+    **MEAT-FIRST PROTOCOL**: BAN meta-commentary like "Short answer:", "Bottom line:", or "In summary:". Start the first paragraph with direct, high-density technical findings or narrative meat.
+    **COLON PROTOCOL (ZERO-TOLERANCE)**: EXCISE colons from narrative prose. Use periods and new sentences. Colons are for bulleted lists ONLY. MANDATE: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED.
+    **LEXICAL VARIETY (ANTI-CLUMPING)**: PROHIBIT repeating the same key noun or verb within the same or adjacent sentences. Use human-centric rephrasing (e.g., "overhead" instead of repeated "costs").
+    **ZERO-PASSIVE VOICE**: PROHIBIT passive voice. MANDATE active voice throughout.
+        - **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Favor semicolons (;) or parentheses ( ).
+        - **Punctuation Diversity**: Use semicolons/parentheses. Limit long dashes.
+        - **Rhythmic Variance**: Vary sentence length significantly.
+        - **Tactical Transitions**: Use "Albeit," "Inasmuch as," or "Markedly" instead of "Additionally/Furthermore."
+    **TEXTURE & OPINION**: Ban AI buzzwords (delve, tapestry, robust). Mandate "Gritty Realism" (costs/hurdles). Avoid hedging.
     GOAL: {topic}
     
     OUTPUT: Return ONLY the content in semantic HTML (no markdown). Wrap paragraphs in <p>. Do NOT include <h1> or <h2> headers here.
@@ -1712,8 +1772,17 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
         CONTEXT: This section strictly follows the concept: "{previous_title}". Ensure logical continuity.
         
         STRICT LIMIT: Stay under {section_words + 50} words.
-        **MEAT-FIRST PROTOCOL**: Deliver core findings or high-density technical/systemic insights immediately in the first paragraph.
+        **MEAT-FIRST PROTOCOL**: BAN meta-commentary like "Short answer:", "Bottom line:", or "In summary:". Start the first paragraph with direct, high-density technical findings or narrative meat.
         **SIMPLICITY MANDATE**: Use simple terms and descriptions. Avoid dense jargon; explain technical concepts using analogies that a non-specialist can grasp.
+        **COLON PROTOCOL (ZERO-TOLERANCE)**: EXCISE colons from all paragraph prose. Use "Specifically" or "Notably" instead. Colons are reserved for vertical lists ONLY. MANDATE: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED.
+        **LEXICAL VARIETY (ANTI-CLUMPING)**: PROHIBIT repeating the same key noun or verb within the same or adjacent sentences. Use human-centric rephrasing (e.g., replacing "integration costs" with "deployment overhead").
+        **ZERO-PASSIVE VOICE**: PROHIBIT passive voice. MANDATE active voice (e.g., "Investors chose winners" instead of "Winners were chosen by investors").
+            - **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Favor semicolons (;) or periods (.).
+            - **Rhythmic Variance**: Vary sentence length. Combine short, assertive claims with longer explanatory clauses.
+            - **Punctuation Policy**: Lean on semicolons for complexity.
+            - **No Colon Clumping**: Do not use colons to introduce inline definitions. Use active verbs instead.
+            - **Tactical Transitions**: BAN robotic transitions. Use connectors like "By the same token," "coupled with," or "notwithstanding."
+        **TEXTURE & OPINION**: BAN AI buzzwords (delve, landscape, robust, unlock). Enforce "Gritty Realism" (operational costs, friction). Strip non-committal hedging.
         **TECHNICAL-EXTERNAL MAPPING**: Instruct the model to identify relevant external frameworks (regulatory, structural, or conceptual) and explicitly link technical solutions to those specific anchors.
         **CONTEXTUAL SPECIFICITY**: Actively identify and expand on points of interest, debates, cultural markers, or specific real-world examples found in the research context.
         
@@ -1825,11 +1894,13 @@ def refine_proposal(topic, current_proposal, critique):
     prompt = f"""
     REWRITE proposal. Topic: {topic}. Draft: {json.dumps(current_proposal)}. Critique: {critique}. 
     Preserve keys: 'then_concept', 'now_concept', 'link'. Ensure JSON format.
+    
+    {STYLE_PROTOCOL}
     """
     return extract_json(safe_generate_content(unimodel, prompt))
 
 # 18. Phase 1: Sales-to-Content Pipeline
-def process_sales_transcript(transcript_text, session_id=None):
+def process_sales_transcript(transcript_text):
     """
     Extracts customer objections and generates solution brief.
     """
@@ -1892,6 +1963,8 @@ def process_sales_transcript(transcript_text, session_id=None):
     ## Competitive Advantages
     ## Implementation Timeline
     ## ROI Projection
+    
+    {STYLE_PROTOCOL}
     
     ### FORMATTING RULES:
     1. Use **bold** for emphasis.
@@ -1962,9 +2035,6 @@ def process_story_logic(request):
     slack_context = req.get('slack_context', {})
     unique_event_id = slack_context.get('ts') or req.get('event_ts') or req.get('client_msg_id')
     
-    # ADK FIX: Removed bypass for feedback loops. Slack provides unique 'ts' for every reply, so they MUST be deduced.
-    is_feedback_loop = bool(req.get('feedback_text'))
-    
     if unique_event_id:
         # Check if we've already seen this event ID in the last 30 minutes
         dedup_ref = db.collection('processed_events').document(str(unique_event_id))
@@ -1999,8 +2069,8 @@ def process_story_logic(request):
     images = req.get('images', [])
     code_files = req.get('code_files', []) # ADD: Extract code_files
     
-    # Use the Slack-mimicking logic: if there's no thread_ts AND no feedback_text, it's the root message (initial).
-    is_initial_post = not slack_context.get('thread_ts') and not feedback_text
+    # Use the Slack-mimicking logic: if there's no thread_ts OR thread_ts == ts, AND no feedback_text, it's the root message (initial).
+    is_initial_post = (not slack_context.get('thread_ts') or slack_context.get('thread_ts') == slack_context.get('ts')) and not feedback_text
     print(f"DEBUG: Thread State -> is_initial_post: {is_initial_post} (ts: {slack_context.get('ts')}, thread_ts: {slack_context.get('thread_ts')})")
     
     # --- STEP 1: PERCEPTION (Sanitize Input) ---
@@ -2363,7 +2433,7 @@ def process_story_logic(request):
             print("Executing Sales Transcript Processing (Fast Exit)")
             transcript_text = req.get('transcript', sanitized_topic)
             
-            result = process_sales_transcript(transcript_text, session_id=session_id)
+            result = process_sales_transcript(transcript_text)
             
             # SUCCESS: Log the event to subcollection for Feedback Worker retrieval
             ts = datetime.datetime.now(datetime.timezone.utc)
@@ -2489,14 +2559,38 @@ def process_story_logic(request):
         
         if isinstance(intent_metadata, str):
             meta_lower = intent_metadata.lower()
-            # 1. Check for the new explicit SIGNAL_BLOCK or legacy VIOLATION intent
-            if '"intent": "signal_block"' in meta_lower or '"intent": "violation"' in meta_lower:
-                is_blocked = True
             
-            # 2. Check for broad refusal keywords using word boundaries
-            refusal_keywords = [r"\bharm\b", r"\brefuse\b", r"\billegal\b", r"\bviolence\b", r"\bsensitive\b", r"\bprohibited\b", r"\bviolate\b"]
-            if any(re.search(kw, meta_lower) for kw in refusal_keywords):
-                is_blocked = True
+            # --- STRUCTURAL SAFETY AUDIT ---
+            # Try to parse the metadata to isolate the AI's "rationale" (which should be safe)
+            try:
+                meta_obj = json.loads(intent_metadata)
+                intent_val = str(meta_obj.get("intent", "")).lower()
+                rationale_val = str(meta_obj.get("rationale", "")).lower()
+                
+                # 1. Check for explicit signals in the intent field
+                if "signal_block" in intent_val or "violation" in intent_val:
+                    is_blocked = True
+                
+                # 2. Check for keywords in the structure EXCEPT for the rationale
+                # We build a 'vetting_string' that includes everything but the AI's thinking
+                vetting_parts = [intent_val]
+                for k, v in meta_obj.items():
+                    if k != "rationale" and k != "intent":
+                        vetting_parts.append(str(v).lower())
+                
+                vetting_string = " ".join(vetting_parts)
+                refusal_keywords = [r"\bharm\b", r"\brefuse\b", r"\billegal\b", r"\bviolence\b", r"\bsensitive\b", r"\bprohibited\b", r"\bviolate\b"]
+                if any(re.search(kw, vetting_string) for kw in refusal_keywords):
+                    is_blocked = True
+                    
+            except Exception:
+                # Fallback to legacy string-match if JSON is malformed (raw refusal)
+                if '"intent": "signal_block"' in meta_lower or '"intent": "violation"' in meta_lower:
+                    is_blocked = True
+                
+                refusal_keywords = [r"\bharm\b", r"\brefuse\b", r"\billegal\b", r"\bviolence\b", r"\bsensitive\b", r"\bprohibited\b", r"\bviolate\b"]
+                if any(re.search(kw, meta_lower) for kw in refusal_keywords):
+                    is_blocked = True
 
         if is_blocked:
             print(f"🛑 Safety Kill Switch activated: {intent_metadata}")
