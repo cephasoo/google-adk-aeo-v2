@@ -565,7 +565,18 @@ def handle_tool_call(name, arguments):
         query = arguments.get("query")
         if not query: return "Error: Missing query."
         geo = arguments.get("geo", DEFAULT_GEO)
-        params = {"api_key": SERPAPI_API_KEY, "engine": "google_trends", "q": query, "geo": geo, "data_type": "TIMESERIES", "date": "today 12-m"}
+        date_label = arguments.get("date", "12 Months")
+        
+        # Mapping for human-friendly timeframes
+        date_map = {
+            "Today": "now 1-d",
+            "7 Days": "now 7-d",
+            "30 Days": "today 1-m",
+            "12 Months": "today 12-m"
+        }
+        date_code = date_map.get(date_label, "today 12-m")
+        
+        params = {"api_key": SERPAPI_API_KEY, "engine": "google_trends", "q": query, "geo": geo, "data_type": "TIMESERIES", "date": date_code}
         results = GoogleSearch(params).get_dict()
         result = json.dumps(results, indent=2)[:5000]
 

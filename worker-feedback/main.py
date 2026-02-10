@@ -13,6 +13,8 @@ import requests
 from google.cloud import firestore, tasks_v2, secretmanager, logging as cloud_logging
 import time
 import random
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # --- UNIFIED MODEL ADAPTER (The Brain Switch) ---
 class UnifiedModel:
@@ -75,6 +77,54 @@ PROJECT_ID = os.environ.get("PROJECT_ID")
 LOCATION = os.environ.get("LOCATION")
 MODEL_NAME = os.environ.get("MODEL_NAME")
 N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL") 
+
+# --- HELPER: Safe n8n Webhook Delivery ---
+def safe_n8n_delivery(payload, timeout=45):
+    """
+    Robust delivery to n8n with retries and SSL resilience.
+    Uses 'requests' with an HTTPAdapter for exponential backoff on transient errors.
+    """
+    if not N8N_PROPOSAL_WEBHOOK_URL:
+        print("⚠️ safe_n8n_delivery: No webhook URL configured.")
+        return False
+
+    session = requests.Session()
+    # Retry on specific status codes and connection errors
+    # backoff_factor 2 means waits 2, 4, 8 seconds
+    retries = Retry(
+        total=3, 
+        backoff_factor=2, 
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["POST"]
+    )
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+    
+    try:
+        print(f"DEBUG: Attempting safe_n8n_delivery [Session: {payload.get('session_id')}]")
+        response = session.post(
+            N8N_PROPOSAL_WEBHOOK_URL, 
+            json=payload, 
+            verify=certifi.where(), 
+            timeout=timeout
+        )
+        response.raise_for_status()
+        print(f"✅ safe_n8n_delivery: Success (200 OK)")
+        return True
+    except requests.exceptions.SSLError as e:
+        print(f"❌ safe_n8n_delivery: SSL Handshake Failed: {e}")
+        # Final emergency attempt without strict session pooling
+        try:
+            time.sleep(2)
+            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json=payload, verify=certifi.where(), timeout=timeout)
+            return True
+        except Exception as inner_e:
+            print(f"❌ safe_n8n_delivery: Emergency fallback also failed: {inner_e}")
+            return False
+    except Exception as e:
+        print(f"⚠️ safe_n8n_delivery: Payload delivery failed: {e}")
+        return False
+
+
 STORY_WORKER_URL = os.environ.get("STORY_WORKER_URL") 
 QUEUE_NAME = "story-worker-queue"
 FUNCTION_IDENTITY_EMAIL = os.environ.get("FUNCTION_IDENTITY_EMAIL")
@@ -92,20 +142,68 @@ logging_v_client = None
 # This ensures 100% linguistic consistency across all generation paths
 # to prevent "Context Pollution" in long-running threads.
 STYLE_PROTOCOL = """
-### STYLE & SANITIZATION PROTOCOL (CRITICAL):
-- **MEAT-FIRST NARRATIVE**: BAN robotic framing and meta-commentary like "Short answer:", "Bottom line:", "In summary:", or "The takeaway is:". Start with the direct insight or data point.
-- **HUMAN FINGERPRINT**: Vary sentence length significantly. Mix short, punchy sentences (5-10 words) with longer, fluid reflections (20-35 words).
-- **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) for related clauses or parentheses ( ) for incidental technicals.
-- **COLON PROTOCOL (ZERO-TOLERANCE)**: EXCISE colons from narrative prose. Do not use them to connect claims to details. Use a period and a new sentence, or "Specifically" / "Markedly". Colons are for vertical bulleted lists ONLY. MANDATE: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED.
-- **LEXICAL VARIETY (ANTI-CLUMPING)**: PROHIBIT repeating the same key noun or verb within the same or adjacent sentences. Use human-centric rephrasing:
-    - *Robotic:* "AI integration carries integration costs."
-    - *Human:* "AI deployment entails significant overhead" or "AI rollouts demand substantial engineering spend."
-- **ZERO-PASSIVE VOICE**: PROHIBIT passive voice structures (e.g., "was broken by"). MANDATE active voice where the subject performs the action (e.g., "The storm broke the window," "CBN reports").
-- **ACTIVE VERB MANDATE**: Replace weak verbs ("is," "has," "carries") with descriptive ones ("catalyzes," "stems," "triggers," "bankrolls").
+### STYLE & SANITIZATION PROTOCOL (ZERO-TOLERANCE):
+- **MEAT-FIRST NARRATIVE**: BAN robotic framing like "Short answer:", "Bottom line:", or "The takeaway is:". Start with direct data.
+- **HUMAN FINGERPRINT**: Vary sentence length. Mix punchy sentences (5-10 words) with fluid reflections (20-35 words).
+- **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) or parentheses ( ).
+- **NARRATIVE COLON BAN**: PROHIBIT colons in prose to connect claims to details. Use a period and a new sentence, or descriptive transitions. 
+- **COLON PROTOCOL (LISTS ONLY)**: Colons are for vertical bulleted lists ONLY. 
+- **MANDATORY CAPITALIZATION**: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED. Absolutely PROHIBIT "Label: lowercase" patterns.
+- **LEXICAL VARIETY (ANTI-CLUMPING)**: MANDATE categorical rotation. PROHIBIT repeating the same key noun/verb in adjacent sentences.
+- **ACTIVE VERB PRIORITY**: PRIORITIZE descriptive, context-aware actions. Use the provided Dynamic Palette as mentors.
+- **ZERO-PASSIVE VOICE**: PRIORITIZE active voice to drive narrative momentum.
 - **ANTI-WATERMARK**: BAN robotic buzzwords: 'delve', 'tapestry', 'landscape', 'unlock', 'embark', 'comprehensive', 'robust'. 
-- **TACTICAL TRANSITIONS**: BAN robotic connectors like "Furthermore," "Moreover," or "Additionally." Use "Albeit," "Inasmuch as," "By the same token," or "Markedly."
-- **GRITTY REALISM**: Mention operational friction, specific implementation costs, or localized hurdles. Stop hedging; be decisive.
+- **NO COLON CLUMPING**: Do not use "Label: Definition" structures. Use active, descriptive narrative flow.
+- **TACTICAL TRANSITIONS**: BAN robotic connectors like "Furthermore" or "Moreover." Use the provided Dynamic Palette to maintain narrative "drag."
+- **MERMAID MODULARITY**: For complex architectures, FAVOR multiple modular diagrams (e.g., Phase 1 vs Phase 2) over a single dense block. This ensures high-fidelity readability and prevents transport failures (Slack 3k URL limit).
 """
+
+# --- HELPER: Dynamic Linguistic Palette ---
+def get_stylistic_mentors(session_id=None):
+    """
+    Dynamically retrieves randomized stylistic mentors from the shared linguistic palette.
+    """
+    import hashlib
+    import random
+    
+    paths_to_try = [
+        os.path.join(os.path.dirname(__file__), "..", "shared", "linguistic_palette.json"),
+        os.path.join(os.path.dirname(__file__), "shared", "linguistic_palette.json"),
+        os.path.join(os.path.dirname(__file__), "linguistic_palette.json")
+    ]
+    
+    palette_path = next((p for p in paths_to_try if os.path.exists(p)), None)
+    
+    try:
+        if not palette_path: return ""
+        with open(palette_path, 'r') as f:
+            palette = json.load(f)
+            
+        if session_id:
+            seed_val = int(hashlib.md5(session_id.encode()).hexdigest(), 16) % (10**8)
+            rng = random.Random(seed_val)
+        else:
+            rng = random.Random()
+            
+        mentors = []
+        categories = palette.get("transitions", {})
+        key_categories = ["opposition_limitation_contradiction", "cause_condition_purpose", "examples_support_emphasis", "agreement_addition_similarity"]
+        
+        for cat in key_categories:
+            words = categories.get(cat, [])
+            if words:
+                sample = rng.sample(words, min(3, len(words)))
+                mentors.append(f"- {cat.replace('_', ' ').title()}: {', '.join(sample)}")
+            
+        verbs = palette.get("verbs", {}).get("active_mentors", [])
+        if verbs:
+            sample_verbs = rng.sample(verbs, min(6, len(verbs)))
+            mentors.append(f"- Active Verb Mentors: {', '.join(sample_verbs)}")
+            
+        return "\n### DYNAMIC STYLE PALETTE (TURN MENTORS):\nREQUIRED: Use at least two (2) words from the mentors below to maintain linguistic texture.\n" + "\n".join(mentors)
+    except Exception as e:
+        print(f"⚠️ get_stylistic_mentors error: {e}")
+        return ""
 
 # --- Utils ---
 def extract_json(text):
@@ -220,11 +318,13 @@ def dispatch_task(payload, target_url):
     }
     tasks_client.create_task(request={"parent": parent, "task": task})
 
-def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None):
+def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None, session_id=None):
     if not tool_confirmation or not tool_confirmation.get("confirmed"): raise PermissionError("Wait for approval.")
-    return safe_generate_content(unimodel, f"{STYLE_PROTOCOL}\nTASK: Tell a 'Then and Now' story using these concepts: {interlinked_concepts}")
+    style_mentors = get_stylistic_mentors(session_id)
+    return safe_generate_content(unimodel, f"{STYLE_PROTOCOL}\n{style_mentors}\nTASK: Tell a 'Then and Now' story using these concepts: {interlinked_concepts}")
 
-def refine_proposal(topic, current_proposal, critique):
+def refine_proposal(topic, current_proposal, critique, session_id=None):
+    style_mentors = get_stylistic_mentors(session_id)
     prompt = f"""
     REWRITE the following content proposal blueprint based on the user's critique.
     CRITIQUE: {critique}
@@ -234,6 +334,7 @@ def refine_proposal(topic, current_proposal, critique):
     Return ONLY a valid JSON object matching the input structure.
     
     {STYLE_PROTOCOL}
+    {style_mentors}
     """
     raw_text = safe_generate_content(unimodel, prompt)
     return extract_json(raw_text)
@@ -425,7 +526,7 @@ def process_feedback_logic(request):
             # Only synthesize if this was the most recent professional event
             elif etype == 'adk_request_confirmation' and event.get('payload'):
                 print("Found Recent Request for Synthesis (Then-and-Now). Synthesizing...")
-                target_content = tell_then_and_now_story(event['payload'], tool_confirmation={"confirmed": True})
+                target_content = tell_then_and_now_story(event['payload'], tool_confirmation={"confirmed": True}, session_id=session_id)
                 break
 
         # Pass 2: Social Fallback
@@ -477,7 +578,7 @@ def process_feedback_logic(request):
         events_ref.add(user_event)
         events_ref.add({"event_type": "final_output", "content": target_content, "timestamp": datetime.datetime.now(datetime.timezone.utc)})
         
-        requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "proposal": [{"link": target_content}], "thread_ts": slack_context.get('ts'), "channel_id": slack_context.get('channel'), "is_final_story": True, "is_initial_post": False }, verify=certifi.where(), timeout=15)
+        safe_n8n_delivery({"session_id": session_id, "proposal": [{"link": target_content}], "thread_ts": slack_context.get('ts'), "channel_id": slack_context.get('channel'), "is_final_story": True, "is_initial_post": False })
         return jsonify({"msg": "Approved and Ingested"}), 200
 
     elif intent == "REFINE":
@@ -513,7 +614,7 @@ def process_feedback_logic(request):
             return jsonify({"msg": "Delegated (Article Refinement)"}), 200
 
         # JSON Path (Then-vs-Now)
-        new_prop = refine_proposal(session_data.get('topic'), last_prop_data, user_feedback)
+        new_prop = refine_proposal(session_data.get('topic'), last_prop_data, user_feedback, session_id=session_id)
         new_id = f"approval_{uuid.uuid4().hex[:8]}"
         
         # FIX: Write to subcollection
@@ -524,7 +625,7 @@ def process_feedback_logic(request):
         
         doc_ref.update({"last_updated": expire_time})
         
-        requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+        safe_n8n_delivery({
             "session_id": session_id, 
             "approval_id": new_id, 
             "proposal": new_prop['interlinked_concepts'], 
@@ -532,6 +633,6 @@ def process_feedback_logic(request):
             "channel_id": slack_context.get('channel'),
             "is_final_story": False,
             "is_initial_post": False
-        }, verify=certifi.where(), timeout=15)
+        })
 
     return jsonify({"message": "Refinement processed."}), 200

@@ -24,6 +24,8 @@ from google.oauth2 import id_token
 from google.cloud import firestore, secretmanager
 from google.cloud.firestore_v1.vector import Vector
 import concurrent.futures
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # --- Logging Setup ---
 try:
@@ -62,6 +64,52 @@ safety_settings = {
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
 }
 
+# --- HELPER: Safe n8n Webhook Delivery ---
+def safe_n8n_delivery(payload, timeout=45):
+    """
+    Robust delivery to n8n with retries and SSL resilience.
+    Uses 'requests' with an HTTPAdapter for exponential backoff on transient errors.
+    """
+    if not N8N_PROPOSAL_WEBHOOK_URL:
+        print("⚠️ safe_n8n_delivery: No webhook URL configured.")
+        return False
+
+    session = requests.Session()
+    # Retry on specific status codes and connection errors
+    # backoff_factor 2 means waits 2, 4, 8 seconds
+    retries = Retry(
+        total=3, 
+        backoff_factor=2, 
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["POST"]
+    )
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+    
+    try:
+        print(f"DEBUG: Attempting safe_n8n_delivery [Session: {payload.get('session_id')}]")
+        response = session.post(
+            N8N_PROPOSAL_WEBHOOK_URL, 
+            json=payload, 
+            verify=certifi.where(), 
+            timeout=timeout
+        )
+        response.raise_for_status()
+        print(f"✅ safe_n8n_delivery: Success (200 OK)")
+        return True
+    except requests.exceptions.SSLError as e:
+        print(f"❌ safe_n8n_delivery: SSL Handshake Failed: {e}")
+        # Final emergency attempt without strict session pooling
+        try:
+            time.sleep(2)
+            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json=payload, verify=certifi.where(), timeout=timeout)
+            return True
+        except Exception as inner_e:
+            print(f"❌ safe_n8n_delivery: Emergency fallback also failed: {inner_e}")
+            return False
+    except Exception as e:
+        print(f"⚠️ safe_n8n_delivery: Payload delivery failed: {e}")
+        return False
+
 
 # --- Global Clients ---
 unimodel = None
@@ -77,21 +125,82 @@ secret_client = None
 # This ensures 100% linguistic consistency across all generation paths
 # to prevent "Context Pollution" in long-running threads.
 STYLE_PROTOCOL = """
-### STYLE & SANITIZATION PROTOCOL (CRITICAL):
-- **MEAT-FIRST NARRATIVE**: BAN robotic framing and meta-commentary like "Short answer:", "Bottom line:", "In summary:", or "The takeaway is:". Start with the direct insight or data point.
-- **HUMAN FINGERPRINT**: Vary sentence length significantly. Mix short, punchy sentences (5-10 words) with longer, fluid reflections (20-35 words).
-- **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) for related clauses or parentheses ( ) for incidental technicals.
-- **COLON PROTOCOL (ZERO-TOLERANCE)**: EXCISE colons from narrative prose. Do not use them to connect claims to details. Use a period and a new sentence, or "Specifically" / "Markedly". Colons are for vertical bulleted lists ONLY. MANDATE: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED.
-- **LEXICAL VARIETY (ANTI-CLUMPING)**: PROHIBIT repeating the same key noun or verb within the same or adjacent sentences. Use human-centric rephrasing:
-    - *Robotic:* "AI integration carries integration costs."
-    - *Human:* "AI deployment entails significant overhead" or "AI rollouts demand substantial engineering spend."
-- **ZERO-PASSIVE VOICE**: PROHIBIT passive voice structures (e.g., "was broken by"). MANDATE active voice where the subject performs the action (e.g., "The storm broke the window," "CBN reports").
-- **ACTIVE VERB MANDATE**: Replace weak verbs ("is," "has," "carries") with descriptive ones ("catalyzes," "stems," "triggers," "bankrolls").
+### STYLE & SANITIZATION PROTOCOL (ZERO-TOLERANCE):
+- **MEAT-FIRST NARRATIVE**: BAN robotic framing like "Short answer:", "Bottom line:", or "The takeaway is:". Start with direct data.
+- **HUMAN FINGERPRINT**: Vary sentence length. Mix punchy sentences (5-10 words) with fluid reflections (20-35 words).
+- **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) or parentheses ( ).
+- **NARRATIVE COLON BAN**: PROHIBIT colons in prose to connect claims to details. Use a period and a new sentence, or descriptive transitions. 
+- **COLON PROTOCOL (LISTS ONLY)**: Colons are for vertical bulleted lists ONLY. 
+- **MANDATORY CAPITALIZATION**: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED. Absolutely PROHIBIT "Label: lowercase" patterns.
+- **LEXICAL VARIETY (ANTI-CLUMPING)**: MANDATE categorical rotation. PROHIBIT repeating the same key noun/verb in adjacent sentences.
+- **ACTIVE VERB PRIORITY**: PRIORITIZE descriptive, context-aware actions. Use the provided Dynamic Palette as mentors.
+- **ZERO-PASSIVE VOICE**: PRIORITIZE active voice to drive narrative momentum.
 - **ANTI-WATERMARK**: BAN robotic buzzwords: 'delve', 'tapestry', 'landscape', 'unlock', 'embark', 'comprehensive', 'robust'. 
-- **NO COLON CLUMPING**: Do not use "Label: Definition" or "Why: Reason" structures. Use active, descriptive verbs and narrative flow.
-- **TACTICAL TRANSITIONS**: BAN robotic connectors like "Furthermore," "Moreover," or "Additionally." Use "Albeit," "Inasmuch as," "By the same token," or "Markedly."
-- **GRITTY REALISM**: Mention operational friction, specific implementation costs, or localized hurdles where applicable. Stop hedging; be decisive.
+- **NO COLON CLUMPING**: Do not use "Label: Definition" structures. Use active, descriptive narrative flow.
+- **TACTICAL TRANSITIONS**: BAN robotic connectors like "Furthermore" or "Moreover." Use the provided Dynamic Palette to maintain narrative "drag."
+- **MERMAID MODULARITY**: For complex architectures, FAVOR multiple modular diagrams (e.g., Phase 1 vs Phase 2) over a single dense block. This ensures high-fidelity readability and prevents transport failures (Slack 3k URL limit).
 """
+
+# --- HELPER: Dynamic Linguistic Palette ---
+def get_stylistic_mentors(session_id=None):
+    """
+    Dynamically retrieves randomized stylistic mentors from the shared linguistic palette.
+    Seeded by session_id to ensure consistency per-thread while maintaining cross-thread variety.
+    """
+    import hashlib
+    import random
+    
+    # Try multiple common relative paths for the shared JSON
+    paths_to_try = [
+        os.path.join(os.path.dirname(__file__), "..", "shared", "linguistic_palette.json"),
+        os.path.join(os.path.dirname(__file__), "shared", "linguistic_palette.json"),
+        os.path.join(os.path.dirname(__file__), "linguistic_palette.json")
+    ]
+    
+    palette_path = next((p for p in paths_to_try if os.path.exists(p)), None)
+    
+    try:
+        if not palette_path:
+            return ""
+            
+        with open(palette_path, 'r') as f:
+            palette = json.load(f)
+            
+        # Seed for stable variety within a session
+        if session_id:
+            seed_val = int(hashlib.md5(session_id.encode()).hexdigest(), 16) % (10**8)
+            rng = random.Random(seed_val)
+        else:
+            rng = random.Random()
+            
+        mentors = []
+        
+        # Pick 3 transitions from each core category
+        categories = palette.get("transitions", {})
+        # Focus on the most common variety injectors
+        key_categories = [
+            "opposition_limitation_contradiction", 
+            "cause_condition_purpose", 
+            "examples_support_emphasis",
+            "agreement_addition_similarity"
+        ]
+        
+        for cat in key_categories:
+            words = categories.get(cat, [])
+            if words:
+                sample = rng.sample(words, min(3, len(words)))
+                mentors.append(f"- {cat.replace('_', ' ').title()}: {', '.join(sample)}")
+            
+        # Pick 6 active verbs
+        verbs = palette.get("verbs", {}).get("active_mentors", [])
+        if verbs:
+            sample_verbs = rng.sample(verbs, min(6, len(verbs)))
+            mentors.append(f"- Active Verb Mentors: {', '.join(sample_verbs)}")
+            
+        return "\n### DYNAMIC STYLE PALETTE (TURN MENTORS):\nREQUIRED: Use at least two (2) words from the mentors below to maintain linguistic texture.\n" + "\n".join(mentors)
+    except Exception as e:
+        print(f"⚠️ get_stylistic_mentors error: {e}")
+        return ""
 
 # --- SECRET MANAGER ---
 def get_secret(secret_id):
@@ -736,8 +845,8 @@ def search_google_trends(geo="US"):
     return get_mcp_client().call("google_trends", {"geo": geo})
     
 # --- 6. ANALYSIS TOOL: Trend History (MCP Refactored) ---
-def analyze_trend_history(query, geo="US"):
-    return get_mcp_client().call("trend_analysis", {"query": query, "geo": geo})
+def analyze_trend_history(query, geo="US", date="12 Months"):
+    return get_mcp_client().call("trend_analysis", {"query": query, "geo": geo, "date": date})
 
 #7. The Specialist Image Search Tool (MCP Refactored)
 def search_google_images(query, num_results=5):
@@ -890,7 +999,7 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     4. TOOL_RECRUITMENT: List tools (WEB, IMAGES, VIDEOS, TRENDS, ANALYSIS, COMPLIANCE, USE_CONVERSATIONAL_CONTEXT).
     
     OUTPUT FORMAT (Raw JSON Only):
-    {{"visual_intent": "YES/NO", "new_geo": "...", "adequacy": "...", "selected_tools": [], "rationale": "..."}}
+    {{"visual_intent": "YES/NO", "new_geo": "...", "adequacy": "...", "selected_tools": [], "timeframe": "Today/7 Days/12 Months", "rationale": "..."}}
     """
     
     router_raw = safe_generate_content(specialist_model, router_prompt, generation_config={"temperature": 0.2})
@@ -918,8 +1027,9 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
 
         adequacy_score = router_data.get("adequacy")
         selected_tools = router_data.get("selected_tools", [])
+        requested_timeframe = router_data.get("timeframe", "12 Months")
         research_intent_raw = json.dumps({"intent": prev_intent, "rationale": router_data.get("rationale")})
-        print(f"  -> Intelligence Router: {router_data.get('rationale')} | Target Geo: {detected_geo}")
+        print(f"  -> Intelligence Router: {router_data.get('rationale')} | Target Geo: {detected_geo} | Timeframe: {requested_timeframe}")
     except Exception as e:
         print(f"⚠️ Router failed: {e}. Falling back.")
         is_recollective_visual_query = False
@@ -927,6 +1037,7 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
         target_geos = [prev_geo] if prev_geo else ["NG"]
         adequacy_score = "INSUFFICIENT"
         selected_tools = ["WEB"]
+        requested_timeframe = "12 Months"
         research_intent_raw = json.dumps({"intent": prev_intent})
     
     # 4. EXECUTION BRANCHING
@@ -972,9 +1083,17 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     distilled_seo_query = None
     distilled_trend_term = None
 
+    # Fast-Exit for SIMPLE_QUESTION: Skip expensive distillation for pulse checks
+    has_target_urls = len(extract_urls_from_text(raw_topic)) > 0
+    is_pulse_check = (prev_intent == "SIMPLE_QUESTION" and not has_target_urls and not images)
+    
     if any(t in ["WEB", "IMAGES", "VIDEOS", "SCHOLAR", "SIMPLE"] for t in selected_tools):
-        print("Sensory Router: Category [SEO] active. Distilling high-precision query...")
-        distilled_seo_query = extract_core_topic(raw_topic, history=history_context)
+        if is_pulse_check and any(word in raw_topic.lower() for word in ["trending", "latest", "today", "now"]):
+            print("Sensory Router: [FAST-EXIT] Pulse check detected. Skipping distillation...")
+            distilled_seo_query = raw_topic
+        else:
+            print("Sensory Router: Category [SEO] active. Distilling high-precision query...")
+            distilled_seo_query = extract_core_topic(raw_topic, history=history_context)
         print(f"  -> SEO Query: '{distilled_seo_query}'")
 
     if any("ANALYSIS" in t for t in selected_tools):
@@ -1054,8 +1173,8 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
                     tool_name = f"serpapi_trends_search_{geo_code}"
                 elif "ANALYSIS" in choice:
                     search_query = distilled_trend_term
-                    print(f"  + Fetching Quantitative Trend Stats for '{search_query}' in '{geo_code}'...")
-                    stats_context = analyze_trend_history(search_query, geo=geo_code)
+                    print(f"  + Fetching Quantitative Trend Stats for '{search_query}' in '{geo_code}' (Timeframe: {requested_timeframe})...")
+                    stats_context = analyze_trend_history(search_query, geo=geo_code, date=requested_timeframe)
                     print(f"DEBUG: analyze_trend_history returned {len(stats_context)} chars.", flush=True)
 
                     
@@ -1088,8 +1207,9 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
 
 
 #11. The Topic Cluster Generator
-def generate_topic_cluster(topic, context, history="", is_initial=True):
+def generate_topic_cluster(topic, context, history="", is_initial=True, session_id=None):
     global unimodel
+    style_mentors = get_stylistic_mentors(session_id)
     
     state_context = "This is a NEW proposal for a new thread." if is_initial else "This is a REVISION or EXTENSION of a previous strategy in an existing thread."
     
@@ -1109,9 +1229,8 @@ def generate_topic_cluster(topic, context, history="", is_initial=True):
     ### GUIDELINES:
     1. If this is a REVISION (is_initial=False), you MAY start with a header like ":robot_face: The proposal has been REVISED" or similar context-aware greetings if appropriate.
     2. If this is an INITIAL proposal, be structured and authoritative.
-    3. Ensure the output is strictly valid JSON for extraction.
-    
     {STYLE_PROTOCOL}
+    {style_mentors}
 
     JSON SCHEMA:
     {{
@@ -1130,7 +1249,9 @@ def generate_topic_cluster(topic, context, history="", is_initial=True):
     return extract_json(safe_generate_content(unimodel, prompt))
 
 # 12. The SEO Metadata Generator (Using Specialist Model)
-def generate_seo_metadata(article_html, topic):
+def generate_seo_metadata(article_html, topic, session_id=None):
+    global unimodel
+    style_mentors = get_stylistic_mentors(session_id)
     """
     Uses the UnifiedModel adapter to route this specific task to Anthropic (Claude).
     """
@@ -1150,6 +1271,9 @@ def generate_seo_metadata(article_html, topic):
     INPUT CONTEXT:
     Topic: "{topic}"
     Title Hint (Priority): "{title_hint}"
+    
+    {STYLE_PROTOCOL}
+    {style_mentors}
     Article Content (HTML):
     {article_html[:15000]} # Truncate to avoid context limits
     
@@ -1270,12 +1394,13 @@ def ensure_slack_compatibility(text):
 
 
 # 13a. The Natural Answer Generator (Conversational & Fluid)
-def generate_natural_answer(topic, context, history=""):
+def generate_natural_answer(topic, context, history="", session_id=None):
+    global unimodel, research_model
+    style_mentors = get_stylistic_mentors(session_id)
     """
     Handles SIMPLE_QUESTION and DIRECT_ANSWER with native intelligence.
     Bypasses the heavy 'Strategist' persona for a more natural flow.
     """
-    global unimodel, research_model
     print(f"DEBUG: generate_natural_answer (Native) starting... [Topic: {topic[:50]}]")
     
     # --- ROUTING LOGIC: Context Size Check ---
@@ -1308,6 +1433,7 @@ def generate_natural_answer(topic, context, history=""):
     Use the GROUNDING DATA to ensure accuracy.
     
     {STYLE_PROTOCOL}
+    {style_mentors}
     
     ### MULTI-NICHE AUDIT PROTOCOL:
     1. **Signal Sifting**: Carefully examine the entire GROUNDING DATA for signals matching the user's specific sub-topic (e.g., 'Politics', 'Education', 'Law').
@@ -1342,12 +1468,13 @@ def generate_natural_answer(topic, context, history=""):
 
 
 # 13b. The Comprehensive Answer Generator (AEO-AWARE CONTENT STRATEGIST)
-def generate_comprehensive_answer(topic, context, history="", intent_metadata=None, context_topic=""):
+def generate_comprehensive_answer(topic, context, history="", intent_metadata=None, context_topic="", session_id=None):
+    global unimodel, research_model
+    style_mentors = get_stylistic_mentors(session_id)
     """
     Standardizes the logic for generating a direct answer.
     Uses 'detect_research_intent' signal to adjust formatting (Tables/Lists).
     """
-    global unimodel, research_model
     print(f"DEBUG: generate_comprehensive_answer starting... [Topic: {topic[:50]}]")
     
     # --- ROUTING LOGIC: Context Size Check ---
@@ -1414,8 +1541,10 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     
     ### FORMATTING GUIDANCE:
     {intent_instruction}
-    
-    {STYLE_PROTOCOL}
+        {STYLE_PROTOCOL}
+        {style_mentors}
+        
+        TOPIC: {topic}
     
     ### CRITICAL RULES:
     1. Generate a response that directly addresses the LATEST INSTRUCTION while using the GROUNDING DATA as supporting evidence.
@@ -1438,8 +1567,9 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     }
 
 # 14. The Dedicated pSEO Article Generator
-def generate_pseo_article(topic, context, history="", history_events=None, is_initial_post=True):
+def generate_pseo_article(topic, context, history="", history_events=None, is_initial_post=True, session_id=None):
     global unimodel
+    style_mentors = get_stylistic_mentors(session_id)
     print(f"Tool: Generating pSEO Article for '{topic}'")
     
     # AUDIENCE DETECTION: Search history for tone instructions
@@ -1597,27 +1727,9 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     
     TONE & STYLE:
     {tone_instruction}
-    - **MEAT-FIRST PROTOCOL**: BAN meta-commentary like "Short answer:", "Bottom line:", or "In summary:". Start the first paragraph with direct, high-density technical findings or narrative meat.
-    - **SIMPLICITY PROTOCOL**: Use simple, accessible terminology. Explain complex concepts using plain English analogies. Avoid academic or overly dense jargon.
-    - **COLON PROTOCOL (ZERO-TOLERANCE)**: EXCISE colons from narrative prose. Do not use them to connect claims to details. Use a period and a new sentence, or "Specifically" / "Markedly". Colons are for vertical bulleted lists ONLY. MANDATE: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED.
-    - **LEXICAL VARIETY (ANTI-CLUMPING)**: PROHIBIT repeating the same key noun or verb within the same or adjacent sentences. Use human-centric rephrasing:
-        - *Robotic:* "AI integration carries integration costs."
-        - *Human:* "AI deployment entails significant overhead" or "AI rollouts demand substantial engineering spend."
-    - **ZERO-PASSIVE VOICE**: PROHIBIT passive voice. MANDATE active voice (e.g., "CBN reports" instead of "It is reported that").
-        - **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Favor semicolons (;) for related clauses or parentheses ( ) for incidental texture. 
-        - **Punctuation Diversity**: Use varied punctuation to create a natural, human rhythm.
-        - **Rhythmic Variance**: Mix short, punchy sentences (5-10 words) with longer, fluid reflections (20-35 words). Avoid medium-length homogeneity.
-        - **Syntactic Naturalness**: PROHIBIT "Colon Clumping" (robotic `Label: list` or `Term: definition` structures) in inline text; integrate these into flowing prose.
-    - **TACTICAL TRANSITION PROTOCOL**: BAN robotic transitions like "Firstly," "Furthermore," and "Moreover." Use high-value narrative connectors:
-        - *Opposition*: "Be that as it may," "albeit," "notwithstanding."
-        - *Addition*: "By the same token," "coupled with," "uniquely."
-        - *Emphasis*: "Important to realize," "markedly," "chiefly."
-        - *Effect*: "Forthwith," "accordingly," "henceforth."
-        - *Logic*: "Inasmuch as," "seeing that," "with this intention."
-    - **TEXTURE & OPINION PROTOCOL (ANTI-WATERMARK)**:
-        - **Lexical Pruning**: BAN high-frequency AI buzzwords: *delve, tapestry, landscape, unleash, empower, robust, seamlessly, multifaceted, unlock*.
-        - **Gritty Realism**: Mandate the mention of "friction points," "operational costs," or "implementation hurdles" to counter AI's default optimism.
-        - **Hedge Removal**: PROHIBIT non-committal phrasing like "it is worth noting," "it could be argued," or "generally speaking." Use direct, assertive claims.
+    
+    {STYLE_PROTOCOL}
+    {style_mentors}
     
     STRUCTURE REQUIREMENTS (Strict HTML):
     1.  **<section class="intro">**: A compelling hook. **MEAT-FIRST**: Deliver core findings or high-density technical insights immediately in the first paragraph.
@@ -1649,8 +1761,9 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     return safe_generate_content(unimodel, prompt, generation_config={"temperature": 0.4})
 
 # 14.5 The Recursive Deep-Dive Generator (Dynamic Room-by-Room Construction)
-def generate_deep_dive_article(topic, context, history="", history_events=None, target_length=1500, target_geo="Global"):
+def generate_deep_dive_article(topic, context, history="", history_events=None, target_length=1500, target_geo="Global", session_id=None):
     global unimodel
+    style_mentors = get_stylistic_mentors(session_id)
     print(f"Tool: Initiating Recursive Deep-Dive for '{topic}' (Region: {target_geo}, Target: {target_length} words)")
     
     # CLAMP: Prevent unbounded generation that crashes SSL/Webhooks
@@ -1718,7 +1831,7 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     except Exception as e:
         print(f"Blueprint Error: {e}")
         # Fallback to pSEO if blueprinting fails
-        return generate_pseo_article(topic, context, history, history_events=history_events, is_initial_post=True)
+        return generate_pseo_article(topic, context, history, history_events=history_events, is_initial_post=True, session_id=session_id)
 
     # PHASE 2: Recursive Room Building (The Writer - PARALLELIZED)
     article_parts = [f"<h1>{title}</h1>"]
@@ -1732,15 +1845,10 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     
     AUDIENCE: {audience_context}
     STYLE: Clear, engaging, professional English. Use analogies for complex ideas.
-    **MEAT-FIRST PROTOCOL**: BAN meta-commentary like "Short answer:", "Bottom line:", or "In summary:". Start the first paragraph with direct, high-density technical findings or narrative meat.
-    **COLON PROTOCOL (ZERO-TOLERANCE)**: EXCISE colons from narrative prose. Use periods and new sentences. Colons are for bulleted lists ONLY. MANDATE: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED.
-    **LEXICAL VARIETY (ANTI-CLUMPING)**: PROHIBIT repeating the same key noun or verb within the same or adjacent sentences. Use human-centric rephrasing (e.g., "overhead" instead of repeated "costs").
-    **ZERO-PASSIVE VOICE**: PROHIBIT passive voice. MANDATE active voice throughout.
-        - **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Favor semicolons (;) or parentheses ( ).
-        - **Punctuation Diversity**: Use semicolons/parentheses. Limit long dashes.
-        - **Rhythmic Variance**: Vary sentence length significantly.
-        - **Tactical Transitions**: Use "Albeit," "Inasmuch as," or "Markedly" instead of "Additionally/Furthermore."
-    **TEXTURE & OPINION**: Ban AI buzzwords (delve, tapestry, robust). Mandate "Gritty Realism" (costs/hurdles). Avoid hedging.
+    
+    {STYLE_PROTOCOL}
+    {style_mentors}
+    
     GOAL: {topic}
     
     OUTPUT: Return ONLY the content in semantic HTML (no markdown). Wrap paragraphs in <p>. Do NOT include <h1> or <h2> headers here.
@@ -1767,6 +1875,9 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
         Write a {section_words}-word section for: "{title}".
         REGION: {target_geo}
         
+        {STYLE_PROTOCOL}
+        {style_mentors}
+        
         CHAPTER {index+1}/{total_sections}: {section['title']}
         INSTRUCTION: {instruction}
         CONTEXT: This section strictly follows the concept: "{previous_title}". Ensure logical continuity.
@@ -1774,9 +1885,9 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
         STRICT LIMIT: Stay under {section_words + 50} words.
         **MEAT-FIRST PROTOCOL**: BAN meta-commentary like "Short answer:", "Bottom line:", or "In summary:". Start the first paragraph with direct, high-density technical findings or narrative meat.
         **SIMPLICITY MANDATE**: Use simple terms and descriptions. Avoid dense jargon; explain technical concepts using analogies that a non-specialist can grasp.
-        **COLON PROTOCOL (ZERO-TOLERANCE)**: EXCISE colons from all paragraph prose. Use "Specifically" or "Notably" instead. Colons are reserved for vertical lists ONLY. MANDATE: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED.
-        **LEXICAL VARIETY (ANTI-CLUMPING)**: PROHIBIT repeating the same key noun or verb within the same or adjacent sentences. Use human-centric rephrasing (e.g., replacing "integration costs" with "deployment overhead").
-        **ZERO-PASSIVE VOICE**: PROHIBIT passive voice. MANDATE active voice (e.g., "Investors chose winners" instead of "Winners were chosen by investors").
+        **COLON PROTOCOL (ZERO-TOLERANCE)**: EXCISE colons from all paragraph prose. Colons are for vertical lists ONLY. MANDATE: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED.
+        **LEXICAL VARIETY (ANTI-CLUMPING)**: PROHIBIT repeating key nouns/verbs (e.g., replace repeated "costs" with "overhead").
+        **ZERO-PASSIVE VOICE**: PROHIBIT passive voice. MANDATE active voice (e.g., "Investors chose winners" instead of "Winners were chosen").
             - **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Favor semicolons (;) or periods (.).
             - **Rhythmic Variance**: Vary sentence length. Combine short, assertive claims with longer explanatory clauses.
             - **Punctuation Policy**: Lean on semicolons for complexity.
@@ -1854,12 +1965,16 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     return full_html
 
 #15. The Euphemistic 'Then vs Now' Linker
-def create_euphemistic_links(keyword_context, is_initial=True):
+def create_euphemistic_links(keyword_context, is_initial=True, session_id=None):
     global unimodel
+    style_mentors = get_stylistic_mentors(session_id)
     
     state_context = "This is a NEW proposal for a new thread." if is_initial else "This is a REVISION or EXTENSION of a previous strategy in an existing thread."
     
     prompt = f"""
+    {STYLE_PROTOCOL}
+    {style_mentors}
+    
     Topic: "{keyword_context['clean_topic']}". 
     
     STATE: {state_context}
@@ -1882,6 +1997,11 @@ def create_euphemistic_links(keyword_context, is_initial=True):
     """
     return extract_json(safe_generate_content(unimodel, prompt))
 
+def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None, session_id=None):
+    if not tool_confirmation or not tool_confirmation.get("confirmed"): raise PermissionError("Wait for approval.")
+    style_mentors = get_stylistic_mentors(session_id)
+    return safe_generate_content(unimodel, f"{STYLE_PROTOCOL}\n{style_mentors}\nTASK: Tell a 'Then and Now' story using these concepts: {interlinked_concepts}")
+
 #16. The Proposal Critic and Refiner
 def critique_proposal(topic, current_proposal):
     global unimodel
@@ -1889,13 +2009,15 @@ def critique_proposal(topic, current_proposal):
     return safe_generate_content(unimodel, prompt)
 
 #17. The Proposal Refiner
-def refine_proposal(topic, current_proposal, critique):
+def refine_proposal(topic, current_proposal, critique, session_id=None):
     global unimodel
+    style_mentors = get_stylistic_mentors(session_id)
     prompt = f"""
     REWRITE proposal. Topic: {topic}. Draft: {json.dumps(current_proposal)}. Critique: {critique}. 
     Preserve keys: 'then_concept', 'now_concept', 'link'. Ensure JSON format.
     
     {STYLE_PROTOCOL}
+    {style_mentors}
     """
     return extract_json(safe_generate_content(unimodel, prompt))
 
@@ -1925,7 +2047,10 @@ def process_sales_transcript(transcript_text):
       "budget_timeline": "summary"
     }}
     
-    CRITICAL: Return ONLY valid JSON. If a category has no data, use an empty array [] or "Not discussed".
+    {STYLE_PROTOCOL}
+    {style_mentors}
+    
+    CRITICAL: Valid JSON ONLY. If a category has no data, use an empty array [] or "Not discussed".
     """
     
     try:
@@ -1960,11 +2085,8 @@ def process_sales_transcript(transcript_text):
     # Solution Brief
     ## Executive Summary
     ## Objection Responses
-    ## Competitive Advantages
-    ## Implementation Timeline
-    ## ROI Projection
-    
     {STYLE_PROTOCOL}
+    {style_mentors}
     
     ### FORMATTING RULES:
     1. Use **bold** for emphasis.
@@ -2350,7 +2472,7 @@ def process_story_logic(request):
                 "type": "social",
                 "last_updated": expire_time
             })
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": reply_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=certifi.where(), timeout=10)
+            safe_n8n_delivery({"session_id": session_id, "type": "social", "message": reply_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
             return jsonify({"msg": "Social reply sent"}), 200
 
         # === PATH B: OPERATIONAL REFORMAT / FAST FOLLOW-UP (Fast Exit) ===
@@ -2362,7 +2484,7 @@ def process_story_logic(request):
             if has_substantive_history:
                 print(f"Executing Operational Reformat (Fast Exit) for command: {sanitized_topic[:50]}")
                 # RESTORED: Use simpler natural answer generator to avoid persona-induced bloat
-                answer_data = generate_natural_answer(sanitized_topic, "COMPLETE_CONTEXT_IN_HISTORY", history=history_text)
+                answer_data = generate_natural_answer(sanitized_topic, "COMPLETE_CONTEXT_IN_HISTORY", history=history_text, session_id=session_id)
                 answer_text = answer_data['text']
                 research_intent = answer_data.get('intent', "OPERATIONAL_REFORMAT")
                 
@@ -2381,7 +2503,7 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 })
                 
-                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                safe_n8n_delivery({
                     "session_id": session_id, 
                     "type": "social", 
                     "message": answer_text, 
@@ -2389,7 +2511,7 @@ def process_story_logic(request):
                     "channel_id": slack_context['channel'], 
                     "thread_ts": slack_context['ts'],
                     "is_initial_post": is_initial_post
-                }, verify=certifi.where(), timeout=15)
+                })
                 return jsonify({"msg": "Operational reformat sent"}), 200
             else:
                 print(f"OPERATIONAL_REFORMAT fallback: Insufficient grounding. Routing to Research Path.")
@@ -2400,7 +2522,7 @@ def process_story_logic(request):
         elif intent == "BLOG_OUTLINE":
             print(f"Executing Blog Outline generation for command: {sanitized_topic[:50]}")
             # Use Comprehensive Content Strategist for outlines
-            answer_data = generate_comprehensive_answer(sanitized_topic, "BLOG_OUTLINE_MODE", history=history_text, context_topic=original_topic)
+            answer_data = generate_comprehensive_answer(sanitized_topic, "BLOG_OUTLINE_MODE", history=history_text, context_topic=original_topic, session_id=session_id)
             answer_text = answer_data['text']
             
             new_events.append({"event_type": "agent_answer", "text": answer_text, "intent": "BLOG_OUTLINE"})
@@ -2417,7 +2539,7 @@ def process_story_logic(request):
                 "last_updated": expire_time
             })
             
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+            safe_n8n_delivery({
                 "session_id": session_id, 
                 "type": "social", 
                 "message": answer_text, 
@@ -2425,7 +2547,7 @@ def process_story_logic(request):
                 "channel_id": slack_context['channel'], 
                 "thread_ts": slack_context['ts'],
                 "is_initial_post": is_initial_post
-            }, verify=certifi.where(), timeout=15)
+            })
             return jsonify({"msg": "Blog outline sent"}), 200
 
         # === PATH C: SALES TRANSCRIPT (Fast Exit) ===
@@ -2464,7 +2586,7 @@ def process_story_logic(request):
             })
 
             # Send to N8N for distribution
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+            safe_n8n_delivery({
                 "session_id": session_id,
                 "type": "solution_brief",
                 "objections": result['objections'],
@@ -2472,7 +2594,7 @@ def process_story_logic(request):
                 "channel_id": slack_context.get('channel'),
                 "thread_ts": slack_context.get('ts'),
                 "is_initial_post": is_initial_post
-            }, verify=certifi.where(), timeout=30)
+            })
             
             return jsonify({"msg": "Solution brief generated"}), 200
 
@@ -2619,13 +2741,13 @@ def process_story_logic(request):
                 "intent": final_intent_key,
                 "last_updated": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
             })
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+            safe_n8n_delivery({
                 "session_id": session_id, 
                 "type": "social", 
                 "message": reply_text, 
                 "channel_id": slack_context['channel'], 
                 "thread_ts": slack_context['ts']
-            }, verify=certifi.where(), timeout=10)
+            })
             return jsonify({"msg": "Safety block applied"}), 200
 
         # --- MONITORING: Signal Propagation ---
@@ -2642,7 +2764,7 @@ def process_story_logic(request):
             if intent == "BLOG_OUTLINE": print(f"Executing Blog Outline generation for command: {clean_topic[:50]}")
             
             # ROUTING CHANGE: use generate_natural_answer for fluid interactions
-            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text)
+            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text, session_id=session_id)
             answer_text = answer_data['text']
             research_intent = answer_data['intent']
             formatting_directive = answer_data['directive']
@@ -2668,7 +2790,7 @@ def process_story_logic(request):
             }
             if is_initial_post: update_data["topic"] = clean_topic
             session_ref.update(update_data)
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+            safe_n8n_delivery({
                 "session_id": session_id, 
                 "type": "social", 
                 "message": answer_text, 
@@ -2677,14 +2799,14 @@ def process_story_logic(request):
                 "channel_id": slack_context['channel'], 
                 "thread_ts": slack_context['ts'],
                 "is_initial_post": is_initial_post
-            }, verify=certifi.where(), timeout=15)
+            })
             return jsonify({"msg": "Answer sent"}), 200
 
         elif intent == "DEEP_DIVE":
             target_count = extract_target_word_count(sanitized_topic, history=history_text)
             print(f"TELEMETRY: Executing Dynamic Deep-Dive Recursive Expansion (Target: {target_count})...")
             # PASS THE sanitzied_topic as the DIRECTIVE to prioritize feedback
-            article_html = generate_deep_dive_article(sanitized_topic, research_data['context'], history=history_text, history_events=history_events, target_length=target_count, target_geo=final_geo)
+            article_html = generate_deep_dive_article(sanitized_topic, research_data['context'], history=history_text, history_events=history_events, target_length=target_count, target_geo=final_geo, session_id=session_id)
             
             # Use Claude for metadata even for deep dives
             seo_data = generate_seo_metadata(article_html, original_topic)
@@ -2714,19 +2836,20 @@ def process_story_logic(request):
             if is_initial_post: update_data["topic"] = seo_data.get('title', clean_topic)
             session_ref.update(update_data)
 
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+            safe_n8n_delivery({
                 "session_id": session_id, 
                 "type": "social", 
                 "message": convert_html_to_markdown(article_html), 
                 "channel_id": slack_context['channel'], 
                 "thread_ts": slack_context['ts'],
                 "is_initial_post": is_initial_post
-            }, verify=certifi.where(), timeout=30)
+            })
             return jsonify({"msg": "Deep-Dive article sent"}), 200
 
         elif intent == "TOPIC_CLUSTER_PROPOSAL":
             try:
-                cluster_data = generate_topic_cluster(sanitized_topic, research_data['context'], history=history_text, is_initial=is_initial_post)
+                # FIX: Pass original_topic (Mission) for tool consistency
+                cluster_data = generate_topic_cluster(sanitized_topic, research_data['context'], history=history_text, is_initial=is_initial_post, session_id=session_id)
                 if not cluster_data or "clusters" not in cluster_data: raise ValueError("Failed to parse valid cluster JSON.")
                 
                 new_events.append({
@@ -2754,7 +2877,7 @@ def process_story_logic(request):
                 
                 # Align with N8N Parser: Wrap JSON in markdown for regex extraction
                 cluster_msg = f"```json\n{json.dumps(cluster_data, indent=2)}\n```"
-                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                safe_n8n_delivery({
                     "session_id": session_id, 
                     "type": "answer", 
                     "message": cluster_msg,
@@ -2762,7 +2885,7 @@ def process_story_logic(request):
                     "channel_id": slack_context['channel'], 
                     "thread_ts": slack_context['ts'],
                     "is_initial_post": is_initial_post
-                }, verify=certifi.where(), timeout=30) # Increased timeout for large clusters
+                })
                 return jsonify({"msg": "Topic cluster sent"}), 200
 
             except Exception as e:
@@ -2787,12 +2910,12 @@ def process_story_logic(request):
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
                 session_ref.update(update_data)
-                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=certifi.where(), timeout=15)
+                safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
                 return jsonify({"msg": "Cluster Fallback Answer sent"}), 200
         elif intent == "THEN_VS_NOW_PROPOSAL":
             try:
                 # FIX: Pass original_topic (Mission) for tool consistency
-                current_proposal = create_euphemistic_links({**research_data, "clean_topic": original_topic}, is_initial=is_initial_post)
+                current_proposal = create_euphemistic_links({**research_data, "clean_topic": original_topic}, is_initial=is_initial_post, session_id=session_id)
                 if not current_proposal or "interlinked_concepts" not in current_proposal:
                      raise ValueError("Failed to generate Then-vs-Now proposal.")
                 
@@ -2804,7 +2927,7 @@ def process_story_logic(request):
                     critique = critique_proposal(original_topic, current_proposal)
                     if "APPROVED" in critique.upper(): break
                     try: 
-                         refined = refine_proposal(original_topic, current_proposal, critique)
+                         refined = refine_proposal(original_topic, current_proposal, critique, session_id=session_id)
                          if refined and "interlinked_concepts" in refined:
                               current_proposal = refined
                          else:
@@ -2832,7 +2955,7 @@ def process_story_logic(request):
                 if is_initial_post: update_data["topic"] = clean_topic
                 session_ref.update(update_data)
 
-                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                safe_n8n_delivery({
                     "session_id": session_id, 
                     "type": "answer_proposal", 
                     "proposal": current_proposal['interlinked_concepts'], 
@@ -2840,7 +2963,7 @@ def process_story_logic(request):
                     "channel_id": slack_context['channel'], 
                     "thread_ts": slack_context['ts'],
                     "is_initial_post": is_initial_post
-                }, verify=certifi.where(), timeout=20)
+                })
                 return jsonify({"msg": "Then-vs-Now proposal sent"}), 200
 
             except ValueError as e:
@@ -2865,7 +2988,7 @@ def process_story_logic(request):
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
                 session_ref.update(update_data)
-                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=certifi.where(), timeout=15)
+                safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
                 return jsonify({"msg": "Fallback answer sent"}), 200
 
         # === PATH C: PSEO ARTICLE GENERATION (Dual-Agent Path) ===
@@ -2875,7 +2998,7 @@ def process_story_logic(request):
                 article_html = generate_pseo_article(sanitized_topic, research_data['context'], history=history_text, history_events=history_events, is_initial_post=is_initial_post)
                 
                 # 2. AGENT B (Claude): Generate the Semantic Metadata
-                seo_data = generate_seo_metadata(article_html, original_topic)
+                seo_data = generate_seo_metadata(article_html, original_topic, session_id=session_id)
                 
                 # SUCCESS: Log the event to subcollection
                 new_events.append({
@@ -2905,7 +3028,7 @@ def process_story_logic(request):
                 session_ref.update(update_data)
                 
                 # 5. Send STRUCTURED DATA to N8N (Restored Wrapper for GhostNode Harmony)
-                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+                safe_n8n_delivery({
                     "session_id": session_id, 
                     "type": "pseo_draft", 
                     "payload": {
@@ -2921,7 +3044,7 @@ def process_story_logic(request):
                     "channel_id": slack_context['channel'], 
                     "thread_ts": slack_context['ts'],
                     "is_initial_post": is_initial_post
-                }, verify=certifi.where(), timeout=30)
+                })
 
                 return jsonify({"msg": "pSEO Draft sent"}), 200
 
@@ -2947,7 +3070,7 @@ def process_story_logic(request):
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
                 session_ref.update(update_data)
-                requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post}, verify=certifi.where(), timeout=15)
+                safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
                 return jsonify({"msg": "pSEO Fallback Answer sent"}), 200
 
 
@@ -2979,7 +3102,7 @@ def process_story_logic(request):
             if is_initial_post: update_data["topic"] = clean_topic
             session_ref.update(update_data)
 
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json={
+            safe_n8n_delivery({
                 "session_id": session_id, 
                 "type": "social", 
                 "message": answer_text, 
@@ -2988,7 +3111,7 @@ def process_story_logic(request):
                 "channel_id": slack_context['channel'], 
                 "thread_ts": slack_context['ts'],
                 "is_initial_post": is_initial_post
-            }, verify=certifi.where(), timeout=15)
+            })
             
             return jsonify({"msg": "Unknown intent fallback answer sent"}), 200
 
