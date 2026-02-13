@@ -1,5 +1,6 @@
 # --- /worker-story/main.py ---
 import functions_framework
+import html
 from flask import jsonify
 import vertexai
 import litellm
@@ -127,6 +128,9 @@ secret_client = None
 STYLE_PROTOCOL = """
 ### STYLE & SANITIZATION PROTOCOL (ZERO-TOLERANCE):
 - **MEAT-FIRST NARRATIVE**: BAN robotic framing like "Short answer:", "Bottom line:", or "The takeaway is:". Start with direct data.
+- **OUTPUT FORMAT (STRICT HTML)**: Return ONLY semantic HTML. PROHIBIT all Markdown syntax (no backticks, no asterisks, no hashes).
+- **NO MARKDOWN HEADERS**: Absolutely BAN `#`, `##`, `###` headers. Use `<h1>`, `<h2>`, `<h3>` tags only.
+- **TAG ENFORCEMENT**: Wrap all paragraphs in `<p>`. Use `<ul><li>` for lists and `<pre><code class="language-...">` for code.
 - **HUMAN FINGERPRINT**: Vary sentence length. Mix punchy sentences (5-10 words) with fluid reflections (20-35 words).
 - **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) or parentheses ( ).
 - **NARRATIVE COLON BAN**: PROHIBIT colons in prose to connect claims to details. Use a period and a new sentence, or descriptive transitions. 
@@ -138,6 +142,10 @@ STYLE_PROTOCOL = """
 - **ANTI-WATERMARK**: BAN robotic buzzwords: 'delve', 'tapestry', 'landscape', 'unlock', 'embark', 'comprehensive', 'robust'. 
 - **NO COLON CLUMPING**: Do not use "Label: Definition" structures. Use active, descriptive narrative flow.
 - **TACTICAL TRANSITIONS**: BAN robotic connectors like "Furthermore" or "Moreover." Use the provided Dynamic Palette to maintain narrative "drag."
+- **CONTEXTUAL INTEGRITY (ZERO-INVENTION)**:
+    1. **DATA FIDELITY**: You are FORBIDDEN from generating any specific statistic (%), project count (e.g., "120 projects"), or implementation claim that is not explicitly in the USER PROMPT, PROVIDED FILES, or VERIFIED SEARCH RESULTS. Use qualitative descriptions if data is absent.
+    2. **LINK VERIFICATION**: Only generate URLs that have been explicitly provided or verified in the current turn's context. Never "guess" a logical URL path.
+    3. **ARCHITECTURAL ANCHORING**: Claims must align with the provided context (e.g., architectural or contextual specs). If a claim contradicts the Primary Anchor (Prompt/Files), the anchor takes precedence.
 - **MERMAID MODULARITY**: For complex architectures, FAVOR multiple modular diagrams (e.g., Phase 1 vs Phase 2) over a single dense block. This ensures high-fidelity readability and prevents transport failures (Slack 3k URL limit).
 """
 
@@ -201,6 +209,21 @@ def get_stylistic_mentors(session_id=None):
     except Exception as e:
         print(f"⚠️ get_stylistic_mentors error: {e}")
         return ""
+
+# --- HELPER: Citation Engine (Inline Anchors) ---
+def extract_labeled_sources(context_str):
+    """
+    Extracts URLs from context and returns a labeled list for the LLM.
+    """
+    if not context_str: return ""
+    # Extract unique URLs
+    found_urls = list(dict.fromkeys(re.findall(r'https?://[^\s<>"]+', str(context_str))))
+    # Filter noisy dev/system URLs
+    clean_urls = [u for u in found_urls if not any(x in u for x in ["ghost-api", "image", "google-adk", "localhost", "mcp-sensory-server", "favicon", "google.com/search"])]
+    if not clean_urls: return ""
+    
+    labeled_list = "\n".join([f"SOURCE [{i+1}]: {url}" for i, url in enumerate(clean_urls[:8])])
+    return f"\nADK_CITATION_GROUNDING_RESOURCES:\n{labeled_list}\n"
 
 # --- SECRET MANAGER ---
 def get_secret(secret_id):
@@ -301,6 +324,49 @@ def get_mcp_client():
         logging.info(f"MCP CLIENT INIT: Connecting to {url}")
         mcp_client = RemoteTools(url)
     return mcp_client
+
+def sanitize_llm_html(raw_html):
+    """
+    Strips LLM preambles and postscripts, ensuring the output starts with 
+    a valid Ghost-friendly HTML tag and ends at the last logical stop (tag or mermaid block).
+    Standardized to protect <figure> tags and trailing code blocks.
+    """
+    if not raw_html: return ""
+    
+    # 1. Find the first structural tag OR markdown code fence
+    # We include backticks in the start pattern to ensure we catch wrapped responses.
+    start_pattern = r'(?:<(?:h1|h2|h3|section|article|p|figure|ul|ol|div|pre|code)|```|~~~)'
+    start_match = re.search(start_pattern, raw_html, re.IGNORECASE)
+    if not start_match:
+        return raw_html.strip()
+    
+    start_idx = start_match.start()
+    
+    # 2. Find the last logical stop
+    # This can be a closing tag OR a mermaid code fence
+    end_pattern = r'(?:</(?:section|article|p|figure|ul|ol|div|h1|h2|h3|pre|code)>|```|~~~)'
+    all_stops = list(re.finditer(end_pattern, raw_html, re.IGNORECASE))
+    
+    if not all_stops:
+        # If no stops found, return from start_idx to end
+        sanitized = raw_html[start_idx:].strip()
+    else:
+        last_stop = all_stops[-1]
+        end_idx = last_stop.end()
+        # Safety Check: If the last stop is very early, fallback to first-match pattern
+        if end_idx <= start_idx:
+            sanitized = raw_html[start_idx:].strip()
+        else:
+            sanitized = raw_html[start_idx:end_idx].strip()
+            
+    # 3. Post-clean: Strip wrapping code fences (e.g. ```html ... ```)
+    # We use a non-greedy regex to strip if the content is entirely wrapped.
+    fence_pattern = r'^(?:```(?:html|xml|text|ps1)?|~~~)\s*(.*?)\s*(?:```|~~~)$'
+    fence_match = re.match(fence_pattern, sanitized, re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        sanitized = fence_match.group(1).strip()
+        
+    return sanitized
 
 # --- UNIFIED MODEL ADAPTER (The Brain Switch) ---
 class UnifiedModel:
@@ -678,41 +744,114 @@ def strip_html_tags(text):
     """Removes HTML tags for clean context stitching and plain-text views."""
     return re.sub(r'<[^>]+>', '', text).strip()
 
-def convert_html_to_markdown(html):
-    """Converts architectural HTML into Slack-friendly Markdown with a clear hierarchy."""
-    # 0. Handle H1 Title (The Master Label)
-    text = re.sub(r'<h1>(.*?)</h1>', r'*\1*\n\n', html)
-    
-    # 1. Headers (H2 and H3)
-    text = re.sub(r'<h2>(.*?)</h2>', r'\n*\1*\n', text)
-    text = re.sub(r'<h3>(.*?)</h3>', r'_ \1 _\n', text)
-    
-    # 2. Sections to separators (More space)
-    text = text.replace('</section>', '\n\n---\n\n')
-    text = re.sub(r'<section[^>]*>', '', text)
-    
-    # 3. Code Blocks (<pre><code> to markdown backticks)
-    text = re.sub(r'<pre><code[^>]*>(.*?)</code></pre>', r'```\n\1\n```', text, flags=re.DOTALL)
+def convert_html_to_markdown(html_str):
+    """
+    Converts architectural HTML into Slack-friendly Markdown with a clear hierarchy.
+    Hardened to protect code blocks from global tag stripping (fixes < > consumptions).
+    """
+    if not html_str: return ""
+    import html
+    import uuid
 
-    # 4. Lists (Improved conversion)
+    # 0. Pre-Pass: Strip LLM Preamble/Banter
+    text = re.sub(r'(?i)^(Part \d+:?|Here is.*?:\s*)', '', str(html_str)).strip()
+    
+    # 1. Strip raw Markdown headers
+    text = re.sub(r'^\s*#{1,6}\s*(.*?)$', r'*\1*', text, flags=re.MULTILINE)
+    
+    # Placeholder system to protect code from final tag strip
+    protected_blocks = {}
+
+    def protect_block(md_content):
+        placeholder = f"__PROTECTED_CODE_{uuid.uuid4().hex}__"
+        protected_blocks[placeholder] = md_content
+        return placeholder
+
+    # 2. Mermaid Blocks (Specialist Visual Handling via MCP)
+    def mermaid_markdown_handler(match):
+        full_block = match.group(0)
+        code_match = re.search(r'<code[^>]*class="[^"]*mermaid[^"]*"[^>]*>([\s\S]*?)</code>', full_block, re.IGNORECASE)
+        if not code_match: return full_block
+        mermaid_code = code_match.group(1).strip()
+        
+        caption = "Mermaid Diagram"
+        caption_match = re.search(r'<figcaption>(.*?)</figcaption>', full_block, re.IGNORECASE)
+        if caption_match:
+            caption = re.sub(r'<[^>]+>', '', caption_match.group(1).strip())
+
+        try:
+            mcp = get_mcp_client()
+            md = mcp.call_tool("render_mermaid", {
+                "mermaid_code": mermaid_code, 
+                "format": "markdown",
+                "alt": caption,
+                "caption": caption
+            })
+            return protect_block(md)
+        except Exception:
+            return protect_block(f"```mermaid\n{mermaid_code}\n```")
+
+    fig_pattern = r'<figure[^>]*>(?:(?!</figure>)[\s\S])*?<code[^>]*class="[^"]*mermaid[^"]*"[^>]*>(?:(?!</figure>)[\s\S])*?</code>(?:(?!</figure>)[\s\S])*?</figure>'
+    text = re.sub(fig_pattern, mermaid_markdown_handler, text, flags=re.IGNORECASE)
+
+    # Orphan Mermaid Handler
+    orphan_pattern = r'<pre\s*[^>]*><code\s+class="[^"]*mermaid[^"]*">([\s\S]*?)</code></pre>|<code\s+class="[^"]*mermaid[^"]*">([\s\S]*?)</code>'
+    def orphan_handler(match):
+        code = (match.group(1) or match.group(2) or "").strip()
+        try:
+            mcp = get_mcp_client()
+            md = mcp.call_tool("render_mermaid", {"mermaid_code": code, "format": "markdown"})
+            return protect_block(md)
+        except Exception:
+            return protect_block(f"```mermaid\n{code}\n```")
+    text = re.sub(orphan_pattern, orphan_handler, text, flags=re.IGNORECASE)
+
+    # 3. General Code Blocks
+    def general_code_handler(match):
+        attrs = match.group(1)
+        code = match.group(2)
+        # SANITATION: Unescape entities and strip internal HTML tags from code
+        code = html.unescape(code)
+        code = re.sub(r'<[^>]+>', '', code)
+        
+        lang_match = re.search(r'language-(\w+)', attrs, re.IGNORECASE)
+        if lang_match or '\n' in code.strip():
+            lang = lang_match.group(1) if lang_match else ""
+            return protect_block(f"```{lang}\n{code.strip()}\n```")
+        return protect_block(f"`{code.strip()}`")
+
+    text = re.sub(r'<pre><code([^>]*)>([\s\S]*?)</code></pre>', general_code_handler, text, flags=re.IGNORECASE)
+    text = re.sub(r'<code([^>]*)>([\s\S]*?)</code>', general_code_handler, text, flags=re.IGNORECASE)
+
+    # 4. Hierarchical Elements (H1-H3, Sections)
+    text = re.sub(r'<h1>(.*?)</h1>', r'*\1*\n\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<h2>(.*?)</h2>', r'\n*\1*\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<h3>(.*?)</h3>', r'_ \1 _\n', text, flags=re.IGNORECASE)
+    text = text.replace('</section>', '\n\n---\n\n')
+    text = re.sub(r'<section[^>]*>', '', text, flags=re.IGNORECASE)
+
+    # 5. Lists
     def list_item_handler(match):
         content = match.group(1).strip()
-        # If content already starts with a number or bullet, just indent it
         if re.match(r'^(\d+\.|•|-|\*)', content):
             return f"  {content}\n"
         return f"  • {content}\n"
 
-    text = re.sub(r'<li>(.*?)</li>', list_item_handler, text, flags=re.DOTALL)
+    text = re.sub(r'<li>(.*?)</li>', list_item_handler, text, flags=re.DOTALL | re.IGNORECASE)
     text = text.replace('<ul>', '\n').replace('</ul>', '\n').replace('<ol>', '\n').replace('</ol>', '\n')
     
-    # 5. Paragraphs & Line Breaks
+    # 6. Paragraphs & Line Breaks
     text = text.replace('<p>', '').replace('</p>', '\n\n')
     text = text.replace('<br>', '\n').replace('<br/>', '\n')
     
-    # 6. Final Strip of remaining tags
-    text = re.sub(r'<[^>]+>', '', text)
+    # 7. Final Strip of remaining tags
+    text = re.sub(r'<(?!https?://|!)[^>]+>', '', text, flags=re.IGNORECASE)
     
-    # Clean up excess newlines (Max 2)
+    # 8. Restore Protected Blocks
+    for placeholder, original in protected_blocks.items():
+        text = text.replace(placeholder, original)
+
+    # 9. Clean up excess newlines
     text = re.sub(r'\n{4,}', '\n\n', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
@@ -979,24 +1118,28 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     # 3. CONSOLIDATED INTELLIGENCE ROUTER (Triple-Threat Prompt)
     router_prompt = f"""
     You are the 'Intelligence Router'. Assess the user's command and decide the path.
+    
+    ### CONTEXTUAL ANCHORS (The Source of Truth):
     USER COMMAND: '{raw_topic}'
     MISSION SUBJECT: '{grounding_subject}'
     CURRENT INTENT: '{prev_intent}'
     CURRENT GEO: '{prev_geo}'
     
-    COLLECTED KNOWLEDGE:
+    ### KNOWLEDGE REPOSITORY:
+    CONVERSATION HISTORY:
     {history_context[:8000]}
     ---
     RESEARCH/MEMORY SAMPLES: 
     {str(base_grounding)[:15000]}
     
-    PROTOCOL:
-    1. VISUAL_INTENT: Require seeing asset? [YES/NO]
-    2. GEO_PIVOT: If the user refers to a specific country, you MUST return the **ISO-3166-1 alpha-2** code.
-       EXAMPLES: Nigeria=NG, South Africa=ZA, United States=US, United Kingdom=GB, Ghana=GH, Kenya=KE, India=IN, Germany=DE, France=FR, Canada=CA.
-       If no pivot, return 'Inherit'.
-    3. ADEQUACY_AUDIT: Have enough info? [SUFFICIENT/INSUFFICIENT]
-    4. TOOL_RECRUITMENT: List tools (WEB, IMAGES, VIDEOS, TRENDS, ANALYSIS, COMPLIANCE, USE_CONVERSATIONAL_CONTEXT).
+    ### PROTOCOL & GUARDRAILS:
+    1. **CONTEXTUAL ANCHORING**: Use the User Command or Provided Files (found in COLLECTED KNOWLEDGE) as your primary relevance filter. 
+    2. **ERA ALIGNMENT (SUGGESTION)**: If the task involves modern tech (e.g., AP2, VCs, Web 3.0), prioritize research in that era. Avoid older patterns (e.g., OAuth2, JWT, Web 2.0) unless specifically requested.
+    3. **MULTI-VARIATE RESEARCH**: Decide if the user needs Architectural, Contextual, or Comparative specs. 
+    4. **VISUAL_INTENT**: Require seeing asset? [YES/NO]
+    5. **GEO_PIVOT**: If the user refers to a specific country, you MUST return the **ISO-3166-1 alpha-2** code.
+    6. **ADEQUACY_AUDIT**: Have enough info to solve the ARCHITECTURAL/CONTEXTUAL goal? [SUFFICIENT/INSUFFICIENT]
+    7. **TOOL_RECRUITMENT**: List tools (WEB, IMAGES, VIDEOS, TRENDS, ANALYSIS, COMPLIANCE, USE_CONVERSATIONAL_CONTEXT).
     
     OUTPUT FORMAT (Raw JSON Only):
     {{"visual_intent": "YES/NO", "new_geo": "...", "adequacy": "...", "selected_tools": [], "timeframe": "Today/7 Days/12 Months", "rationale": "..."}}
@@ -1069,6 +1212,17 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
             tool_logs.append({"event_type": "tool_call", "tool_name": "analyze_image", "status": "success", "content": insight})
 
     # 4.2 Gatekeeper Short-Circuit
+    # ADK HARDENING: We FORCE research for high-fidelity intents (DEEP_DIVE, BLOG_OUTLINE)
+    # if we have no unique grounding URLs in the context, even if the model thinks it's SUFFICIENT.
+    # This ensures "Staff Engineer" over-confidence doesn't break the citation protocol.
+    has_grounding_urls = len(re.findall(r'https?://[^\s<>"]+', str(context_snippets))) > 0
+    is_high_fidelity = any(t in str(prev_intent) for t in ["DEEP_DIVE", "BLOG_OUTLINE", "AUTHOR"])
+    
+    if adequacy_score == "SUFFICIENT" and is_high_fidelity and not has_grounding_urls:
+        print("SENSORY GATEKEEPER: High-fidelity intent detected with zero grounding URLs. Forcing search.")
+        adequacy_score = "INSUFFICIENT"
+        selected_tools.append("WEB")
+
     if adequacy_score == "SUFFICIENT" and "TRENDS" not in str(selected_tools):
         print("SENSORY GATEKEEPER: Knowledge is sufficient. Skipping search.")
         return {"context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent_raw, "detected_geo": detected_geo}
@@ -1469,7 +1623,7 @@ def generate_natural_answer(topic, context, history="", session_id=None):
 
 # 13b. The Comprehensive Answer Generator (AEO-AWARE CONTENT STRATEGIST)
 def generate_comprehensive_answer(topic, context, history="", intent_metadata=None, context_topic="", session_id=None):
-    global unimodel, research_model
+    global unimodel, research_model, specialist_model, flash_model
     style_mentors = get_stylistic_mentors(session_id)
     """
     Standardizes the logic for generating a direct answer.
@@ -1484,8 +1638,9 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     has_code = "[CODE_ANALYSIS]" in str(context) or "[CODE_ANALYSIS]" in str(history)
     use_research_model = total_context_size > 30000 or has_code
     
-    active_model = research_model if (use_research_model and research_model) else unimodel
-    model_name = "Research Model (Flash)" if active_model == research_model else "Unimodel (GPT-5)"
+    # UPGRADE: Force Specialist Model (Claude) for Research Audits 🛡️🎯🛡️
+    active_model = specialist_model if specialist_model else (research_model if (use_research_model and research_model) else unimodel)
+    model_name = "Specialist Model (Claude 4.5)" if active_model == specialist_model else ("Research Model (Flash)" if active_model == research_model else "Unimodel (GPT-5)")
     print(f"DEBUG: Routing Comprehensive Answer to [{model_name}] | Context Size: {total_context_size} chars")
     
     # NEW: Context check includes history if researchers marked it as sufficient
@@ -1498,6 +1653,10 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     persona_instruction = f"""
     You are a Senior Content Strategist. 
     AUDIENCE: {audience_context}
+    
+    GOAL:
+    Generate a high-density, technical research audit that directly addresses the user's specific sub-topic or vertical. 
+    Avoid "Sports Blindness" or generic global signals. Look for the nuance in the grounding data.
     """
 
     # 2. INTENT DETECTION
@@ -1541,7 +1700,8 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     
     ### FORMATTING GUIDANCE:
     {intent_instruction}
-        {STYLE_PROTOCOL}
+    {extract_labeled_sources(context)}
+    {STYLE_PROTOCOL}
         {style_mentors}
         
         TOPIC: {topic}
@@ -1565,6 +1725,179 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
         "intent": research_intent,
         "directive": formatting_directive
     }
+
+# 13b. Mermaid Post-Processor (Ghost Compatibility Fix)
+def post_process_mermaid_to_images(html_content):
+    """
+    Detects Mermaid code blocks in HTML and converts them into visual images
+    via the MCP render_mermaid tool for Ghost compatibility.
+    Hardened to extract authored figcaptions for dynamic alt tags.
+    Now supports flexible class names and markdown-style fences.
+    """
+    if not html_content or 'mermaid' not in html_content.lower():
+        return html_content
+
+    print(f"  + [MCP-PROCESS] Converting Mermaid blocks via Sensory Hub...")
+    mcp = get_mcp_client()
+    
+    def replacer(match):
+        full_block = match.group(0)
+        # Try to find a caption in a surrounding figure
+        caption = "Mermaid Diagram"
+        caption_match = re.search(r'<figcaption>(.*?)</figcaption>', full_block, re.IGNORECASE)
+        if caption_match:
+            caption = caption_match.group(1).strip()
+            # Clean for ALT tag safety
+            caption = re.sub(r'<[^>]+>', '', caption)
+            
+        safe_alt = html.escape(caption, quote=True)
+
+        # Find the actual mermaid code - broadened class matching
+        code_match = re.search(r'<code[^>]*class="[^"]*mermaid[^"]*"[^>]*>([\s\S]*?)</code>', full_block, re.IGNORECASE)
+        if not code_match:
+            return full_block
+            
+        mermaid_code = code_match.group(1).strip()
+        
+        try:
+            # Call MCP with dynamic metadata
+            rendered = mcp.call_tool("render_mermaid", {
+                "mermaid_code": mermaid_code, 
+                "format": "html",
+                "alt": safe_alt,
+                "caption": caption
+            })
+            
+            # Replace the <pre><code> block or just <code> block with the <img> tag
+            # Flexible recursive replacement
+            inner_pattern = r'<pre\s*[^>]*><code\s+class="[^"]*mermaid[^"]*">[\s\S]*?</code></pre>|' \
+                            r'<code\s+class="[^"]*mermaid[^"]*">[\s\S]*?</code>'
+            
+            return re.sub(inner_pattern, lambda m: rendered, full_block, flags=re.IGNORECASE)
+            
+        except Exception as e:
+            print(f"⚠️ Mermaid MCP Error: {e}")
+            return full_block
+
+    # 1. Figure Pass: Capture metadata (broadened class)
+    figure_pattern = r'<figure[^>]*>(?:(?!</figure>)[\s\S])*?<code[^>]*class="[^"]*mermaid[^"]*"[^>]*>(?:(?!</figure>)[\s\S])*?</code>(?:(?!</figure>)[\s\S])*?</figure>'
+    result = re.sub(figure_pattern, replacer, html_content, flags=re.IGNORECASE)
+    
+    # 2. Markdown Pass: Convert ```mermaid blocks into images inside figures
+    def markdown_replacer(match):
+        code = match.group(1).strip()
+        try:
+            rendered = mcp.call_tool("render_mermaid", {"mermaid_code": code, "format": "html"})
+            return f'<figure class="kg-card kg-image-card kg-width-wide">{rendered}</figure>'
+        except Exception as e:
+            print(f"⚠️ Mermaid Markdown Error: {e}")
+            return match.group(0)
+
+    markdown_pattern = r'```mermaid\s*([\s\S]*?)\s*```'
+    result = re.sub(markdown_pattern, markdown_replacer, result, flags=re.IGNORECASE)
+
+    # 3. Orphan Pass: Fallback for orphaned HTML code blocks
+    orphan_pattern = r'<pre\s*[^>]*><code\s+class="[^"]*mermaid[^"]*">([\s\S]*?)</code></pre>|' \
+                     r'<code\s+class="[^"]*mermaid[^"]*">([\s\S]*?)</code>'
+
+    def orphan_replacer(match):
+        code = (match.group(1) or match.group(2) or "").strip()
+        if not code: return match.group(0)
+        try:
+            # Wrap orphan images in a Ghost-friendly container by default
+            rendered = mcp.call_tool("render_mermaid", {"mermaid_code": code, "format": "html"})
+            return f'<figure class="kg-card kg-image-card kg-width-wide">{rendered}</figure>'
+        except Exception as e:
+            print(f"⚠️ Mermaid Orphan Error: {e}")
+            return match.group(0)
+
+    return re.sub(orphan_pattern, orphan_replacer, result, flags=re.IGNORECASE)
+
+# 13c. The Chunked Refactor Helper (ADK Performance Fix)
+def chunked_refactor_article(source_text, audience_context, specialist_model, style_mentors):
+    """
+    Chunks a large article and refactors it segment-by-segment to prevent summarization drift.
+    Ensures that a 3000+ word draft remains a 3000+ word article in Ghost HTML.
+    """
+    print(f"  + Initiating Chunked Refactor for {len(source_text)} characters...")
+    
+    # Split by H2 headers, keeping the headers with the chunks
+    # We use a lookahead to split and keep the delimiter
+    chunks = re.split(r'(?=\n## )', source_text)
+    chunks = [c.strip() for c in chunks if c.strip()]
+    
+    if len(chunks) <= 1 and len(source_text) > 8000:
+        # Emergency Paragraph-Based Chunking for Large Text without Headers
+        print("  ⚠️ No H2 headers found in large text. Using paragraph-based chunking.")
+        raw_paras = source_text.split('\n\n')
+        chunks = []
+        buffer = []
+        buffer_size = 0
+        for p in raw_paras:
+            buffer.append(p)
+            buffer_size += len(p)
+            if buffer_size > 4000:
+                chunks.append('\n\n'.join(buffer))
+                buffer = []
+                buffer_size = 0
+        if buffer: chunks.append('\n\n'.join(buffer))
+
+    results = [None] * len(chunks)
+    
+    def process_chunk(idx, chunk_text):
+        is_first = (idx == 0)
+        chunk_refactor_prompt = f"""
+        You are a Content Refactor Engine specializing in high-fidelity Ghost CMS delivery.
+        
+        SEGMENT: {idx+1}/{len(chunks)}
+        TARGET AUDIENCE: {audience_context}
+        
+        TASK: Convert this 'SOURCE SEGMENT' into target GHOST-FRIENDLY HTML format.
+        
+        STRUCTURE REQUIREMENTS (Strict HTML):
+        1.  **Semantic Structuring**: Use <section> wrappers with appropriate classes (e.g., class="intro", class="body", class="deep-dive", class="methodology").
+        2.  **Semantic Headers**: Use <h1> for the main title, <h2> for major sections, and <h3> for sub-sections.
+        3.  **NO NUMBERED HEADINGS**: Do NOT include numbers (e.g., "1. ", "2. ") in your <h2> or <h3> headers.
+        4.  **Code Blocks**: Use semantic HTML: `<pre><code class="language-...">...</code></pre>`.
+        5.  **Mermaid Diagrams**: MUST be preserved. Wrap Mermaid code in a `<figure class="kg-card kg-image-card kg-width-wide">` block. Inside, include the `<pre><code class="language-mermaid">...</code></pre>` and a context-aware `<figcaption>...</figcaption>`.
+        6.  **Lists**: Use semantic `<ul><li>` or `<ol><li>`.
+        7.  **Paragraphs**: Wrap all text in <p> tags.
+        
+        CRITICAL CONTENT RULES:
+        - **Verbatim Integrity (ADK PRESERVATION)**: DO NOT summarize. Refactor the content EXACTLY as it appears in the source segment. If there are 5 paragraphs, output 5 paragraphs.
+        - **Acronym Protocol**: Define all acronyms in parentheses on the first use.
+        
+        CRITICAL FORMATTING RULES:
+        -   **NO MARKDOWN**: Absolutely NO markdown backticks (```), asterisks for bold (**), or hyphens for lists (- or *).
+        -   **CLEAN CONTENT**: Remove any internal instructions or metalabels.
+        -   **NO PREAMBLE**: Start directly with the first HTML tag.
+        
+        {STYLE_PROTOCOL}
+        {style_mentors}
+        
+        SOURCE SEGMENT:
+        {chunk_text}
+        
+        {extract_labeled_sources(audience_context)}
+        
+        CRITICAL CITATION RULE:
+        - **Inline Anchored Links**: If the source text contains facts supported by Grounding Sources, you MUST use semantic HTML anchored links: `<a href="URL">Anchor Text</a>`.
+        - **No Link Dumps**: Do NOT append a "Sources" list at the end.
+        """
+        # Lower temp for maximum literal adherence
+        raw_out = safe_generate_content(specialist_model, chunk_refactor_prompt, generation_config={"temperature": 0.1})
+        return idx, sanitize_llm_html(raw_out)
+
+    print(f"  + Launching Parallel Refactor Crew ({len(chunks)} chunks)...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_idx = {executor.submit(process_chunk, i, chunk): i for i, chunk in enumerate(chunks)}
+        for future in concurrent.futures.as_completed(future_to_idx):
+            idx, html_segment = future.result()
+            results[idx] = html_segment
+            print(f"  + [CHUNK {idx+1}] Refactor Complete.")
+            
+    final_html = "\n\n".join(results)
+    return post_process_mermaid_to_images(final_html)
 
 # 14. The Dedicated pSEO Article Generator
 def generate_pseo_article(topic, context, history="", history_events=None, is_initial_post=True, session_id=None):
@@ -1590,7 +1923,7 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     has_pseo_keyword = "pseo" in topic_lower
     
     # Path A Signals (Verbatim Finalization)
-    is_repurpose_cmd = any(kw in topic_lower for kw in ["dump", "repurpose", "publish the", "provision the", "for the draft", "finalize the"])
+    is_repurpose_cmd = any(kw in topic_lower for kw in ["dump", "repurpose", "refactor", "publish the", "provision the", "for the draft", "finalize the"])
     
     # Path B Signals (Creative Iteration)
     is_expand_cmd = any(kw in topic_lower for kw in ["expand", "flesh out", "write from", "based on outline", "refine", "polish", "rewrite"])
@@ -1618,10 +1951,11 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     if is_repurpose_cmd and history_events:
         for event in reversed(history_events):
             # 1. Look for recent agent_proposal (pseo_article) with clean HTML
+            # HARDENING: Skip direct provisioning if the user explicitly asked to "refactor"
             proposal_data = event.get('proposal_data')
-            if isinstance(proposal_data, dict) and proposal_data.get('article_html'):
+            if isinstance(proposal_data, dict) and proposal_data.get('article_html') and "refactor" not in topic_lower:
                 print(f"  + FAST-TRACK: Found clean HTML in proposal_data. Provisioning directly.")
-                return proposal_data['article_html']
+                return post_process_mermaid_to_images(proposal_data['article_html'])
             
             # 2. Look for existing text (Markdown) to REFACTOR
             content = event.get('text') or event.get('content')
@@ -1629,9 +1963,9 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
                 # HARDENING: Reject Fast-Track if it contains raw markdown artifacts
                 has_markdown_artifacts = "```" in content or "\n- " in content or "\n* " in content
                 
-                if "<section" in content and "</section>" in content and not has_markdown_artifacts:
+                if "<section" in content and "</section>" in content and not has_markdown_artifacts and "refactor" not in topic_lower:
                     print(f"  + FAST-TRACK: Found existing high-fidelity HTML draft. Provisioning directly.")
-                    return content
+                    return post_process_mermaid_to_images(content)
             
                 # Otherwise, this is our best source for the Refactor Engine
                 best_source_text = content
@@ -1651,6 +1985,11 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
         # Use best_source_text if found, otherwise the whole history (risky but fallback)
         source_to_refactor = best_source_text or history
         
+        # PERFORMANCE FIX (ADK-CHUNK): Handle massive drafts (>8k chars) via segmentation
+        if len(source_to_refactor) > 8000:
+            return chunked_refactor_article(source_to_refactor, audience_context, specialist_model, style_mentors)
+
+        print("  + Using Single-Pass Refactor (Small Article)")
         refactor_prompt = f"""
         You are a Content Refactor Engine specializing in high-fidelity Ghost CMS delivery.
         
@@ -1658,37 +1997,28 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
         
         TASK: Convert the 'SOURCE TEXT' into target GHOST-FRIENDLY HTML format.
         
-        STRUCTURE REQUIREMENTS (Strict HTML):
-        1.  **Semantic Structuring**: Use <section> wrappers with appropriate classes (e.g., class="intro", class="body", class="deep-dive", class="methodology").
-        2.  **Semantic Headers**: Use <h1> for the main title, <h2> for major sections, and <h3> for sub-sections.
-        3.  **NO NUMBERED HEADINGS**: Do NOT include numbers (e.g., "1. ", "2. ") in your <h2> or <h3> headers.
         4.  **Code Blocks**: Use semantic HTML: `<pre><code class="language-...">...</code></pre>`.
-        5.  **Lists**: Use semantic `<ul><li>` or `<ol><li>`.
-        6.  **Paragraphs**: Wrap all text in <p> tags.
+        5.  **Mermaid Diagrams**: MUST be preserved. Wrap Mermaid code in a `<figure class="kg-card kg-image-card kg-width-wide">` block. Inside, include the `<pre><code class="language-mermaid">...</code></pre>` and a context-aware `<figcaption>...</figcaption>`.
+        6.  **Lists**: Use semantic `<ul><li>` or `<ol><li>`.
+        7.  **Paragraphs**: Wrap all text in <p> tags.
         
         CRITICAL CONTENT RULES:
         - **Semantic Integrity**: Ensure the article flows logically and follows the structure of the source text.
         - **Acronym Protocol**: Define all acronyms in parentheses on the first use.
+        - **Inline Anchored Links**: Ensure all external links are preserved as semantic HTML anchored tags: `<a href="URL">Anchor Text</a>`.
         
         CRITICAL FORMATTING RULES:
         -   **NO MARKDOWN**: Absolutely NO markdown backticks (```), asterisks for bold (**), or hyphens for lists (- or *).
         -   **CLEAN CONTENT**: Remove any internal instructions, metalabels, or architect-facing strings (e.g., "writing_instruction", "blueprint", "architect notes") found in the source text.
         -   **NO PREAMBLE**: Start directly with the first HTML tag.
+        -   **NO LINK DUMP**: Absolutely PROHIBIT appending a list of "Sources" or "References" at the end of the article.
         
         SOURCE TEXT:
         {source_to_refactor}
         """
         # Use Specialist (Claude Sonnet 4.5) for high-fidelity refactoring
         raw_html = safe_generate_content(specialist_model, refactor_prompt, generation_config={"temperature": 0.2})
-        
-        # FIX: Strip Conversational Filler (The "Okay, here is..." preamble)
-        # We look for the first occurrence of <h... or <section... and the last occurrence of a major closing tag
-        match = re.search(r'(<(?:h1|section|article)[\s\S]*</(?:section|article|h1|p)>)', raw_html, re.IGNORECASE)
-        if match:
-            print("  + Sanitized pSEO Output: Removed preamble/postscript.")
-            return match.group(1)
-            
-        return raw_html # Fallback if regex fails (likely clean enough)
+        return post_process_mermaid_to_images(sanitize_llm_html(raw_html))
 
     # --- PATH B & C: EXPAND / AUTHOR (Creative Synthesis) ---
     elif start_mode == "EXPAND":
@@ -1736,8 +2066,9 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     2.  **<section class="body">**: Detailed analysis using <h2> and <h3> tags.
     3.  **NO NUMBERED HEADINGS**: Do NOT include numbers (e.g., "1. ", "2. ") in your <h2> or <h3> headers.
     4.  **Code Blocks**: Use semantic HTML: `<pre><code class="language-...">...</code></pre>`.
-    5.  **Lists**: Use semantic `<ul><li>` or `<ol><li>`.
-    6.  **<section class="methodology">**: A TECHNICAL TRANSPARENCY FOOTER. 
+    5.  **Mermaid Diagrams**: MUST be preserved. Wrap Mermaid code in a `<figure class="kg-card kg-image-card kg-width-wide">` block. Inside, include the `<pre><code class="language-mermaid">...</code></pre>` and a context-aware `<figcaption>...</figcaption>`.
+    6.  **Lists**: Use semantic `<ul><li>` or `<ol><li>`.
+    7.  **<section class="methodology">**: A TECHNICAL TRANSPARENCY FOOTER. 
     
     CRITICAL CONTENT RULES:
     - **Contextual Specificity**: Actively identify and expand on points of interest, debates, cultural markers, or specific real-world examples found in the research context.
@@ -1755,10 +2086,17 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     
     {context_block}
     
+    {extract_labeled_sources(context_block)}
+    
+    CRITICAL CITATION RULE:
+    - **Inline Anchored Links**: When referencing facts or data points from the GROUNDING SOURCES, you MUST use semantic HTML anchored links inside the prose: `<a href="URL">Anchor Text</a>`.
+    - **No Link Dumps**: Absolutely PROHIBIT appending a list of "Sources" or "References" at the end of the article. Grounding must be 100% inline for SEO and readability.
+    
     Article Draft:
     """
     
-    return safe_generate_content(unimodel, prompt, generation_config={"temperature": 0.4})
+    raw_response = safe_generate_content(unimodel, prompt, generation_config={"temperature": 0.4})
+    return post_process_mermaid_to_images(sanitize_llm_html(raw_response))
 
 # 14.5 The Recursive Deep-Dive Generator (Dynamic Room-by-Room Construction)
 def generate_deep_dive_article(topic, context, history="", history_events=None, target_length=1500, target_geo="Global", session_id=None):
@@ -1851,9 +2189,16 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     
     GOAL: {topic}
     
+    {extract_labeled_sources(context if is_grounded else "")}
+    
+    CRITICAL CITATION RULE:
+    - **Inline Anchored Links**: When referencing facts or data points from the GROUNDING SOURCES, you MUST use semantic HTML anchored links inside the prose: `<a href="URL">Anchor Text</a>`.
+    - **No Link Dumps**: Absolutely PROHIBIT appending a list of "Sources" or "References" at the end of the section.
+    
     OUTPUT: Return ONLY the content in semantic HTML (no markdown). Wrap paragraphs in <p>. Do NOT include <h1> or <h2> headers here.
     """
-    article_parts.append(f'<section class="intro">\n{safe_generate_content(unimodel, intro_prompt)}\n</section>')
+    intro_raw = safe_generate_content(unimodel, intro_prompt)
+    article_parts.append(f'<section class="intro">\n{sanitize_llm_html(intro_raw)}\n</section>')
     
     # Define Worker Function for Parallel Processing
     def generate_section(index, section, total_sections, previous_title):
@@ -1899,10 +2244,17 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
         
         GROUNDING DATA: {context if is_grounded else "Internal Knowledge base"}
         
+        {extract_labeled_sources(context if is_grounded else "")}
+        
+        CRITICAL CITATION RULE:
+        - **Inline Anchored Links**: When referencing facts or data points from the GROUNDING SOURCES, you MUST use semantic HTML anchored links inside the prose: `<a href="URL">Anchor Text</a>`.
+        - **No Link Dumps**: Absolutely PROHIBIT appending a list of "Sources" or "References" at the end of the section. Grounding must be 100% inline for SEO and readability.
+        
         OUTPUT: Start with <h2>{section['title']}</h2> then the content in semantic HTML (no markdown). Wrap paragraphs in <p>, use <ul>/<li> for lists, and `<pre><code class="language-...">` for code.
+        **Mermaid Diagrams**: MUST be preserved. Wrap Mermaid code in a `<figure class="kg-card kg-image-card kg-width-wide">` block. Inside, include the `<pre><code class="language-mermaid">...</code></pre>` and a context-aware `<figcaption>...</figcaption>`.
         """
         content = safe_generate_content(unimodel, room_prompt)
-        return index, f'<section class="body-part">\n{content}\n</section>'
+        return index, f'<section class="body-part">\n{sanitize_llm_html(content)}\n</section>'
 
     # Execute Parallel Pool
     print(f"  + Launching Parallel Construction Crew ({len(sections)} sections)...")
@@ -1934,19 +2286,11 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     
     OUTPUT: Return ONLY the content in semantic HTML (no markdown). Wrap paragraphs in <p>. Do NOT include a header.
     """
-    article_parts.append(f'<section class="conclusion">\n<h2>Final Reflection</h2>\n{safe_generate_content(unimodel, conc_prompt)}\n</section>')
+    conc_raw = safe_generate_content(unimodel, conc_prompt)
+    article_parts.append(f'<section class="conclusion">\n<h2>Final Reflection</h2>\n{sanitize_llm_html(conc_raw)}\n</section>')
 
     # PHASE 3: Methodology
     print("  + Finalizing Methodology & Transparency...")
-    if is_grounded:
-        # STRIP DEBRIS: Clean external metadata from grounding context before listing sources
-        found_urls = list(set(re.findall(r'https?://[^\s<>"]+', str(context))))
-        # Filter for real article links, avoid ghost-api/image/internal artifacts
-        clean_urls = [u for u in found_urls if not any(x in u for x in ["ghost-api", "image", "google-adk", "localhost"])]
-        source_text = ", ".join(clean_urls[:5]) if clean_urls else "Verified research sources."
-    else:
-        source_text = "AEO Synthesis from Knowledge Base."
-
     # Calculate interim word count for the footer
     current_content = " ".join(article_parts)
     est_words = len(current_content.split())
@@ -1954,15 +2298,14 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     methodology_text = f"""
     <section class="methodology">
     <h2>Methodology & Transparency</h2>
-    This {est_words}-word analysis was recursively architected.
-    Sources: {source_text}
+    <p>This {est_words}-word technical analysis was recursively architected using a multi-agent orchestration framework. Concepts were synthesized through a combination of contextual grounding and forensic technical auditing to ensure architectural accuracy.</p>
     </section>
     """
     article_parts.append(methodology_text)
 
     full_html = "\n\n".join(article_parts)
     print(f"  -> Deep-Dive Complete. Est words: {len(full_html.split())}")
-    return full_html
+    return post_process_mermaid_to_images(full_html)
 
 #15. The Euphemistic 'Then vs Now' Linker
 def create_euphemistic_links(keyword_context, is_initial=True, session_id=None):
@@ -2115,7 +2458,7 @@ def process_sales_transcript(transcript_text):
 # --- THE STATEFUL MAIN WORKER FUNCTION (FINAL V6 - SOCIAL AWARE) ---
 @functions_framework.http
 def process_story_logic(request):
-    global unimodel, flash_model, research_model, specialist_model, db
+    global unimodel, flash_model, research_model, specialist_model, db, mcp_client
 
     # 0. ENTRY TELEMETRY (Observability)
     now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -2141,7 +2484,14 @@ def process_story_logic(request):
     if db is None:
         db = firestore.Client(project=PROJECT_ID)
 
+    # Late-Init for MCP (Standardized Resilience) 🛡️🏗️🛡️
+    mcp_client = get_mcp_client()
+
     req = request.get_json(silent=True)
+    if not req:
+        print("🛑 ERROR: Story Worker received empty or malformed payload.")
+        return jsonify({"error": "Missing payload"}), 400
+
     if isinstance(req, list): req = req[0] # Add safety for n8n list payloads
     print(f"DEBUG: Story Worker received payload keys: {list(req.keys()) if req else 'None'}")
     
@@ -2197,6 +2547,8 @@ def process_story_logic(request):
     
     # --- STEP 1: PERCEPTION (Sanitize Input) ---
     sanitized_topic = sanitize_input_text(feedback_text or original_topic)
+    clean_topic = sanitized_topic # Consistency alias 🛡️🩹🛡️
+    expire_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
     
     # --- STEP 2: LOAD SHORT-TERM MEMORY ---
     doc_ref = db.collection('agent_sessions').document(session_id)
@@ -2759,15 +3111,13 @@ def process_story_logic(request):
 
         # 3. Generate Output based on Intent
         # UPGRADE: Handle structural intents (FORMAT_*) and provide a robust fallback
-        # UPGRADE: Handle structural intents (FORMAT_*) and provide a robust fallback
-        if intent in ["DIRECT_ANSWER", "SIMPLE_QUESTION", "BLOG_OUTLINE"] or str(intent).startswith("FORMAT_"):
+        if intent in ["DIRECT_ANSWER", "BLOG_OUTLINE"] or str(intent).startswith("FORMAT_"):
             if intent == "BLOG_OUTLINE": print(f"Executing Blog Outline generation for command: {clean_topic[:50]}")
             
-            # ROUTING CHANGE: use generate_natural_answer for fluid interactions
-            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text, session_id=session_id)
+            # HIGH-FIDELITY ROUTING: Use Comprehensive Content Strategist for Audits/Formats
+            answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, session_id=session_id)
             answer_text = answer_data['text']
-            research_intent = answer_data['intent']
-            formatting_directive = answer_data['directive']
+            research_intent = answer_data.get('intent', intent)
             
             new_events.append({"event_type": "agent_answer", "text": answer_text, "intent": research_intent})
             
@@ -2779,7 +3129,7 @@ def process_story_logic(request):
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
                 events_ref.add(event)
 
-            # UPDATE METADATA: Only update 'topic' if it's the first turn to prevent command-hijacking
+            # UPDATE METADATA
             update_data = {
                 "status": "awaiting_feedback", 
                 "type": "work_answer", 
@@ -2790,17 +3140,55 @@ def process_story_logic(request):
             }
             if is_initial_post: update_data["topic"] = clean_topic
             session_ref.update(update_data)
+
             safe_n8n_delivery({
                 "session_id": session_id, 
                 "type": "social", 
-                "message": answer_text, 
+                "message": convert_html_to_markdown(answer_text), 
+                "intent": research_intent,
+                "channel_id": slack_context['channel'], 
+                "thread_ts": slack_context['ts'],
+                "is_initial_post": is_initial_post
+            })
+            return jsonify({"msg": "High-fidelity answer sent"}), 200
+
+        elif intent == "SIMPLE_QUESTION":
+            # LIGHTWEIGHT ROUTING: Use Natural Answer Engine
+            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text, session_id=session_id)
+            answer_text = answer_data['text']
+            research_intent = answer_data.get('intent', intent)
+            formatting_directive = answer_data.get('directive', "")
+            
+            new_events.append({"event_type": "agent_answer", "text": answer_text, "intent": research_intent})
+            
+            session_ref = db.collection('agent_sessions').document(session_id)
+            events_ref = session_ref.collection('events')
+            for event in new_events:
+                if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
+                events_ref.add(event)
+
+            update_data = {
+                "status": "awaiting_feedback", 
+                "type": "work_answer", 
+                "slack_context": slack_context,
+                "detected_geo": final_geo,
+                "intent": final_intent_key,
+                "last_updated": expire_time
+            }
+            if is_initial_post: update_data["topic"] = clean_topic
+            session_ref.update(update_data)
+
+            safe_n8n_delivery({
+                "session_id": session_id, 
+                "type": "social", 
+                "message": convert_html_to_markdown(answer_text), 
                 "intent": research_intent,
                 "directive": formatting_directive,
                 "channel_id": slack_context['channel'], 
                 "thread_ts": slack_context['ts'],
                 "is_initial_post": is_initial_post
             })
-            return jsonify({"msg": "Answer sent"}), 200
+            return jsonify({"msg": "Natural answer sent"}), 200
 
         elif intent == "DEEP_DIVE":
             target_count = extract_target_word_count(sanitized_topic, history=history_text)
@@ -2892,7 +3280,9 @@ def process_story_logic(request):
                 print(f"TELEMETRY: ⚠️ TOPIC_CLUSTER Fallback: {e}")
                 answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic)
                 answer_text = answer_data['text']
-                new_events.append({"event_type": "agent_answer", "text": answer_text})
+                research_intent = answer_data.get('intent', intent)
+                
+                new_events.append({"event_type": "agent_answer", "text": answer_text, "intent": research_intent})
                 
                 session_ref = db.collection('agent_sessions').document(session_id)
                 events_ref = session_ref.collection('events')
@@ -2910,7 +3300,7 @@ def process_story_logic(request):
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
                 session_ref.update(update_data)
-                safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
+                safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
                 return jsonify({"msg": "Cluster Fallback Answer sent"}), 200
         elif intent == "THEN_VS_NOW_PROPOSAL":
             try:
@@ -2968,8 +3358,11 @@ def process_story_logic(request):
 
             except ValueError as e:
                 # Fallback
-                answer_text = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic)['text']
-                new_events.append({"event_type": "agent_answer", "text": answer_text})
+                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic)
+                answer_text = answer_data['text']
+                research_intent = answer_data.get('intent', intent)
+                
+                new_events.append({"event_type": "agent_answer", "text": answer_text, "intent": research_intent})
                 
                 session_ref = db.collection('agent_sessions').document(session_id)
                 events_ref = session_ref.collection('events')
@@ -2988,7 +3381,7 @@ def process_story_logic(request):
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
                 session_ref.update(update_data)
-                safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
+                safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
                 return jsonify({"msg": "Fallback answer sent"}), 200
 
         # === PATH C: PSEO ARTICLE GENERATION (Dual-Agent Path) ===
@@ -3052,7 +3445,9 @@ def process_story_logic(request):
                 print(f"⚠️ PSEO_ARTICLE Fallback: {e}")
                 answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic)
                 answer_text = answer_data['text']
-                new_events.append({"event_type": "agent_answer", "text": answer_text})
+                research_intent = answer_data.get('intent', intent)
+                
+                new_events.append({"event_type": "agent_answer", "text": answer_text, "intent": research_intent})
                 
                 session_ref = db.collection('agent_sessions').document(session_id)
                 events_ref = session_ref.collection('events')
@@ -3070,7 +3465,7 @@ def process_story_logic(request):
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
                 session_ref.update(update_data)
-                safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
+                safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
                 return jsonify({"msg": "pSEO Fallback Answer sent"}), 200
 
 

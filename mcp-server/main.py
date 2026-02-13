@@ -1,5 +1,6 @@
 import os
 import re
+import base64
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import json
 import requests
@@ -16,10 +17,10 @@ from vertexai.language_models import TextEmbeddingModel
 from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, Part
 from vertexai.preview.vision_models import ImageGenerationModel
 from serpapi import GoogleSearch
-from googleapiclient.discovery import build
-import base64
-import litellm
 from litellm import completion
+import time
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # --- Configuration ---
 PROJECT_ID = os.environ.get("PROJECT_ID")
@@ -261,6 +262,40 @@ def intelligent_sample_code(content, max_chars=120000):
     
     return final_content
 
+def resilient_request(method, url, **kwargs):
+    """
+    Centralized helper for robust HTTP requests with SSL and connection resilience.
+    """
+    session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=2,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET", "POST", "HEAD"]
+    )
+    session.mount('https://', HTTPAdapter(max_retries=retries))
+    
+    # Default timeout if not provided
+    if 'timeout' not in kwargs:
+        kwargs['timeout'] = 30
+        
+    try:
+        # Primary attempt with certifi
+        if 'verify' not in kwargs:
+            kwargs['verify'] = certifi.where()
+            
+        response = session.request(method, url, **kwargs)
+        response.raise_for_status()
+        return response
+    except requests.exceptions.SSLError as e:
+        print(f"⚠️ MCP SSL Error for {url}: {e}. Retrying without strict verification.")
+        time.sleep(1)
+        # Fallback to insecure if certifi fails (common in local or behind firewalls)
+        return requests.request(method, url, verify=False, **kwargs)
+    except Exception as e:
+        print(f"❌ MCP Request Failure for {url}: {e}")
+        raise e
+
 def handle_tool_call(name, arguments):
     """
     Central dispatcher for all sensory tools.
@@ -278,7 +313,7 @@ def handle_tool_call(name, arguments):
         "google_trends", "trend_analysis", "google_images_search", "google_videos_search", 
         "google_scholar_search", "google_news_search", "google_simple_search",
         "detect_geo", "detect_intent", "analyze_image", "generate_image",
-        "google_ai_overview", "analyze_code_file"
+        "google_ai_overview", "analyze_code_file", "render_mermaid"
     ]
     if name not in allowed_tools:
         return f"Error: Tool '{name}' is not in the allowed list."
@@ -338,15 +373,14 @@ def handle_tool_call(name, arguments):
             }
             # Initial head request to check content-type if not obviously .pdf
             if not is_pdf:
-                head_resp = requests.head(url, headers=headers, timeout=10, allow_redirects=True)
+                head_resp = resilient_request("HEAD", url, headers=headers, timeout=10, allow_redirects=True)
                 content_type = head_resp.headers.get("Content-Type", "").lower()
                 if "application/pdf" in content_type:
                     is_pdf = True
 
             if is_pdf:
                 print(f"MCP Hub: High-Fidelity PDF Detection. Using Gemini for {url}")
-                pdf_resp = requests.get(url, headers=headers, timeout=30, verify=certifi.where())
-                pdf_resp.raise_for_status()
+                pdf_resp = resilient_request("GET", url, headers=headers, timeout=30)
                 
                 model = get_flash_model() # Uses gemini-2.0-flash-exp (or whichever is configured)
                 pdf_part = Part.from_data(data=pdf_resp.content, mime_type="application/pdf")
@@ -366,7 +400,7 @@ def handle_tool_call(name, arguments):
                 # Standard HTML Scrape via Browserless
                 endpoint = f"https://production-sfo.browserless.io/content?token={BROWSERLESS_API_KEY}&stealth=true"
                 payload = {"url": url, "rejectResourceTypes": ["media", "font"], "gotoOptions": {"timeout": 15000, "waitUntil": "networkidle2"}}
-                response = requests.post(endpoint, json=payload, timeout=20, verify=certifi.where())
+                response = resilient_request("POST", endpoint, json=payload, timeout=20)
                 soup = BeautifulSoup(response.content, 'html.parser')
                 
                 for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "ad"]): tag.decompose()
@@ -523,8 +557,12 @@ def handle_tool_call(name, arguments):
             result = f"Error in compliance RAG: {str(e)}"
 
     elif name == "google_trends":
-        geo = arguments.get("geo", DEFAULT_GEO)
-        params = {"api_key": SERPAPI_API_KEY, "engine": "google_trends_trending_now", "geo": geo, "hours": "24"}
+        raw_geo = arguments.get("geo", DEFAULT_GEO)
+        geo = None if str(raw_geo).lower() == "global" else raw_geo
+        
+        params = {"api_key": SERPAPI_API_KEY, "engine": "google_trends_trending_now", "hours": "24"}
+        if geo: params["geo"] = geo
+        
         results = GoogleSearch(params).get_dict()
         
         trending_searches = results.get("trending_searches", [])
@@ -564,7 +602,9 @@ def handle_tool_call(name, arguments):
     elif name == "trend_analysis":
         query = arguments.get("query")
         if not query: return "Error: Missing query."
-        geo = arguments.get("geo", DEFAULT_GEO)
+        raw_geo = arguments.get("geo", DEFAULT_GEO)
+        # Normalization: If "Global", SerpAPI usually expects geo to be omitted or empty
+        geo = None if str(raw_geo).lower() == "global" else raw_geo
         date_label = arguments.get("date", "12 Months")
         
         # Mapping for human-friendly timeframes
@@ -576,7 +616,9 @@ def handle_tool_call(name, arguments):
         }
         date_code = date_map.get(date_label, "today 12-m")
         
-        params = {"api_key": SERPAPI_API_KEY, "engine": "google_trends", "q": query, "geo": geo, "data_type": "TIMESERIES", "date": date_code}
+        params = {"api_key": SERPAPI_API_KEY, "engine": "google_trends", "q": query, "data_type": "TIMESERIES", "date": date_code}
+        if geo: params["geo"] = geo
+        
         results = GoogleSearch(params).get_dict()
         result = json.dumps(results, indent=2)[:5000]
 
@@ -729,7 +771,7 @@ def handle_tool_call(name, arguments):
                     if slack_token:
                         headers["Authorization"] = f"Bearer {slack_token}"
                 
-                response = requests.get(image_data, headers=headers)
+                response = resilient_request("GET", image_data, headers=headers)
                 # Dynamic MIME detection for URLs
                 content_type = response.headers.get("Content-Type", "").lower()
                 if "png" in content_type: mime_type = "image/png"
@@ -872,6 +914,28 @@ def handle_tool_call(name, arguments):
         except Exception as e:
             print(f"MCP Hub: Code analysis failed after retries: {e}")
             result = f"CODE_FILE ({file_name}):\n{file_content[:2000]}\n\n[Analysis failed after retries, using raw code]"
+        except Exception as e:
+            result = f"Error in code analysis: {str(e)}"
+
+    elif name == "render_mermaid":
+        mermaid_code = arguments.get("mermaid_code")
+        output_format = arguments.get("format", "html")
+        alt_text = arguments.get("alt", "Mermaid Diagram")
+        
+        if not mermaid_code: return "Error: Missing mermaid_code."
+        
+        try:
+            # Revert to standard Base64 as per user request (Simplification) 🛡️🧹🛡️
+            encoded = base64.b64encode(mermaid_code.encode('utf-8')).decode('utf-8')
+            image_url = f"https://mermaid.ink/img/{encoded}"
+            
+            if output_format == "html":
+                result = f'<img src="{image_url}" class="kg-image" alt="{alt_text}" loading="lazy">'
+            else:
+                # RAW URL for Slack unfurling 🛡️📊🛡️
+                result = f"\n\n{image_url}\n\n"
+        except Exception as e:
+            result = f"Error rendering mermaid: {str(e)}"
 
     else:
         return f"Error: Tool '{name}' implementation logic not found."

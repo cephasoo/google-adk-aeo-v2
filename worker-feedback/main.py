@@ -144,6 +144,9 @@ logging_v_client = None
 STYLE_PROTOCOL = """
 ### STYLE & SANITIZATION PROTOCOL (ZERO-TOLERANCE):
 - **MEAT-FIRST NARRATIVE**: BAN robotic framing like "Short answer:", "Bottom line:", or "The takeaway is:". Start with direct data.
+- **OUTPUT FORMAT (STRICT HTML)**: Return ONLY semantic HTML. PROHIBIT all Markdown syntax (no backticks, no asterisks, no hashes).
+- **NO MARKDOWN HEADERS**: Absolutely BAN `#`, `##`, `###` headers. Use `<h1>`, `<h2>`, `<h3>` tags only.
+- **TAG ENFORCEMENT**: Wrap all paragraphs in `<p>`. Use `<ul><li>` for lists and `<pre><code class="language-...">` for code.
 - **HUMAN FINGERPRINT**: Vary sentence length. Mix punchy sentences (5-10 words) with fluid reflections (20-35 words).
 - **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) or parentheses ( ).
 - **NARRATIVE COLON BAN**: PROHIBIT colons in prose to connect claims to details. Use a period and a new sentence, or descriptive transitions. 
@@ -155,6 +158,10 @@ STYLE_PROTOCOL = """
 - **ANTI-WATERMARK**: BAN robotic buzzwords: 'delve', 'tapestry', 'landscape', 'unlock', 'embark', 'comprehensive', 'robust'. 
 - **NO COLON CLUMPING**: Do not use "Label: Definition" structures. Use active, descriptive narrative flow.
 - **TACTICAL TRANSITIONS**: BAN robotic connectors like "Furthermore" or "Moreover." Use the provided Dynamic Palette to maintain narrative "drag."
+- **CONTEXTUAL INTEGRITY (ZERO-INVENTION)**:
+    1. **DATA FIDELITY**: You are FORBIDDEN from generating any specific statistic (%), project count (e.g., "120 projects"), or implementation claim that is not explicitly in the USER PROMPT, PROVIDED FILES, or VERIFIED SEARCH RESULTS. Use qualitative descriptions if data is absent.
+    2. **LINK VERIFICATION**: Only generate URLs that have been explicitly provided or verified in the current turn's context. Never "guess" a logical URL path.
+    3. **ARCHITECTURAL ANCHORING**: Claims must align with the provided context (e.g., architectural or contextual specs). If a claim contradicts the Primary Anchor (Prompt/Files), the anchor takes precedence.
 - **MERMAID MODULARITY**: For complex architectures, FAVOR multiple modular diagrams (e.g., Phase 1 vs Phase 2) over a single dense block. This ensures high-fidelity readability and prevents transport failures (Slack 3k URL limit).
 """
 
@@ -204,6 +211,133 @@ def get_stylistic_mentors(session_id=None):
     except Exception as e:
         print(f"⚠️ get_stylistic_mentors error: {e}")
         return ""
+
+# --- HELPER: Citation Engine (Inline Anchors) ---
+def extract_labeled_sources(context_str):
+    """
+    Extracts URLs from context and returns a labeled list for the LLM.
+    """
+    if not context_str: return ""
+    # Extract unique URLs
+    found_urls = list(dict.fromkeys(re.findall(r'https?://[^\s<>"]+', str(context_str))))
+    # Filter noisy dev/system URLs
+    clean_urls = [u for u in found_urls if not any(x in u for x in ["ghost-api", "image", "google-adk", "localhost", "mcp-sensory-server", "favicon", "google.com/search"])]
+    if not clean_urls: return ""
+    
+    labeled_list = "\n".join([f"SOURCE [{i+1}]: {url}" for i, url in enumerate(clean_urls[:8])])
+    return f"\nADK_CITATION_GROUNDING_RESOURCES:\n{labeled_list}\n"
+
+def convert_html_to_markdown(html_str):
+    """
+    Converts architectural HTML into Slack-friendly Markdown with a clear hierarchy.
+    Hardened to protect code blocks from global tag stripping (fixes < > consumptions).
+    """
+    if not html_str: return ""
+    import html
+    import uuid
+
+    # 0. Pre-Pass: Strip LLM Preamble/Banter
+    text = re.sub(r'(?i)^(Part \d+:?|Here is.*?:\s*)', '', str(html_str)).strip()
+    
+    # 1. Strip raw Markdown headers
+    text = re.sub(r'^\s*#{1,6}\s*(.*?)$', r'*\1*', text, flags=re.MULTILINE)
+    
+    # Placeholder system to protect code from final tag strip
+    protected_blocks = {}
+
+    def protect_block(md_content):
+        placeholder = f"__PROTECTED_CODE_{uuid.uuid4().hex}__"
+        protected_blocks[placeholder] = md_content
+        return placeholder
+
+    # 2. Mermaid Blocks (Specialist Visual Handling via MCP)
+    def mermaid_markdown_handler(match):
+        full_block = match.group(0)
+        code_match = re.search(r'<code[^>]*class="[^"]*mermaid[^"]*"[^>]*>([\s\S]*?)</code>', full_block, re.IGNORECASE)
+        if not code_match: return full_block
+        mermaid_code = code_match.group(1).strip()
+        
+        caption = "Mermaid Diagram"
+        caption_match = re.search(r'<figcaption>(.*?)</figcaption>', full_block, re.IGNORECASE)
+        if caption_match:
+            caption = re.sub(r'<[^>]+>', '', caption_match.group(1).strip())
+
+        try:
+            mcp = get_mcp_client()
+            md = mcp.call_tool("render_mermaid", {
+                "mermaid_code": mermaid_code, 
+                "format": "markdown",
+                "alt": caption,
+                "caption": caption
+            })
+            return protect_block(md)
+        except Exception:
+            return protect_block(f"```mermaid\n{mermaid_code}\n```")
+
+    fig_pattern = r'<figure[^>]*>(?:(?!</figure>)[\s\S])*?<code[^>]*class="[^"]*mermaid[^"]*"[^>]*>(?:(?!</figure>)[\s\S])*?</code>(?:(?!</figure>)[\s\S])*?</figure>'
+    text = re.sub(fig_pattern, mermaid_markdown_handler, text, flags=re.IGNORECASE)
+
+    # Orphan Mermaid Handler
+    orphan_pattern = r'<pre\s*[^>]*><code\s+class="[^"]*mermaid[^"]*">([\s\S]*?)</code></pre>|<code\s+class="[^"]*mermaid[^"]*"[^>]*>([\s\S]*?)</code>'
+    def orphan_handler(match):
+        code = (match.group(1) or match.group(2) or "").strip()
+        try:
+            mcp = get_mcp_client()
+            md = mcp.call_tool("render_mermaid", {"mermaid_code": code, "format": "markdown"})
+            return protect_block(md)
+        except Exception:
+            return protect_block(f"```mermaid\n{code}\n```")
+    text = re.sub(orphan_pattern, orphan_handler, text, flags=re.IGNORECASE)
+
+    # 3. General Code Blocks
+    def general_code_handler(match):
+        attrs = match.group(1)
+        code = match.group(2)
+        # SANITATION: Unescape entities and strip internal HTML tags from code
+        code = html.unescape(code)
+        code = re.sub(r'<[^>]+>', '', code)
+        
+        lang_match = re.search(r'language-(\w+)', attrs, re.IGNORECASE)
+        if lang_match or '\n' in code.strip():
+            lang = lang_match.group(1) if lang_match else ""
+            return protect_block(f"```{lang}\n{code.strip()}\n```")
+        return protect_block(f"`{code.strip()}`")
+
+    text = re.sub(r'<pre><code([^>]*)>([\s\S]*?)</code></pre>', general_code_handler, text, flags=re.IGNORECASE)
+    text = re.sub(r'<code([^>]*)>([\s\S]*?)</code>', general_code_handler, text, flags=re.IGNORECASE)
+
+    # 4. Hierarchical Elements (H1-H3, Sections)
+    text = re.sub(r'<h1>(.*?)</h1>', r'*\1*\n\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<h2>(.*?)</h2>', r'\n*\1*\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<h3>(.*?)</h3>', r'_ \1 _\n', text, flags=re.IGNORECASE)
+    text = text.replace('</section>', '\n\n---\n\n')
+    text = re.sub(r'<section[^>]*>', '', text, flags=re.IGNORECASE)
+
+    # 5. Lists
+    def list_item_handler(match):
+        content = match.group(1).strip()
+        if re.match(r'^(\d+\.|•|-|\*)', content):
+            return f"  {content}\n"
+        return f"  • {content}\n"
+
+    text = re.sub(r'<li>(.*?)</li>', list_item_handler, text, flags=re.DOTALL | re.IGNORECASE)
+    text = text.replace('<ul>', '\n').replace('</ul>', '\n').replace('<ol>', '\n').replace('</ol>', '\n')
+    
+    # 6. Paragraphs & Line Breaks
+    text = text.replace('<p>', '').replace('</p>', '\n\n')
+    text = text.replace('<br>', '\n').replace('<br/>', '\n')
+    
+    # 7. Final Strip of remaining tags
+    text = re.sub(r'<(?!https?://|!)[^>]+>', '', text, flags=re.IGNORECASE)
+    
+    # 8. Restore Protected Blocks
+    for placeholder, original in protected_blocks.items():
+        text = text.replace(placeholder, original)
+
+    # 9. Clean up excess newlines
+    text = re.sub(r'\n{4,}', '\n\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 # --- Utils ---
 def extract_json(text):
@@ -319,11 +453,37 @@ def dispatch_task(payload, target_url):
     tasks_client.create_task(request={"parent": parent, "task": task})
 
 def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None, session_id=None):
+    global specialist_model
     if not tool_confirmation or not tool_confirmation.get("confirmed"): raise PermissionError("Wait for approval.")
+    
+    # UPGRADE: Force Specialist Model (Claude 4.5) for high-fidelity narrative
+    if specialist_model is None:
+        specialist_model = UnifiedModel(provider="anthropic", model_name="claude-sonnet-4-5")
+        
     style_mentors = get_stylistic_mentors(session_id)
-    return safe_generate_content(unimodel, f"{STYLE_PROTOCOL}\n{style_mentors}\nTASK: Tell a 'Then and Now' story using these concepts: {interlinked_concepts}")
+    prompt = f"""
+    {STYLE_PROTOCOL}
+    {style_mentors}
+    
+    TASK: Tell a 'Then and Now' story using these concepts: {interlinked_concepts}
+    
+    {extract_labeled_sources(interlinked_concepts)}
+    
+    CRITICAL CITATION RULE:
+    - **Inline Anchored Links**: When referencing facts supported by the GROUNDING SOURCES, you MUST use semantic HTML anchored links: `<a href="URL">Anchor Text</a>`.
+    - **No Link Dumps**: Do NOT append a "Sources" list at the end.
+    """
+    
+    print(f"DEBUG: tell_then_and_now_story: Using Specialist Model for high-fidelity synthesis.")
+    return safe_generate_content(specialist_model, prompt)
 
 def refine_proposal(topic, current_proposal, critique, session_id=None):
+    global specialist_model
+    
+    # UPGRADE: Force Specialist Model (Claude 4.5) for high-fidelity refinement
+    if specialist_model is None:
+        specialist_model = UnifiedModel(provider="anthropic", model_name="claude-sonnet-4-5")
+        
     style_mentors = get_stylistic_mentors(session_id)
     prompt = f"""
     REWRITE the following content proposal blueprint based on the user's critique.
@@ -336,7 +496,8 @@ def refine_proposal(topic, current_proposal, critique, session_id=None):
     {STYLE_PROTOCOL}
     {style_mentors}
     """
-    raw_text = safe_generate_content(unimodel, prompt)
+    print(f"DEBUG: refine_proposal: Using Specialist Model for high-fidelity instruction adherence.")
+    raw_text = safe_generate_content(specialist_model, prompt)
     return extract_json(raw_text)
 
 # --- THE STATEFUL AND HARDENED FEEDBACK WORKER ---
@@ -348,6 +509,10 @@ def process_feedback_logic(request):
         db = firestore.Client()
 
     req = request.get_json(silent=True)
+    if not req:
+        print("🛑 Feedback Worker: Aborting. No payload provided.")
+        return jsonify({"error": "Missing payload"}), 400
+        
     if isinstance(req, list): req = req[0] # Add safety for n8n list payloads
     print(f"DEBUG: Feedback Worker received payload keys: {list(req.keys()) if req else 'None'}")
     session_id = req.get('session_id')
@@ -578,7 +743,14 @@ def process_feedback_logic(request):
         events_ref.add(user_event)
         events_ref.add({"event_type": "final_output", "content": target_content, "timestamp": datetime.datetime.now(datetime.timezone.utc)})
         
-        safe_n8n_delivery({"session_id": session_id, "proposal": [{"link": target_content}], "thread_ts": slack_context.get('ts'), "channel_id": slack_context.get('channel'), "is_final_story": True, "is_initial_post": False })
+        safe_n8n_delivery({
+            "session_id": session_id, 
+            "proposal": [{"link": convert_html_to_markdown(target_content)}], 
+            "thread_ts": slack_context.get('ts'), 
+            "channel_id": slack_context.get('channel'), 
+            "is_final_story": True, 
+            "is_initial_post": False 
+        })
         return jsonify({"msg": "Approved and Ingested"}), 200
 
     elif intent == "REFINE":
@@ -628,7 +800,7 @@ def process_feedback_logic(request):
         safe_n8n_delivery({
             "session_id": session_id, 
             "approval_id": new_id, 
-            "proposal": new_prop['interlinked_concepts'], 
+            "proposal": [convert_html_to_markdown(c) if isinstance(c, str) else c for c in new_prop['interlinked_concepts']], 
             "thread_ts": slack_context.get('ts'), 
             "channel_id": slack_context.get('channel'),
             "is_final_story": False,
