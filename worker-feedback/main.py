@@ -144,9 +144,10 @@ logging_v_client = None
 STYLE_PROTOCOL = """
 ### STYLE & SANITIZATION PROTOCOL (ZERO-TOLERANCE):
 - **MEAT-FIRST NARRATIVE**: BAN robotic framing like "Short answer:", "Bottom line:", or "The takeaway is:". Start with direct data.
-- **OUTPUT FORMAT (STRICT HTML)**: Return ONLY semantic HTML. PROHIBIT all Markdown syntax (no backticks, no asterisks, no hashes).
-- **NO MARKDOWN HEADERS**: Absolutely BAN `#`, `##`, `###` headers. Use `<h1>`, `<h2>`, `<h3>` tags only.
-- **TAG ENFORCEMENT**: Wrap all paragraphs in `<p>`. Use `<ul><li>` for lists and `<pre><code class="language-...">` for code.
+- **OUTPUT TARGETS (MANDATORY)**:
+    1. **CMS_DRAFT**: If the target is a blog draft, use ONLY semantic HTML. PROHIBIT all Markdown. Tables MUST use `<table>` tags.
+    2. **MODERATOR_VIEW**: If the target is a Slack brief, use Markdown for tables (pipes: `|`) and code blocks. Use HTML for prose.
+- **TAG ENFORCEMENT**: In CMS_DRAFT mode, wrap all paragraphs in `<p>`. In MODERATOR_VIEW, use Slack-safe line breaks.
 - **HUMAN FINGERPRINT**: Vary sentence length. Mix punchy sentences (5-10 words) with fluid reflections (20-35 words).
 - **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) or parentheses ( ).
 - **NARRATIVE COLON BAN**: PROHIBIT colons in prose to connect claims to details. Use a period and a new sentence, or descriptive transitions. 
@@ -452,7 +453,7 @@ def dispatch_task(payload, target_url):
     }
     tasks_client.create_task(request={"parent": parent, "task": task})
 
-def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None, session_id=None):
+def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None, session_id=None, output_target="MODERATOR_VIEW"):
     global specialist_model
     if not tool_confirmation or not tool_confirmation.get("confirmed"): raise PermissionError("Wait for approval.")
     
@@ -461,9 +462,18 @@ def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None, sessio
         specialist_model = UnifiedModel(provider="anthropic", model_name="claude-sonnet-4-5")
         
     style_mentors = get_stylistic_mentors(session_id)
+    
+    # Determined Output Target
+    target_instruction = ""
+    if output_target == "MODERATOR_VIEW":
+        target_instruction = "IMPORTANT: TARGET: MODERATOR_VIEW (Slack). Use Markdown Pipes (|) for tables."
+    else:
+        target_instruction = "IMPORTANT: TARGET: CMS_DRAFT (Ghost CMS). Use strictly semantic HTML <table> tags."
+    
     prompt = f"""
     {STYLE_PROTOCOL}
     {style_mentors}
+    {target_instruction}
     
     TASK: Tell a 'Then and Now' story using these concepts: {interlinked_concepts}
     
@@ -474,7 +484,7 @@ def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None, sessio
     - **No Link Dumps**: Do NOT append a "Sources" list at the end.
     """
     
-    print(f"DEBUG: tell_then_and_now_story: Using Specialist Model for high-fidelity synthesis.")
+    print(f"DEBUG: tell_then_and_now_story: Using Specialist Model for high-fidelity synthesis. [Target: {output_target}]")
     return safe_generate_content(specialist_model, prompt)
 
 def refine_proposal(topic, current_proposal, critique, session_id=None):
@@ -499,6 +509,15 @@ def refine_proposal(topic, current_proposal, critique, session_id=None):
     print(f"DEBUG: refine_proposal: Using Specialist Model for high-fidelity instruction adherence.")
     raw_text = safe_generate_content(specialist_model, prompt)
     return extract_json(raw_text)
+
+def get_output_target(intent: str) -> str:
+    """
+    Centralized mapping logic for target-aware formatting.
+    """
+    intent = intent.upper().strip()
+    if intent == "PSEO_ARTICLE":
+        return "CMS_DRAFT"
+    return "MODERATOR_VIEW"
 
 # --- THE STATEFUL AND HARDENED FEEDBACK WORKER ---
 @functions_framework.http
@@ -691,7 +710,9 @@ def process_feedback_logic(request):
             # Only synthesize if this was the most recent professional event
             elif etype == 'adk_request_confirmation' and event.get('payload'):
                 print("Found Recent Request for Synthesis (Then-and-Now). Synthesizing...")
-                target_content = tell_then_and_now_story(event['payload'], tool_confirmation={"confirmed": True}, session_id=session_id)
+                # Determine target based on session intent
+                target = get_output_target(session_data.get('intent', 'THEN_VS_NOW_PROPOSAL'))
+                target_content = tell_then_and_now_story(event['payload'], tool_confirmation={"confirmed": True}, session_id=session_id, output_target=target)
                 break
 
         # Pass 2: Social Fallback

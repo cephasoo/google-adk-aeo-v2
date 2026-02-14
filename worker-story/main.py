@@ -128,9 +128,10 @@ secret_client = None
 STYLE_PROTOCOL = """
 ### STYLE & SANITIZATION PROTOCOL (ZERO-TOLERANCE):
 - **MEAT-FIRST NARRATIVE**: BAN robotic framing like "Short answer:", "Bottom line:", or "The takeaway is:". Start with direct data.
-- **OUTPUT FORMAT (STRICT HTML)**: Return ONLY semantic HTML. PROHIBIT all Markdown syntax (no backticks, no asterisks, no hashes).
-- **NO MARKDOWN HEADERS**: Absolutely BAN `#`, `##`, `###` headers. Use `<h1>`, `<h2>`, `<h3>` tags only.
-- **TAG ENFORCEMENT**: Wrap all paragraphs in `<p>`. Use `<ul><li>` for lists and `<pre><code class="language-...">` for code.
+- **OUTPUT TARGETS (MANDATORY)**:
+    1. **CMS_DRAFT**: If the target is a blog draft, use ONLY semantic HTML. PROHIBIT all Markdown. Tables MUST use `<table>` tags.
+    2. **MODERATOR_VIEW**: If the target is a Slack brief, use Markdown for tables (pipes: `|`) and code blocks. Use HTML for prose.
+- **TAG ENFORCEMENT**: In CMS_DRAFT mode, wrap all paragraphs in `<p>`. In MODERATOR_VIEW, use Slack-safe line breaks.
 - **HUMAN FINGERPRINT**: Vary sentence length. Mix punchy sentences (5-10 words) with fluid reflections (20-35 words).
 - **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) or parentheses ( ).
 - **NARRATIVE COLON BAN**: PROHIBIT colons in prose to connect claims to details. Use a period and a new sentence, or descriptive transitions. 
@@ -1360,7 +1361,16 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     return { "context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent_raw, "detected_geo": detected_geo }
 
 
-#11. The Topic Cluster Generator
+def get_output_target(intent: str) -> str:
+    """
+    Centralized mapping logic for target-aware formatting.
+    """
+    intent = intent.upper().strip()
+    if intent == "PSEO_ARTICLE":
+        return "CMS_DRAFT"
+    return "MODERATOR_VIEW"
+
+# #11. The Topic Cluster Generator
 def generate_topic_cluster(topic, context, history="", is_initial=True, session_id=None):
     global unimodel
     style_mentors = get_stylistic_mentors(session_id)
@@ -1548,9 +1558,16 @@ def ensure_slack_compatibility(text):
 
 
 # 13a. The Natural Answer Generator (Conversational & Fluid)
-def generate_natural_answer(topic, context, history="", session_id=None):
+def generate_natural_answer(topic, context, history="", session_id=None, output_target="MODERATOR_VIEW"):
     global unimodel, research_model
     style_mentors = get_stylistic_mentors(session_id)
+    
+    target_instruction = ""
+    if output_target == "MODERATOR_VIEW":
+        target_instruction = "IMPORTANT: You are talking to a MODERATOR on Slack. Use Markdown Pipes (|) for any tables. Use Slack-safe formatting."
+    else:
+        target_instruction = "IMPORTANT: You are drafting for Ghost CMS. Use strictly semantic HTML <table> tags. Prohibit all Markdown."
+
     """
     Handles SIMPLE_QUESTION and DIRECT_ANSWER with native intelligence.
     Bypasses the heavy 'Strategist' persona for a more natural flow.
@@ -1571,6 +1588,10 @@ def generate_natural_answer(topic, context, history="", session_id=None):
     print(f"DEBUG: Routing Natural Answer to [{model_name}] | Context Size: {total_context_size} chars")
 
     prompt = f"""
+    {STYLE_PROTOCOL}
+    {style_mentors}
+    {target_instruction}
+    
     You are a helpful, knowledgeable AI assistant.
     
     ### CONVERSATION HISTORY:
@@ -1622,9 +1643,16 @@ def generate_natural_answer(topic, context, history="", session_id=None):
 
 
 # 13b. The Comprehensive Answer Generator (AEO-AWARE CONTENT STRATEGIST)
-def generate_comprehensive_answer(topic, context, history="", intent_metadata=None, context_topic="", session_id=None):
+def generate_comprehensive_answer(topic, context, history="", intent_metadata=None, context_topic="", session_id=None, output_target="MODERATOR_VIEW"):
     global unimodel, research_model, specialist_model, flash_model
     style_mentors = get_stylistic_mentors(session_id)
+    
+    target_instruction = ""
+    if output_target == "MODERATOR_VIEW":
+        target_instruction = "TARGET: MODERATOR_VIEW (Slack). Use Markdown Pipes (|) for tables. Use standard Slack formatting."
+    else:
+        target_instruction = "TARGET: CMS_DRAFT (Ghost). Use Semantic HTML <table> tags. PROHIBIT Markdown."
+
     """
     Standardizes the logic for generating a direct answer.
     Uses 'detect_research_intent' signal to adjust formatting (Tables/Lists).
@@ -1683,6 +1711,10 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
 
     # 4. DYNAMIC PROMPT ASSEMBLY
     prompt = f"""
+    {STYLE_PROTOCOL}
+    {style_mentors}
+    {target_instruction}
+    
     {persona_instruction}
     
     ### CONTEXT & MISSION:
@@ -1814,11 +1846,18 @@ def post_process_mermaid_to_images(html_content):
     return re.sub(orphan_pattern, orphan_replacer, result, flags=re.IGNORECASE)
 
 # 13c. The Chunked Refactor Helper (ADK Performance Fix)
-def chunked_refactor_article(source_text, audience_context, specialist_model, style_mentors):
+def chunked_refactor_article(source_text, audience_context, specialist_model, style_mentors, output_target="CMS_DRAFT"):
     """
     Chunks a large article and refactors it segment-by-segment to prevent summarization drift.
     Ensures that a 3000+ word draft remains a 3000+ word article in Ghost HTML.
     """
+    
+    target_instruction = ""
+    if output_target == "MODERATOR_VIEW":
+        target_instruction = "IMPORTANT: You are talking to a MODERATOR on Slack. Use Markdown Pipes (|) for any tables."
+    else:
+        target_instruction = "IMPORTANT: You are drafting for Ghost CMS. Use strictly semantic HTML <table> tags."
+
     print(f"  + Initiating Chunked Refactor for {len(source_text)} characters...")
     
     # Split by H2 headers, keeping the headers with the chunks
@@ -1874,6 +1913,7 @@ def chunked_refactor_article(source_text, audience_context, specialist_model, st
         
         {STYLE_PROTOCOL}
         {style_mentors}
+        {target_instruction}
         
         SOURCE SEGMENT:
         {chunk_text}
@@ -1900,7 +1940,7 @@ def chunked_refactor_article(source_text, audience_context, specialist_model, st
     return post_process_mermaid_to_images(final_html)
 
 # 14. The Dedicated pSEO Article Generator
-def generate_pseo_article(topic, context, history="", history_events=None, is_initial_post=True, session_id=None):
+def generate_pseo_article(topic, context, history="", history_events=None, is_initial_post=True, session_id=None, output_target="CMS_DRAFT"):
     global unimodel
     style_mentors = get_stylistic_mentors(session_id)
     print(f"Tool: Generating pSEO Article for '{topic}'")
@@ -1987,7 +2027,7 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
         
         # PERFORMANCE FIX (ADK-CHUNK): Handle massive drafts (>8k chars) via segmentation
         if len(source_to_refactor) > 8000:
-            return chunked_refactor_article(source_to_refactor, audience_context, specialist_model, style_mentors)
+            return chunked_refactor_article(source_to_refactor, audience_context, specialist_model, style_mentors, output_target=output_target)
 
         print("  + Using Single-Pass Refactor (Small Article)")
         refactor_prompt = f"""
@@ -2007,12 +2047,10 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
         - **Acronym Protocol**: Define all acronyms in parentheses on the first use.
         - **Inline Anchored Links**: Ensure all external links are preserved as semantic HTML anchored tags: `<a href="URL">Anchor Text</a>`.
         
-        CRITICAL FORMATTING RULES:
-        -   **NO MARKDOWN**: Absolutely NO markdown backticks (```), asterisks for bold (**), or hyphens for lists (- or *).
-        -   **CLEAN CONTENT**: Remove any internal instructions, metalabels, or architect-facing strings (e.g., "writing_instruction", "blueprint", "architect notes") found in the source text.
-        -   **NO PREAMBLE**: Start directly with the first HTML tag.
-        -   **NO LINK DUMP**: Absolutely PROHIBIT appending a list of "Sources" or "References" at the end of the article.
-        
+        {STYLE_PROTOCOL}
+        {style_mentors}
+        {target_instruction}
+
         SOURCE TEXT:
         {source_to_refactor}
         """
@@ -2060,6 +2098,7 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     
     {STYLE_PROTOCOL}
     {style_mentors}
+    {target_instruction}
     
     STRUCTURE REQUIREMENTS (Strict HTML):
     1.  **<section class="intro">**: A compelling hook. **MEAT-FIRST**: Deliver core findings or high-density technical insights immediately in the first paragraph.
@@ -2099,9 +2138,15 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     return post_process_mermaid_to_images(sanitize_llm_html(raw_response))
 
 # 14.5 The Recursive Deep-Dive Generator (Dynamic Room-by-Room Construction)
-def generate_deep_dive_article(topic, context, history="", history_events=None, target_length=1500, target_geo="Global", session_id=None):
+def generate_deep_dive_article(topic, context, history="", history_events=None, target_length=1500, target_geo="Global", session_id=None, output_target="MODERATOR_VIEW"):
     global unimodel
     style_mentors = get_stylistic_mentors(session_id)
+    
+    target_instruction = ""
+    if output_target == "MODERATOR_VIEW":
+        target_instruction = "TARGET: MODERATOR_VIEW (Slack). Use Markdown Pipes (|) for tables. Use standard Slack formatting."
+    else:
+        target_instruction = "TARGET: CMS_DRAFT (Ghost). Use Semantic HTML <table> tags. PROHIBIT Markdown."
     print(f"Tool: Initiating Recursive Deep-Dive for '{topic}' (Region: {target_geo}, Target: {target_length} words)")
     
     # CLAMP: Prevent unbounded generation that crashes SSL/Webhooks
@@ -2169,7 +2214,7 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     except Exception as e:
         print(f"Blueprint Error: {e}")
         # Fallback to pSEO if blueprinting fails
-        return generate_pseo_article(topic, context, history, history_events=history_events, is_initial_post=True, session_id=session_id)
+        return generate_pseo_article(topic, context, history, history_events=history_events, is_initial_post=True, session_id=session_id, output_target=output_target)
 
     # PHASE 2: Recursive Room Building (The Writer - PARALLELIZED)
     article_parts = [f"<h1>{title}</h1>"]
@@ -2186,6 +2231,7 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     
     {STYLE_PROTOCOL}
     {style_mentors}
+    {target_instruction}
     
     GOAL: {topic}
     
@@ -2222,6 +2268,7 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
         
         {STYLE_PROTOCOL}
         {style_mentors}
+        {target_instruction}
         
         CHAPTER {index+1}/{total_sections}: {section['title']}
         INSTRUCTION: {instruction}
@@ -2284,6 +2331,10 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     Audience: {audience_context}. 
     Summary of key impact.
     
+    {STYLE_PROTOCOL}
+    {style_mentors}
+    {target_instruction}
+
     OUTPUT: Return ONLY the content in semantic HTML (no markdown). Wrap paragraphs in <p>. Do NOT include a header.
     """
     conc_raw = safe_generate_content(unimodel, conc_prompt)
@@ -2340,10 +2391,18 @@ def create_euphemistic_links(keyword_context, is_initial=True, session_id=None):
     """
     return extract_json(safe_generate_content(unimodel, prompt))
 
-def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None, session_id=None):
+#15. The Euphemistic 'Then vs Now' Linker
+def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None, session_id=None, output_target="MODERATOR_VIEW"):
     if not tool_confirmation or not tool_confirmation.get("confirmed"): raise PermissionError("Wait for approval.")
     style_mentors = get_stylistic_mentors(session_id)
-    return safe_generate_content(unimodel, f"{STYLE_PROTOCOL}\n{style_mentors}\nTASK: Tell a 'Then and Now' story using these concepts: {interlinked_concepts}")
+    
+    target_instruction = ""
+    if output_target == "MODERATOR_VIEW":
+        target_instruction = "IMPORTANT: You are talking to a MODERATOR on Slack. Use Markdown Pipes (|) for any tables."
+    else:
+        target_instruction = "IMPORTANT: You are drafting for Ghost CMS. Use strictly semantic HTML <table> tags."
+
+    return safe_generate_content(unimodel, f"{STYLE_PROTOCOL}\n{style_mentors}\n{target_instruction}\nTASK: Tell a 'Then and Now' story using these concepts: {interlinked_concepts}")
 
 #16. The Proposal Critic and Refiner
 def critique_proposal(topic, current_proposal):
@@ -2365,11 +2424,18 @@ def refine_proposal(topic, current_proposal, critique, session_id=None):
     return extract_json(safe_generate_content(unimodel, prompt))
 
 # 18. Phase 1: Sales-to-Content Pipeline
-def process_sales_transcript(transcript_text):
+def process_sales_transcript(transcript_text, output_target="MODERATOR_VIEW"):
     """
     Extracts customer objections and generates solution brief.
     """
     global specialist_model, db
+    
+    target_instruction = ""
+    if output_target == "MODERATOR_VIEW":
+        target_instruction = "TARGET: MODERATOR_VIEW (Slack Briefing). Use Markdown Pipes (|) for tables. Use Slack-safe formatting."
+    else:
+        target_instruction = "TARGET: CMS_DRAFT (Ghost CMS). Use Semantic HTML <table> tags. PROHIBIT Markdown."
+
     
     # Step 1: Extract objections using Claude
     objection_prompt = f"""
@@ -2430,10 +2496,11 @@ def process_sales_transcript(transcript_text):
     ## Objection Responses
     {STYLE_PROTOCOL}
     {style_mentors}
+    {target_instruction}
     
-    ### FORMATTING RULES:
+    ### FORMATTING RULES (PRIORITY):
     1. Use **bold** for emphasis.
-    2. Use markdown tables where appropriate.
+    2. Tables: IF MODERATOR_VIEW, use Markdown Pipes (|). IF CMS_DRAFT, use HTML <table>.
     3. **Code Blocks**: If including technical/code examples, use markdown fenced code blocks:
        - Use triple backticks with language identifier: ```language
     """
@@ -2835,8 +2902,11 @@ def process_story_logic(request):
             
             if has_substantive_history:
                 print(f"Executing Operational Reformat (Fast Exit) for command: {sanitized_topic[:50]}")
+                # Determined Output Target
+                target = get_output_target(intent)
+                
                 # RESTORED: Use simpler natural answer generator to avoid persona-induced bloat
-                answer_data = generate_natural_answer(sanitized_topic, "COMPLETE_CONTEXT_IN_HISTORY", history=history_text, session_id=session_id)
+                answer_data = generate_natural_answer(sanitized_topic, "COMPLETE_CONTEXT_IN_HISTORY", history=history_text, session_id=session_id, output_target=target)
                 answer_text = answer_data['text']
                 research_intent = answer_data.get('intent', "OPERATIONAL_REFORMAT")
                 
@@ -2873,8 +2943,11 @@ def process_story_logic(request):
         # === PATH CX: BLOG OUTLINE (High-Fidelity Structure) ===
         elif intent == "BLOG_OUTLINE":
             print(f"Executing Blog Outline generation for command: {sanitized_topic[:50]}")
+            # Determined Output Target
+            target = get_output_target(intent)
+            
             # Use Comprehensive Content Strategist for outlines
-            answer_data = generate_comprehensive_answer(sanitized_topic, "BLOG_OUTLINE_MODE", history=history_text, context_topic=original_topic, session_id=session_id)
+            answer_data = generate_comprehensive_answer(sanitized_topic, "BLOG_OUTLINE_MODE", history=history_text, context_topic=original_topic, session_id=session_id, output_target=target)
             answer_text = answer_data['text']
             
             new_events.append({"event_type": "agent_answer", "text": answer_text, "intent": "BLOG_OUTLINE"})
@@ -2906,8 +2979,8 @@ def process_story_logic(request):
         elif intent == "SALES_TRANSCRIPT" or req.get('type') == 'sales_transcript':
             print("Executing Sales Transcript Processing (Fast Exit)")
             transcript_text = req.get('transcript', sanitized_topic)
-            
-            result = process_sales_transcript(transcript_text)
+            target = get_output_target(intent)
+            result = process_sales_transcript(transcript_text, output_target=target)
             
             # SUCCESS: Log the event to subcollection for Feedback Worker retrieval
             ts = datetime.datetime.now(datetime.timezone.utc)
@@ -3114,8 +3187,11 @@ def process_story_logic(request):
         if intent in ["DIRECT_ANSWER", "BLOG_OUTLINE"] or str(intent).startswith("FORMAT_"):
             if intent == "BLOG_OUTLINE": print(f"Executing Blog Outline generation for command: {clean_topic[:50]}")
             
+            # Determined Output Target
+            target = get_output_target(intent)
+            
             # HIGH-FIDELITY ROUTING: Use Comprehensive Content Strategist for Audits/Formats
-            answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, session_id=session_id)
+            answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, session_id=session_id, output_target=target)
             answer_text = answer_data['text']
             research_intent = answer_data.get('intent', intent)
             
@@ -3153,8 +3229,10 @@ def process_story_logic(request):
             return jsonify({"msg": "High-fidelity answer sent"}), 200
 
         elif intent == "SIMPLE_QUESTION":
+            # Determined Output Target
+            target = get_output_target(intent)
             # LIGHTWEIGHT ROUTING: Use Natural Answer Engine
-            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text, session_id=session_id)
+            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text, session_id=session_id, output_target=target)
             answer_text = answer_data['text']
             research_intent = answer_data.get('intent', intent)
             formatting_directive = answer_data.get('directive', "")
@@ -3193,8 +3271,10 @@ def process_story_logic(request):
         elif intent == "DEEP_DIVE":
             target_count = extract_target_word_count(sanitized_topic, history=history_text)
             print(f"TELEMETRY: Executing Dynamic Deep-Dive Recursive Expansion (Target: {target_count})...")
+            # Determined Output Target
+            target = get_output_target(intent)
             # PASS THE sanitzied_topic as the DIRECTIVE to prioritize feedback
-            article_html = generate_deep_dive_article(sanitized_topic, research_data['context'], history=history_text, history_events=history_events, target_length=target_count, target_geo=final_geo, session_id=session_id)
+            article_html = generate_deep_dive_article(sanitized_topic, research_data['context'], history=history_text, history_events=history_events, target_length=target_count, target_geo=final_geo, session_id=session_id, output_target=target)
             
             # Use Claude for metadata even for deep dives
             seo_data = generate_seo_metadata(article_html, original_topic)
@@ -3278,7 +3358,8 @@ def process_story_logic(request):
 
             except Exception as e:
                 print(f"TELEMETRY: ⚠️ TOPIC_CLUSTER Fallback: {e}")
-                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic)
+                target = get_output_target(intent)
+                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, output_target=target)
                 answer_text = answer_data['text']
                 research_intent = answer_data.get('intent', intent)
                 
@@ -3358,7 +3439,8 @@ def process_story_logic(request):
 
             except ValueError as e:
                 # Fallback
-                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic)
+                target = get_output_target(intent)
+                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, output_target=target)
                 answer_text = answer_data['text']
                 research_intent = answer_data.get('intent', intent)
                 
@@ -3388,7 +3470,8 @@ def process_story_logic(request):
         elif intent == "PSEO_ARTICLE":
             try:
                 # 1. AGENT A (Gemini): Generate the Body Content (Prioritizing Latest Feedback)
-                article_html = generate_pseo_article(sanitized_topic, research_data['context'], history=history_text, history_events=history_events, is_initial_post=is_initial_post)
+                target = get_output_target(intent)
+                article_html = generate_pseo_article(sanitized_topic, research_data['context'], history=history_text, history_events=history_events, is_initial_post=is_initial_post, output_target=target)
                 
                 # 2. AGENT B (Claude): Generate the Semantic Metadata
                 seo_data = generate_seo_metadata(article_html, original_topic, session_id=session_id)
@@ -3443,7 +3526,8 @@ def process_story_logic(request):
 
             except Exception as e:
                 print(f"⚠️ PSEO_ARTICLE Fallback: {e}")
-                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic)
+                target = get_output_target(intent)
+                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, output_target=target)
                 answer_text = answer_data['text']
                 research_intent = answer_data.get('intent', intent)
                 
@@ -3472,7 +3556,8 @@ def process_story_logic(request):
         else: 
             # ROBUST FALLBACK: If intent is unknown, default to a natural answer rather than crashing with 500
             print(f"TELEMETRY: ⚠️ Unknown Intent Detected: '{intent}'. Defaulting to Natural Answer fallback.")
-            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text)
+            target = get_output_target("FALLBACK") # Defaults to MODERATOR_VIEW
+            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text, output_target=target)
             answer_text = answer_data['text']
             research_intent = answer_data['intent']
             formatting_directive = answer_data['directive']
