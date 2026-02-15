@@ -129,9 +129,8 @@ STYLE_PROTOCOL = """
 ### STYLE & SANITIZATION PROTOCOL (ZERO-TOLERANCE):
 - **MEAT-FIRST NARRATIVE**: BAN robotic framing like "Short answer:", "Bottom line:", or "The takeaway is:". Start with direct data.
 - **OUTPUT TARGETS (MANDATORY)**:
-    1. **CMS_DRAFT**: If the target is a blog draft, use ONLY semantic HTML. PROHIBIT all Markdown. Tables MUST use `<table>` tags. Headers MUST use `<h2>` or `<h3>` (PROHIBIT `#`).
-    2. **MODERATOR_VIEW**: If the target is a Slack brief, use Markdown for tables (pipes: `|`), headers (`#`, `##`), and code blocks. Use HTML for prose paragraphs.
-- **TAG ENFORCEMENT**: In CMS_DRAFT mode, wrap all paragraphs in `<p>`. In MODERATOR_VIEW, use Slack-safe line breaks.
+    1. **CMS_DRAFT**: If the target is a blog draft (Ghost), use ONLY semantic HTML. PROHIBIT all Markdown. Tables MUST use `<table>` tags. Headers MUST use `<h2>` or `<h3>` (PROHIBIT `#`). Wrap all paragraphs in `<p>`.
+    2. **MODERATOR_VIEW**: If the target is a Slack brief or research discovery, use Markdown exclusively for tables (pipes: `|`), headers (`#`, `##`), and code blocks. PROHIBIT all HTML tags (no `<p>`, `<h2>`, etc.). Use blank lines for paragraph separation.
 - **HUMAN FINGERPRINT**: Vary sentence length. Mix punchy sentences (5-10 words) with fluid reflections (20-35 words).
 - **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) or parentheses ( ).
 - **NARRATIVE COLON BAN**: PROHIBIT colons in prose to connect claims to details. Use a period and a new sentence, or descriptive transitions. 
@@ -158,6 +157,14 @@ STYLE_PROTOCOL = """
 - **MERMAID MANDATE**: You are strictly PROHIBITED from generating ASCII-based diagrams or logic maps (e.g., using arrows like `-->` or pipes `|` for flow). For any architectural maps, sequence flows, or visual logic, you MUST use `mermaid` code blocks. This ensures high-fidelity rendering via the MCP gateway.
 - **MERMAID MODULARITY**: For complex architectures, FAVOR multiple modular diagrams (e.g., Phase 1 vs Phase 2) over a single dense block. This ensures high-fidelity readability and prevents transport failures (Slack 3k URL limit).
 - **TABLE COMPACTION**: PROHIBIT blank lines within Markdown tables. All rows (header, separator, and data) MUST be contiguous for parser integrity.
+- **STRATEGIC CONTEXT SANITIZATION (ANTI-META-TALK)**:
+    - **UNIVERSAL PROHIBITION**: You are strictly PROHIBITED from mentioning internal strategic decision-making, competitive audits, or benchmarking scores in any CMS_DRAFT output.
+    - **BANNED CATEGORIES**:
+        1. **SEO/Metrics**: "competitor gap," "audit scores," "ranking analysis," "search volume," "AEO strategy," "moat factor," "technical density score."
+        2. **Process/Turns**: "turn-based analysis," "Turn 1/2/3/4," "internal blueprint," "iterative refinement," "previous response," "vetted prompt."
+        3. **Implementation Meta**: "strategic decision primitives," "policy enforcement point (PEP) architecture," "architectural logic implementation."
+        4. **Comparative Bias**: "technical vacuum," "marketing hype," "marketing fluff," "displace leaders."
+    - **TONE REPLACEMENT**: Instead of saying "Other guides score 2/10," simply present the authoritative technical finding with 10/10 technical depth. The "moat" is felt through your technical precision, not stated in prose.
 """
 
 # --- HELPER: Dynamic Linguistic Palette ---
@@ -2098,6 +2105,16 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     global unimodel
     style_mentors = get_stylistic_mentors(session_id)
     
+    # --- STRATEGIC CONTEXT SANITIZATION: Strip internal meta-talk from history ---
+    if output_target == "CMS_DRAFT":
+        internal_keywords = [
+            "competitor gap", "audit scores", "ranking analysis", "aeo strategy", 
+            "moat factor", "technical density score", "turn 1", "turn 2", "turn 3", 
+            "turn 4", "internal blueprint", "vetted prompt", "technical vacuum"
+        ]
+        for kw in internal_keywords:
+            history = re.sub(rf"(?i){kw}.*?\n?", "[STRATEGIC_CONTEXT_OMITTED] ", history)
+    
     target_instruction = ""
     if output_target == "MODERATOR_VIEW":
         target_instruction = "TARGET: MODERATOR_VIEW (Slack). Use Markdown Pipes (|) for tables. Use standard Slack formatting."
@@ -2132,9 +2149,10 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     has_outline_structure = "## " in str(history) and len(str(history)) < 3000 # Rough heuristic: Outlines are shorter
     has_full_draft_structure = "## " in str(history) and len(str(history)) > 3000
     
-    # FUTURE-PROOFING: If follow-up, insist on "pseo" keyword for Path A/B to avoid accidental refactors of general feedback
-    if not is_initial_post and not has_pseo_keyword:
-        print("  + Follow-up turn without 'pSEO' keyword. Defaulting to AUTHOR mode for safety.")
+    # FUTURE-PROOFING: If follow-up, favor REFACTOR/EXPAND mode if content exists.
+    # Only force AUTHOR mode if no pseo/article context is found in the current turn OR history.
+    if not is_initial_post and not has_pseo_keyword and not has_full_draft_structure and not has_outline_structure:
+        print("  + Follow-up turn without 'pSEO' keyword or existing structure. Defaulting to AUTHOR mode for safety.")
         start_mode = "AUTHOR"
     elif is_repurpose_cmd and has_full_draft_structure:
         start_mode = "REFACTOR"
@@ -2956,8 +2974,10 @@ def process_story_logic(request):
                 *   *POSITIVE TRIGGERS:* "Compare human-centric", "Do a then vs now", "Show trajectory", "Contrast eras".
                 *   *Rule:* Use this ONLY for explicit trajectory/comparison requests.
 
-            5.  **PSEO_ARTICLE**: **Ghost CMS Content Hook.** Only select this if the message is a NEW request to create a pSEO article or EXPLICITLY mentions "**pSEO**", "**Ghost**", or "**Ghost CMS**" as a command. 
-                *   *CRITICAL:* If the user is asking *about* a previous pSEO article (e.g., "How did you integrate X?", "Explain the delivery", "What's the status?"), **DO NOT** select this. Use **SIMPLE_QUESTION** or **DIRECT_ANSWER** instead.
+            5.  **PSEO_ARTICLE**: **Ghost CMS Content Hook.** Select this whenever the user includes the super-keyword "**pSEO**" in their request, or when they explicitly target the **Ghost CMS** platform ("update the post", "push to ghost").
+                *   *Super-Keyword Rule:* If the prompt contains "pSEO" or "Ghost" or "Ghost CMS", this is MANDATORY.
+                *   *Dichotomy Rule:* Use this for remote publication/updates. If the goal is just to see a summary or reformat the current Slack chat, use **OPERATIONAL_REFORMAT**.
+                *   *Triggers:* "Update the pSEO draft", "Push this pSEO article to Ghost", "Refine the Ghost post for the v1 migration".
 
             6.  **SALES_TRANSCRIPT**: **Sales Analysis.** Select this if the user provides a transcript or asks to analyze a sales call for objections, solution briefs, or deal coaching.
                 *   *Triggers:* "Analyze this call", "Create a solution brief", "Extract objections", "What were the pain points?".
@@ -3637,7 +3657,48 @@ def process_story_logic(request):
                 # 2. AGENT B (Claude): Generate the Semantic Metadata
                 seo_data = generate_seo_metadata(article_html, original_topic, session_id=session_id)
                 
-                # SUCCESS: Log the event to subcollection
+                # 3. Get session reference (used throughout this handler)
+                session_ref = db.collection('agent_sessions').document(session_id)
+                
+                # 4. Check if this is an update to an existing post (BEFORE updating session)
+                ghost_post_id = None
+                if not is_initial_post:
+                    # Try to find existing Ghost post ID from session metadata
+                    session_data = session_ref.get().to_dict()
+                    ghost_post_id = session_data.get('ghost_post_id') if session_data else None
+                
+                # 5. Determine operation type
+                operation_type = "pseo_update" if ghost_post_id else "pseo_draft"
+                
+                # 6. Build Ghost CMS payload (WITHOUT featured_image_prompt)
+                # Note: featured_image_prompt is preserved in seo_data for future Slack image feature
+                ghost_payload = {
+                    # REQUIRED FIELDS
+                    "title": seo_data.get("title", "Untitled Draft"),
+                    "html": article_html,
+                    
+                    # HIGH PRIORITY FIELDS
+                    "tags": seo_data.get("tags", []),
+                    "meta_title": seo_data.get("meta_title"),
+                    "meta_description": seo_data.get("meta_description"),
+                    
+                    # OPTIONAL FIELDS
+                    "custom_excerpt": seo_data.get("custom_excerpt")
+                }
+                
+                # Set status to 'draft' ONLY for CREATE operations
+                # For UPDATE operations, omit status to preserve current status (draft or published)
+                if not ghost_post_id:
+                    ghost_payload["status"] = "draft"
+                
+                # Add ghost_post_id for updates
+                if ghost_post_id:
+                    ghost_payload["ghost_post_id"] = ghost_post_id
+                
+                # Remove None values to avoid N8N errors
+                ghost_payload = {k: v for k, v in ghost_payload.items() if v is not None}
+                
+                # 7. SUCCESS: Log the event to subcollection
                 new_events.append({
                     "event_type": "agent_proposal", 
                     "proposal_type": "pseo_article", 
@@ -3645,14 +3706,13 @@ def process_story_logic(request):
                     "proposal_data": {"article_html": article_html}
                 })
                 
-                # 4. Write to Database
-                session_ref = db.collection('agent_sessions').document(session_id)
+                # 8. Write events to Database
                 events_ref = session_ref.collection('events')
                 for event in new_events:
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
                     events_ref.add(event)
 
-                # UPDATE METADATA: Preserve Mission Topic
+                # 9. UPDATE METADATA: Preserve Mission Topic
                 update_data = {
                     "status": "awaiting_feedback", 
                     "type": "work_proposal", 
@@ -3664,24 +3724,21 @@ def process_story_logic(request):
                 if is_initial_post: update_data["topic"] = seo_data.get('title', clean_topic)
                 session_ref.update(update_data)
                 
-                # 5. Send STRUCTURED DATA to N8N (Restored Wrapper for GhostNode Harmony)
+                # 9. Send STRUCTURED DATA to N8N (Restored Wrapper for GhostNode Harmony)
                 safe_n8n_delivery({
                     "session_id": session_id, 
-                    "type": "pseo_draft", 
-                    "payload": {
-                        "title": seo_data.get("title", "Untitled Draft"),
-                        "html": article_html,
-                        "tags": seo_data.get("tags", []),
-                        "custom_excerpt": seo_data.get("custom_excerpt"),
-                        "meta_title": seo_data.get("meta_title"),
-                        "meta_description": seo_data.get("meta_description"),
-                        "featured_image_prompt": seo_data.get("featured_image_prompt"),
-                        "status": "draft"
-                    },
+                    "type": operation_type,  # "pseo_draft" or "pseo_update"
+                    "payload": ghost_payload,
                     "channel_id": slack_context['channel'], 
                     "thread_ts": slack_context['ts'],
                     "is_initial_post": is_initial_post
                 })
+                
+                # 10. FUTURE: Generate and send featured image to Slack
+                # featured_image_prompt = seo_data.get("featured_image_prompt")
+                # if featured_image_prompt:
+                #     image_base64 = generate_featured_image(featured_image_prompt)
+                #     send_slack_image(image_base64, slack_context)
 
                 return jsonify({"msg": "pSEO Draft sent"}), 200
 

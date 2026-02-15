@@ -145,8 +145,8 @@ STYLE_PROTOCOL = """
 ### STYLE & SANITIZATION PROTOCOL (ZERO-TOLERANCE):
 - **MEAT-FIRST NARRATIVE**: BAN robotic framing like "Short answer:", "Bottom line:", or "The takeaway is:". Start with direct data.
 - **OUTPUT TARGETS (MANDATORY)**:
-    1. **CMS_DRAFT**: If the target is a blog draft, use ONLY semantic HTML. PROHIBIT all Markdown. Tables MUST use `<table>` tags.
-    2. **MODERATOR_VIEW**: If the target is a Slack brief, use Markdown for tables (pipes: `|`) and code blocks. Use HTML for prose.
+    1. **CMS_DRAFT**: If the target is a blog draft (Ghost), use ONLY semantic HTML. PROHIBIT all Markdown. Tables MUST use `<table>` tags. Headers MUST use `<h2>` or `<h3>` (PROHIBIT `#`). Wrap all paragraphs in `<p>`.
+    2. **MODERATOR_VIEW**: If the target is a Slack brief or research discovery, use Markdown exclusively for tables (pipes: `|`), headers (`#`, `##`), and code blocks. PROHIBIT all HTML tags (no `<p>`, `<h2>`, etc.). Use blank lines for paragraph separation.
 - **TAG ENFORCEMENT**: In CMS_DRAFT mode, wrap all paragraphs in `<p>`. In MODERATOR_VIEW, use Slack-safe line breaks.
 - **HUMAN FINGERPRINT**: Vary sentence length. Mix punchy sentences (5-10 words) with fluid reflections (20-35 words).
 - **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) or parentheses ( ).
@@ -174,8 +174,15 @@ STYLE_PROTOCOL = """
 - **MERMAID MANDATE**: You are strictly PROHIBITED from generating ASCII-based diagrams or logic maps (e.g., using arrows like `-->` or pipes `|` for flow). For any architectural maps, sequence flows, or visual logic, you MUST use `mermaid` code blocks. This ensures high-fidelity rendering via the MCP gateway.
 - **MERMAID MODULARITY**: For complex architectures, FAVOR multiple modular diagrams (e.g., Phase 1 vs Phase 2) over a single dense block. This ensures high-fidelity readability and prevents transport failures (Slack 3k URL limit).
 - **TABLE COMPACTION**: PROHIBIT blank lines within Markdown tables. All rows (header, separator, and data) MUST be contiguous for parser integrity.
+- **STRATEGIC CONTEXT SANITIZATION (ANTI-META-TALK)**:
+    - **UNIVERSAL PROHIBITION**: You are strictly PROHIBITED from mentioning internal strategic decision-making, competitive audits, or benchmarking scores in any CMS_DRAFT output.
+    - **BANNED CATEGORIES**:
+        1. **SEO/Metrics**: "competitor gap," "audit scores," "ranking analysis," "search volume," "AEO strategy," "moat factor," "technical density score."
+        2. **Process/Turns**: "turn-based analysis," "Turn 1/2/3/4," "internal blueprint," "iterative refinement," "previous response," "vetted prompt."
+        3. **Implementation Meta**: "strategic decision primitives," "policy enforcement point (PEP) architecture," "architectural logic implementation."
+        4. **Comparative Bias**: "technical vacuum," "marketing hype," "marketing fluff," "displace leaders."
+    - **TONE REPLACEMENT**: Instead of saying "Other guides score 2/10," simply present the authoritative technical finding with 10/10 technical depth. The "moat" is felt through your technical precision, not stated in prose.
 """
-
 # --- HELPER: Dynamic Linguistic Palette ---
 def get_stylistic_mentors(session_id=None):
     """
@@ -472,6 +479,16 @@ def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None, sessio
         specialist_model = UnifiedModel(provider="anthropic", model_name="claude-sonnet-4-5")
         
     style_mentors = get_stylistic_mentors(session_id)
+    
+    # --- STRATEGIC CONTEXT SANITIZATION ---
+    if output_target == "CMS_DRAFT":
+        internal_keywords = [
+            "competitor gap", "audit scores", "ranking analysis", "aeo strategy", 
+            "moat factor", "technical density score", "turn 1", "turn 2", "turn 3", 
+            "turn 4", "internal blueprint", "vetted prompt", "technical vacuum"
+        ]
+        for kw in internal_keywords:
+            interlinked_concepts = re.sub(rf"(?i){kw}.*?\n?", "[STRATEGIC_CONTEXT_OMITTED] ", str(interlinked_concepts))
     
     # Determined Output Target
     target_instruction = ""
