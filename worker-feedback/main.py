@@ -163,7 +163,9 @@ STYLE_PROTOCOL = """
     1. **DATA FIDELITY**: You are FORBIDDEN from generating any specific statistic (%), project count (e.g., "120 projects"), or implementation claim that is not explicitly in the USER PROMPT, PROVIDED FILES, or VERIFIED SEARCH RESULTS. Use qualitative descriptions if data is absent.
     2. **LINK VERIFICATION**: Only generate URLs that have been explicitly provided or verified in the current turn's context. Never "guess" a logical URL path.
     3. **ARCHITECTURAL ANCHORING**: Claims must align with the provided context (e.g., architectural or contextual specs). If a claim contradicts the Primary Anchor (Prompt/Files), the anchor takes precedence.
+- **MERMAID MANDATE**: You are strictly PROHIBITED from generating ASCII-based diagrams or logic maps (e.g., using arrows like `-->` or pipes `|` for flow). For any architectural maps, sequence flows, or visual logic, you MUST use `mermaid` code blocks. This ensures high-fidelity rendering via the MCP gateway.
 - **MERMAID MODULARITY**: For complex architectures, FAVOR multiple modular diagrams (e.g., Phase 1 vs Phase 2) over a single dense block. This ensures high-fidelity readability and prevents transport failures (Slack 3k URL limit).
+- **TABLE COMPACTION**: PROHIBIT blank lines within Markdown tables. All rows (header, separator, and data) MUST be contiguous for parser integrity.
 """
 
 # --- HELPER: Dynamic Linguistic Palette ---
