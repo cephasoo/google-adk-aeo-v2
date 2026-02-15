@@ -164,6 +164,7 @@ STYLE_PROTOCOL = """
         2. **Process/Turns**: "turn-based analysis," "Turn 1/2/3/4," "internal blueprint," "iterative refinement," "previous response," "vetted prompt."
         3. **Implementation Meta**: "strategic decision primitives," "policy enforcement point (PEP) architecture," "architectural logic implementation."
         4. **Comparative Bias**: "technical vacuum," "marketing hype," "marketing fluff," "displace leaders."
+    - **DEFINITION SHIELD**: PROHIBIT "Define [Abbreviation] as [Full Name]" sentence structures. Integrate definitions naturally (e.g., "The Policy Enforcement Point (PEP)...") or assume professional context.
     - **TONE REPLACEMENT**: Instead of saying "Other guides score 2/10," simply present the authoritative technical finding with 10/10 technical depth. The "moat" is felt through your technical precision, not stated in prose.
 """
 
