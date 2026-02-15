@@ -147,6 +147,14 @@ STYLE_PROTOCOL = """
     1. **DATA FIDELITY**: You are FORBIDDEN from generating any specific statistic (%), project count (e.g., "120 projects"), or implementation claim that is not explicitly in the USER PROMPT, PROVIDED FILES, or VERIFIED SEARCH RESULTS. Use qualitative descriptions if data is absent.
     2. **LINK VERIFICATION**: Only generate URLs that have been explicitly provided or verified in the current turn's context. Never "guess" a logical URL path.
     3. **ARCHITECTURAL ANCHORING**: Claims must align with the provided context (e.g., architectural or contextual specs). If a claim contradicts the Primary Anchor (Prompt/Files), the anchor takes precedence.
+    4. **GROUNDING DATA SUPREMACY (Universal)**: When GROUNDING DATA contains current information on ANY topic (APIs, news events, trend data, regulatory changes, market statistics, etc.), you MUST prioritize that information over your training data. Your training data has a knowledge cutoff; GROUNDING DATA represents real-time, verified information. Specific applications:
+       - **Technical**: API versions, library deprecations, framework updates
+       - **News/Events**: Current events, breaking news, recent announcements
+       - **Trends**: Search volume data, market shifts, emerging patterns
+       - **Regulatory**: New laws, policy changes, compliance updates
+       - **Statistics**: Current metrics, recent studies, updated benchmarks
+    5. **TEMPORAL VERIFICATION**: When GROUNDING DATA contains timestamps, publication dates, or version numbers, treat those as authoritative. If GROUNDING DATA shows information is outdated or superseded, you MUST use the current replacement mentioned in GROUNDING DATA.
+    6. **EXPLICIT SOURCE ATTRIBUTION**: When using information from GROUNDING DATA, cite the source type (e.g., "According to recent search data..." or "Based on current API documentation..."). This creates transparency about information provenance.
 - **MERMAID MANDATE**: You are strictly PROHIBITED from generating ASCII-based diagrams or logic maps (e.g., using arrows like `-->` or pipes `|` for flow). For any architectural maps, sequence flows, or visual logic, you MUST use `mermaid` code blocks. This ensures high-fidelity rendering via the MCP gateway.
 - **MERMAID MODULARITY**: For complex architectures, FAVOR multiple modular diagrams (e.g., Phase 1 vs Phase 2) over a single dense block. This ensures high-fidelity readability and prevents transport failures (Slack 3k URL limit).
 - **TABLE COMPACTION**: PROHIBIT blank lines within Markdown tables. All rows (header, separator, and data) MUST be contiguous for parser integrity.
@@ -654,25 +662,83 @@ def extract_core_topic(user_prompt, history=""):
     print(f"Distilling core topic from: '{user_prompt[:100]}...'")
     
     extraction_prompt = f"""
-    You are an expert Google Search operator.
+    You are an expert Google Search operator specializing in technical documentation discovery.
     Convert the user's natural language request into a single, high-precision Google Advanced Search query.
 
     ### SEARCH OPERATOR RULES:
     1.  **Grouping with Parentheses:** Use `( )` to group synonyms when using OR. 
     2.  **Alternatives:** Use uppercase `OR` between entities.
-    3.  **Exact Phrases:** Use quotes `""` for specific multi-word concepts.
+    3.  **Exact Phrases:** Use quotes `""` for specific multi-word concepts (but see TECHNICAL DISCOVERY PROTOCOL below).
     4.  **Exclusion:** Use `-` to remove noise.
     5.  **No Commas:** Do not use commas.
     6.  **Freshness:** If news, include "news" or "latest".
     7.  **Remove Fluff:** Remove "I want to know", "Please tell me", etc.
     8.  **Site Operator:** Use site: for specific domains.
     9.  **Filetype Operator:** Use filetype: for PDFs/docs.
-    10. **Limit Length:** Under 10 words.
+    10. **Limit Length:** Under 15 words (increased for technical queries).
     11. **Implicit AND:** No need for AND.
     12. **CRITICAL: FILTER EDITORIAL INSTRUCTIONS.**
         - Remove words like: "outline", "draft", "strategy", "blog post", "article", "word count", "Grade 8", "1500+ words", "logic flow".
         - But PRESERVE discovery intent words: "why", "how", "reasons", "causes", "factors", "impact", "trends".
         - Focus ONLY on the SUBJECT MATTER and DISCOVERY INTENT.
+
+    ### TECHNICAL DISCOVERY PROTOCOL (Universal):
+    **If the user's request involves discovering current/authoritative information about ANY technical subject, product, or specification:**
+    
+    **Applicable Domains:**
+    - **APIs/Libraries**: API versions, library versions, SDK documentation, deprecation status
+    - **Academic**: Books, theses, research papers, academic publications
+    - **Products**: Vehicle models, product specifications, technical manuals
+    - **Standards**: Technical standards, protocols, specifications (ISO, IEEE, RFC)
+    - **Software**: Framework versions, language features, tool documentation
+    - **Hardware**: Device specifications, component datasheets, technical specs
+    
+    **Universal Discovery Rules:**
+    1. **Identify the Core Subject**: Extract the primary entity (service name, product model, book title, standard number)
+    2. **Use OR for Variants/Alternatives**: If multiple names/versions exist, use OR (e.g., "Content API" OR "Merchant API", "iPhone 15" OR "iPhone 15 Pro")
+    3. **Avoid Over-Quoting Unrelated Terms**: Do NOT quote implementation details, security terms, or regulatory terms in the SAME query as the core discovery
+    4. **Prioritize Authoritative Sources**: 
+       - APIs: site:developers.google.com, site:docs.microsoft.com, site:developer.apple.com
+       - Academic: site:scholar.google.com, site:arxiv.org, site:jstor.org
+       - Products: site:manufacturer-domain.com (e.g., site:tesla.com for Tesla specs)
+       - Standards: site:ietf.org, site:iso.org, site:ieee.org
+    5. **Focus on Discovery Keywords**: 
+       - APIs: "documentation", "API reference", "current version", "deprecation", "migration guide"
+       - Academic: "full text", "PDF", "abstract", "citation", "DOI"
+       - Products: "specifications", "technical manual", "datasheet", "features"
+       - Standards: "RFC", "specification", "standard", "protocol"
+    6. **Separate Concerns**: If user mentions multiple unrelated topics, focus ONLY on the core discovery aspect
+    7. **Include Temporal Indicators**: If user says "current", "latest", "new", include those terms or use date filters
+
+    **Example Query Transformations (Multi-Domain):**
+    
+    **APIs:**
+    - Input: "Google Merchant Center's current product retrieval API with offerId lookups"
+      Output: site:developers.google.com "Google Merchant Center" ("Content API" OR "Merchant API") product retrieval offerId documentation
+    
+    - Input: "Current API for GMC with ES256 verification and POPIA compliance"
+      Output: site:developers.google.com "Google Merchant Center" API documentation current version deprecation
+    
+    **Academic:**
+    - Input: "Find the full text of 'Attention Is All You Need' transformer paper"
+      Output: "Attention Is All You Need" Vaswani transformer paper PDF (site:arxiv.org OR site:scholar.google.com)
+    
+    - Input: "Latest research on quantum computing error correction"
+      Output: quantum computing error correction research paper 2024 2025 (site:arxiv.org OR site:scholar.google.com)
+    
+    **Products:**
+    - Input: "Tesla Model 3 2024 battery specifications and range"
+      Output: site:tesla.com "Model 3" 2024 battery specifications range technical
+    
+    - Input: "iPhone 15 Pro camera sensor specs"
+      Output: site:apple.com "iPhone 15 Pro" camera sensor specifications technical
+    
+    **Standards:**
+    - Input: "Current HTTP/3 protocol specification"
+      Output: HTTP/3 RFC specification protocol (site:ietf.org OR site:rfc-editor.org)
+    
+    - Input: "ISO 27001 information security standard requirements"
+      Output: site:iso.org "ISO 27001" information security standard requirements
 
     ### CONTEXT MAPPING:
     Use the provided HISTORY to resolve ambiguous terms like "he", "it", or "that" where the specific entity names aren't specified.
@@ -1138,11 +1204,18 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     ### PROTOCOL & GUARDRAILS:
     1. **CONTEXTUAL ANCHORING**: Use the User Command or Provided Files (found in COLLECTED KNOWLEDGE) as your primary relevance filter. 
     2. **ERA ALIGNMENT (SUGGESTION)**: If the task involves modern tech (e.g., AP2, VCs, Web 3.0), prioritize research in that era. Avoid older patterns (e.g., OAuth2, JWT, Web 2.0) unless specifically requested.
-    3. **MULTI-VARIATE RESEARCH**: Decide if the user needs Architectural, Contextual, or Comparative specs. 
-    4. **VISUAL_INTENT**: Require seeing asset? [YES/NO]
-    5. **GEO_PIVOT**: If the user refers to a specific country, you MUST return the **ISO-3166-1 alpha-2** code.
-    6. **ADEQUACY_AUDIT**: Have enough info to solve the ARCHITECTURAL/CONTEXTUAL goal? [SUFFICIENT/INSUFFICIENT]
-    7. **TOOL_RECRUITMENT**: List tools (WEB, IMAGES, VIDEOS, TRENDS, ANALYSIS, COMPLIANCE, USE_CONVERSATIONAL_CONTEXT).
+    3. **TEMPORAL VERIFICATION PROTOCOL**: If the user's request involves ANY of the following, flag for verification in your rationale:
+       - **Technical**: API versions, library versions, framework updates, deprecation status
+       - **News/Events**: Current events, breaking news, recent announcements, policy changes
+       - **Trends**: Market shifts, search volume data, emerging patterns, consumer behavior
+       - **Statistics**: Current metrics, recent studies, updated benchmarks, market data
+       - **Regulatory**: New laws, compliance updates, regulatory changes, legal requirements
+       Example rationale: "API version verification required for Google Merchant Center" or "Current trend data needed for AI agent adoption"
+    4. **MULTI-VARIATE RESEARCH**: Decide if the user needs Architectural, Contextual, or Comparative specs. 
+    5. **VISUAL_INTENT**: Require seeing asset? [YES/NO]
+    6. **GEO_PIVOT**: If the user refers to a specific country, you MUST return the **ISO-3166-1 alpha-2** code.
+    7. **ADEQUACY_AUDIT**: Have enough info to solve the ARCHITECTURAL/CONTEXTUAL goal? [SUFFICIENT/INSUFFICIENT]
+    8. **TOOL_RECRUITMENT**: List tools (WEB, IMAGES, VIDEOS, TRENDS, ANALYSIS, COMPLIANCE, USE_CONVERSATIONAL_CONTEXT).
     
     OUTPUT FORMAT (Raw JSON Only):
     {{"visual_intent": "YES/NO", "new_geo": "...", "adequacy": "...", "selected_tools": [], "timeframe": "Today/7 Days/12 Months", "rationale": "..."}}
@@ -1252,6 +1325,15 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
             print("Sensory Router: Category [SEO] active. Distilling high-precision query...")
             distilled_seo_query = extract_core_topic(raw_topic, history=history_context)
         print(f"  -> SEO Query: '{distilled_seo_query}'")
+        
+        # VERIFICATION: Log query construction details for debugging
+        is_technical_query = any(term in raw_topic.lower() for term in [
+            "api", "current", "documentation", "library", "sdk", "paper", "thesis", 
+            "research", "specifications", "specs", "technical", "standard", "rfc", "iso"
+        ])
+        if is_technical_query:
+            print(f"  -> QUERY TYPE: Technical Discovery (will use fallback if needed)")
+            print(f"  -> ORIGINAL REQUEST: '{raw_topic[:150]}...'")
 
     if any("ANALYSIS" in t for t in selected_tools):
         print("Sensory Router: Category [TREND] active. Distilling trend entity...")
@@ -1282,6 +1364,49 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
         if choice == "WEB":
             research_context = search_google_web(distilled_seo_query)
             tool_name = "serpapi_web_search_global"
+            
+            # FALLBACK: If no results and query looks like technical discovery, retry with relaxed constraints
+            if not research_context or "No significant results" in str(research_context):
+                # Detect technical discovery queries by checking for common patterns
+                is_technical_query = any(term in distilled_seo_query.lower() for term in [
+                    # APIs/Libraries
+                    "api", "documentation", "library", "sdk", "client", 
+                    # Academic
+                    "paper", "thesis", "research", "publication", "doi", "arxiv",
+                    # Products
+                    "specifications", "specs", "technical manual", "datasheet",
+                    # Standards
+                    "rfc", "iso", "ieee", "standard", "protocol",
+                    # Software/Hardware
+                    "framework", "version", "deprecation", "migration",
+                    # Common discovery terms
+                    "current", "latest", "official", "reference"
+                ])
+                
+                if is_technical_query:
+                    print(f"FALLBACK: Initial technical discovery query returned no results. Retrying with relaxed constraints...")
+                    
+                    # Extract site: operator if present
+                    site_match = re.search(r'site:([^\s]+)', distilled_seo_query)
+                    site_operator = site_match.group(0) if site_match else ""
+                    
+                    # Extract core terms (remove quotes and extra terms)
+                    fallback_query = re.sub(r'site:[^\s]+', '', distilled_seo_query)  # Remove site operator
+                    fallback_query = re.sub(r'"[^"]*"', lambda m: m.group(0).replace('"', ''), fallback_query)  # Remove quotes
+                    
+                    # Add domain-appropriate discovery keyword
+                    if any(term in distilled_seo_query.lower() for term in ["api", "library", "sdk"]):
+                        fallback_query = f"{site_operator} {fallback_query} documentation".strip()
+                    elif any(term in distilled_seo_query.lower() for term in ["paper", "research", "thesis"]):
+                        fallback_query = f"{site_operator} {fallback_query} PDF full text".strip()
+                    elif any(term in distilled_seo_query.lower() for term in ["specifications", "specs", "manual"]):
+                        fallback_query = f"{site_operator} {fallback_query} technical specifications".strip()
+                    else:
+                        fallback_query = f"{site_operator} {fallback_query} official".strip()
+                    
+                    print(f"  -> Fallback Query: '{fallback_query}'")
+                    research_context = search_google_web(fallback_query)
+                    tool_name = "serpapi_web_search_global_fallback"
         elif choice == "IMAGES":
             research_context = search_google_images(distilled_seo_query)
             tool_name = "serpapi_image_search"
@@ -1540,7 +1665,6 @@ def ensure_slack_compatibility(text):
         compacted_lines.append(line)
     
     lines = compacted_lines
-    tables_found = 0
     
     for i, line in enumerate(lines):
         if line.strip().startswith("```"):
@@ -1755,7 +1879,20 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     
     ### CRITICAL RULES:
     1. Generate a response that directly addresses the LATEST INSTRUCTION while using the GROUNDING DATA as supporting evidence.
-    2. **Formatting Protocol (MANDATORY)**: 
+    2. **GROUNDING DATA PRIORITY (MANDATORY - Universal)**: If GROUNDING DATA contains current information on ANY topic, you MUST prioritize it over your training data. Your training data has a knowledge cutoff; GROUNDING DATA represents real-time, verified information. Examples:
+       - **Technical**: API versions, deprecation status, current best practices
+       - **News/Events**: Recent announcements, breaking news, current events
+       - **Trends**: Search volume data, market shifts, emerging patterns
+       - **Statistics**: Current metrics, recent studies, updated benchmarks
+    3. **Temporal Awareness Protocol**: When GROUNDING DATA contains timestamps or version information:
+       - Check if information is current or outdated
+       - If outdated information is superseded in GROUNDING DATA, use the replacement
+       - Explicitly note temporal context (e.g., "As of February 2026..." or "According to recent data...")
+    4. **Implementation Protocol** (for technical content):
+       - First, check GROUNDING DATA for current versions and deprecation status
+       - Explicitly state which version you are using in comments or documentation
+       - If GROUNDING DATA shows deprecation, use the replacement mentioned
+    5. **Formatting Protocol (MANDATORY)**: 
        - **If TARGET: CMS_DRAFT (Ghost)**: Use semantic HTML `<pre><code class="language-...">...</code></pre>`. Always specify the language (e.g., `language-python`) for syntax highlighting. PROHIBIT triple backticks. Use `<h2>` and `<h3>` for headers (PROHIBIT `#`). Use `<p>` for paragraphs.
        - **If TARGET: MODERATOR_VIEW (Slack)**: Use markdown fenced code blocks with triple backticks and the language identifier (e.g., ```python). Use Markdown headers (`#`, `##`). Use `<p>` for prose paragraphs (Slack-safe).
     """
