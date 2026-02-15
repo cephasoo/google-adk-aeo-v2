@@ -129,8 +129,8 @@ STYLE_PROTOCOL = """
 ### STYLE & SANITIZATION PROTOCOL (ZERO-TOLERANCE):
 - **MEAT-FIRST NARRATIVE**: BAN robotic framing like "Short answer:", "Bottom line:", or "The takeaway is:". Start with direct data.
 - **OUTPUT TARGETS (MANDATORY)**:
-    1. **CMS_DRAFT**: If the target is a blog draft, use ONLY semantic HTML. PROHIBIT all Markdown. Tables MUST use `<table>` tags.
-    2. **MODERATOR_VIEW**: If the target is a Slack brief, use Markdown for tables (pipes: `|`) and code blocks. Use HTML for prose.
+    1. **CMS_DRAFT**: If the target is a blog draft, use ONLY semantic HTML. PROHIBIT all Markdown. Tables MUST use `<table>` tags. Headers MUST use `<h2>` or `<h3>` (PROHIBIT `#`).
+    2. **MODERATOR_VIEW**: If the target is a Slack brief, use Markdown for tables (pipes: `|`), headers (`#`, `##`), and code blocks. Use HTML for prose paragraphs.
 - **TAG ENFORCEMENT**: In CMS_DRAFT mode, wrap all paragraphs in `<p>`. In MODERATOR_VIEW, use Slack-safe line breaks.
 - **HUMAN FINGERPRINT**: Vary sentence length. Mix punchy sentences (5-10 words) with fluid reflections (20-35 words).
 - **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) or parentheses ( ).
@@ -147,7 +147,9 @@ STYLE_PROTOCOL = """
     1. **DATA FIDELITY**: You are FORBIDDEN from generating any specific statistic (%), project count (e.g., "120 projects"), or implementation claim that is not explicitly in the USER PROMPT, PROVIDED FILES, or VERIFIED SEARCH RESULTS. Use qualitative descriptions if data is absent.
     2. **LINK VERIFICATION**: Only generate URLs that have been explicitly provided or verified in the current turn's context. Never "guess" a logical URL path.
     3. **ARCHITECTURAL ANCHORING**: Claims must align with the provided context (e.g., architectural or contextual specs). If a claim contradicts the Primary Anchor (Prompt/Files), the anchor takes precedence.
+- **MERMAID MANDATE**: You are strictly PROHIBITED from generating ASCII-based diagrams or logic maps (e.g., using arrows like `-->` or pipes `|` for flow). For any architectural maps, sequence flows, or visual logic, you MUST use `mermaid` code blocks. This ensures high-fidelity rendering via the MCP gateway.
 - **MERMAID MODULARITY**: For complex architectures, FAVOR multiple modular diagrams (e.g., Phase 1 vs Phase 2) over a single dense block. This ensures high-fidelity readability and prevents transport failures (Slack 3k URL limit).
+- **TABLE COMPACTION**: PROHIBIT blank lines within Markdown tables. All rows (header, separator, and data) MUST be contiguous for parser integrity.
 """
 
 # --- HELPER: Dynamic Linguistic Palette ---
@@ -1515,16 +1517,32 @@ def ensure_slack_compatibility(text):
     Ensures text is formatted correctly for Slack:
     1. Enforces double newlines for paragraphs.
     2. Converts Markdown bold (**) to Slack bold (*).
-    
-    Skips code blocks to prevent breaking syntax.
+    3. TABLE COMPACTION: Strips blank lines within pipe-based tables.
     """
     if not text: return ""
     lines = text.split('\n')
     new_lines = []
     in_code_block = False
     
+    # Pass 1: Compact Table Slags (Strip blank lines within |...|) + Strip Separators
+    compacted_lines = []
+    separator_pattern = re.compile(r'^\s*\|[\s\-:|\|]+\|\s*$')  # Matches |---|---| or |:::|:::| etc.
+    
+    for line in lines:
+        # Skip table separator lines (e.g., |---|---|)
+        if separator_pattern.match(line):
+            continue
+            
+        if not line.strip() and compacted_lines and compacted_lines[-1].strip().startswith('|') and compacted_lines[-1].strip().endswith('|'):
+            # Look ahead for a matching pipe to confirm it's a split table
+            # However, for robustness, we just drop interior blanks if sandwiched by pipes
+            continue 
+        compacted_lines.append(line)
+    
+    lines = compacted_lines
+    tables_found = 0
+    
     for i, line in enumerate(lines):
-        # Toggle code block state - RESTORED TO STABLE START-ONLY LOGIC
         if line.strip().startswith("```"):
             in_code_block = not in_code_block
             new_lines.append(line)
@@ -1534,21 +1552,18 @@ def ensure_slack_compatibility(text):
             new_lines.append(line)
             continue
             
-        # Detect clear paragraph breaks (non-list, non-header)
+        is_table_row = line.strip().startswith('|') and line.strip().endswith('|')
+        
         is_list_item = line.strip().startswith(('-', '*', '1.', '•'))
         is_header = line.strip().startswith('#')
         is_empty = not line.strip()
         
-        # FIX BOLDING: Convert **text** to *text* only if not in code block
-        # Use regex to replace double asterisks with single, preserving inner content
         processed_line = re.sub(r'\*\*(.+?)\*\*', r'*\1*', line)
-        
         new_lines.append(processed_line)
         
-        # Add extra newline if it's a paragraph end and next line isn't empty
-        if not is_empty and not is_list_item and not is_header and i < len(lines) - 1:
+        if not is_empty and not is_list_item and not is_header and not is_table_row and i < len(lines) - 1:
             next_line = lines[i+1]
-            if next_line.strip() and not next_line.strip().startswith(('-', '*', '1.', '•')):
+            if next_line.strip() and not next_line.strip().startswith(('-', '*', '1.', '•')) and not next_line.strip().startswith('|'):
                 new_lines.append("")  
 
     return "\n".join(new_lines)
@@ -1740,17 +1755,19 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     
     ### CRITICAL RULES:
     1. Generate a response that directly addresses the LATEST INSTRUCTION while using the GROUNDING DATA as supporting evidence.
-    2. **Code Blocks**: For any code snippets, use markdown fenced code blocks:
-       - Use triple backticks with language identifier: ```language
-       - Example: ```python\ndef hello(): return \"world\"\n```
-       - Always specify the language for proper syntax highlighting.
+    2. **Formatting Protocol (MANDATORY)**: 
+       - **If TARGET: CMS_DRAFT (Ghost)**: Use semantic HTML `<pre><code class="language-...">...</code></pre>`. Always specify the language (e.g., `language-python`) for syntax highlighting. PROHIBIT triple backticks. Use `<h2>` and `<h3>` for headers (PROHIBIT `#`). Use `<p>` for paragraphs.
+       - **If TARGET: MODERATOR_VIEW (Slack)**: Use markdown fenced code blocks with triple backticks and the language identifier (e.g., ```python). Use Markdown headers (`#`, `##`). Use `<p>` for prose paragraphs (Slack-safe).
     """
 
     # Use active_model (Dynamic routing) for the final synthesis
     text = safe_generate_content(active_model, prompt, generation_config={"temperature": target_temp})
     
+    # INTEGRATE MERMAID: Convert any Mermaid blocks to images before final formatting
+    processed_text = post_process_mermaid_to_images(text)
+    
     # Enforce spacing on the output
-    final_text = ensure_slack_compatibility(text.strip())
+    final_text = ensure_slack_compatibility(processed_text.strip())
     
     return {
         "text": final_text,
@@ -1943,6 +1960,13 @@ def chunked_refactor_article(source_text, audience_context, specialist_model, st
 def generate_pseo_article(topic, context, history="", history_events=None, is_initial_post=True, session_id=None, output_target="CMS_DRAFT"):
     global unimodel
     style_mentors = get_stylistic_mentors(session_id)
+    
+    target_instruction = ""
+    if output_target == "MODERATOR_VIEW":
+        target_instruction = "TARGET: MODERATOR_VIEW (Slack). Use Markdown Pipes (|) for tables. Use standard Slack formatting."
+    else:
+        target_instruction = "TARGET: CMS_DRAFT (Ghost). Use Semantic HTML <table> tags. PROHIBIT Markdown."
+
     print(f"Tool: Generating pSEO Article for '{topic}'")
     
     # AUDIENCE DETECTION: Search history for tone instructions
@@ -3549,7 +3573,21 @@ def process_story_logic(request):
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
                 session_ref.update(update_data)
-                safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
+                if intent == "PSEO_ARTICLE":
+                    safe_n8n_delivery({
+                        "session_id": session_id, 
+                        "type": "pseo_draft", 
+                        "payload": {
+                            "title": clean_topic,
+                            "html": answer_text,
+                            "status": "draft_fallback"
+                        },
+                        "channel_id": slack_context['channel'], 
+                        "thread_ts": slack_context['ts'],
+                        "is_initial_post": is_initial_post
+                    })
+                else:
+                    safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
                 return jsonify({"msg": "pSEO Fallback Answer sent"}), 200
 
 
