@@ -102,6 +102,52 @@ def get_flash_model():
     return flash_model
 
 # --- Shared Helper: SERP Parser ---
+def _parse_bing_results(results):
+    extracted_features = []
+    
+    if "bing_chat" in results:
+        chat = results["bing_chat"]
+        answer = chat.get("answer", "")
+        if answer:
+            extracted_features.append(f"**Bing Copilot / Chat Answer:**\n{answer}")
+        
+        citations = chat.get("citations", [])
+        if citations:
+            cite_list = ["**Citations:**"]
+            for cite in citations:
+                cite_list.append(f"- {cite.get('text', 'N/A')}: {cite.get('link', 'N/A')}")
+            extracted_features.append("\n".join(cite_list))
+
+    if "organic_results" in results:
+        organic = results["organic_results"][:5]
+        organic_list = [f"- {res.get('title', 'N/A')}: {res.get('snippet', 'N/A')} ({res.get('link', 'N/A')})" for res in organic]
+        if organic_list:
+            extracted_features.append("**Bing Web Results:**\n" + "\n".join(organic_list))
+
+    if extracted_features:
+        return "[GROUNDING_CONTENT (BING)]\n" + "\n\n---\n\n".join(extracted_features)
+    return "No significant Bing results found."
+
+def _parse_youtube_results(results):
+    extracted_features = []
+    
+    if "video_results" in results:
+        videos = results["video_results"][:5]
+        video_list = []
+        for vid in videos:
+            title = vid.get("title", "N/A")
+            link = vid.get("link", "N/A")
+            channel = vid.get("channel", {}).get("name", "N/A")
+            desc = vid.get("description", "No description.")
+            video_list.append(f"- **{title}** by {channel}\n  Snippet: {desc}\n  Link: {link}")
+        
+        if video_list:
+            extracted_features.append("**YouTube Search Results:**\n" + "\n".join(video_list))
+
+    if extracted_features:
+        return "[GROUNDING_CONTENT (YOUTUBE)]\n" + "\n\n---\n\n".join(extracted_features)
+    return "No significant YouTube results found."
+
 def _parse_serp_features(results):
     extracted_features = []
     if "ai_overview" in results:
@@ -312,6 +358,7 @@ def handle_tool_call(name, arguments):
         "google_web_search", "scrape_article", "rag_search", "compliance_rag_search",
         "google_trends", "trend_analysis", "google_images_search", "google_videos_search", 
         "google_scholar_search", "google_news_search", "google_simple_search",
+        "bing_search", "bing_copilot", "youtube_search",
         "detect_geo", "detect_intent", "analyze_image", "generate_image",
         "google_ai_overview", "analyze_code_file", "render_mermaid"
     ]
@@ -669,6 +716,27 @@ def handle_tool_call(name, arguments):
         params = {"api_key": SERPAPI_API_KEY, "engine": "google_ai_overview", "page_token": token}
         results = GoogleSearch(params).get_dict()
         result = _parse_serp_features(results)
+
+    elif name == "bing_search":
+        query = arguments.get("query")
+        if not query: return "Error: Missing query."
+        params = {"api_key": SERPAPI_API_KEY, "engine": "bing", "q": query}
+        results = GoogleSearch(params).get_dict()
+        result = _parse_bing_results(results)
+
+    elif name == "bing_copilot":
+        query = arguments.get("query")
+        if not query: return "Error: Missing query."
+        params = {"api_key": SERPAPI_API_KEY, "engine": "bing_copilot", "q": query}
+        results = GoogleSearch(params).get_dict()
+        result = _parse_bing_results(results) # Reuses common Bing structure + chat bits
+
+    elif name == "youtube_search":
+        query = arguments.get("query")
+        if not query: return "Error: Missing query."
+        params = {"api_key": SERPAPI_API_KEY, "engine": "youtube", "search_query": query}
+        results = GoogleSearch(params).get_dict()
+        result = _parse_youtube_results(results)
 
     elif name == "detect_geo":
         query = arguments.get("query")

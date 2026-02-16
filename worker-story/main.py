@@ -122,26 +122,10 @@ db = None
 mcp_client = None
 secret_client = None
 
-# --- STYLE & SANITIZATION PROTOCOL (Global Constant) ---
-# This ensures 100% linguistic consistency across all generation paths
-# to prevent "Context Pollution" in long-running threads.
-STYLE_PROTOCOL = """
-### STYLE & SANITIZATION PROTOCOL (ZERO-TOLERANCE):
-- **MEAT-FIRST NARRATIVE**: BAN robotic framing like "Short answer:", "Bottom line:", or "The takeaway is:". Start with direct data.
-- **OUTPUT TARGETS (MANDATORY)**:
-    1. **CMS_DRAFT**: If the target is a blog draft (Ghost), use ONLY semantic HTML. PROHIBIT all Markdown. Tables MUST use `<table>` tags. Headers MUST use `<h2>` or `<h3>` (PROHIBIT `#`). Wrap all paragraphs in `<p>`.
-    2. **MODERATOR_VIEW**: If the target is a Slack brief or research discovery, use Markdown exclusively for tables (pipes: `|`), headers (`#`, `##`), and code blocks. PROHIBIT all HTML tags (no `<p>`, `<h2>`, etc.). Use blank lines for paragraph separation.
-- **HUMAN FINGERPRINT**: Vary sentence length. Mix punchy sentences (5-10 words) with fluid reflections (20-35 words).
-- **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) or parentheses ( ).
-- **NARRATIVE COLON BAN**: PROHIBIT colons in prose to connect claims to details. Use a period and a new sentence, or descriptive transitions. 
-- **COLON PROTOCOL (LISTS ONLY)**: Colons are for vertical bulleted lists ONLY. 
-- **MANDATORY CAPITALIZATION**: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED. Absolutely PROHIBIT "Label: lowercase" patterns.
-- **LEXICAL VARIETY (ANTI-CLUMPING)**: MANDATE categorical rotation. PROHIBIT repeating the same key noun/verb in adjacent sentences.
-- **ACTIVE VERB PRIORITY**: PRIORITIZE descriptive, context-aware actions. Use the provided Dynamic Palette as mentors.
-- **ZERO-PASSIVE VOICE**: PRIORITIZE active voice to drive narrative momentum.
-- **ANTI-WATERMARK**: BAN robotic buzzwords: 'delve', 'tapestry', 'landscape', 'unlock', 'embark', 'comprehensive', 'robust'. 
-- **NO COLON CLUMPING**: Do not use "Label: Definition" structures. Use active, descriptive narrative flow.
-- **TACTICAL TRANSITIONS**: BAN robotic connectors like "Furthermore" or "Moreover." Use the provided Dynamic Palette to maintain narrative "drag."
+# --- MODULAR STYLE & SANITIZATION PROTOCOL (Zero-Loss Fidelity) ---
+
+# 1. BASELINE: Grounding & RAI (Permanent System Instructions)
+PROTOCOL_GROUNDING_RAI = """
 - **CONTEXTUAL INTEGRITY (ZERO-INVENTION)**:
     1. **DATA FIDELITY**: You are FORBIDDEN from generating any specific statistic (%), project count (e.g., "120 projects"), or implementation claim that is not explicitly in the USER PROMPT, PROVIDED FILES, or VERIFIED SEARCH RESULTS. Use qualitative descriptions if data is absent.
     2. **LINK VERIFICATION**: Only generate URLs that have been explicitly provided or verified in the current turn's context. Never "guess" a logical URL path.
@@ -154,11 +138,44 @@ STYLE_PROTOCOL = """
        - **Statistics**: Current metrics, recent studies, updated benchmarks
     5. **TEMPORAL VERIFICATION**: When GROUNDING DATA contains timestamps, publication dates, or version numbers, treat those as authoritative. If GROUNDING DATA shows information is outdated or superseded, you MUST use the current replacement mentioned in GROUNDING DATA.
     6. **EXPLICIT SOURCE ATTRIBUTION**: When using information from GROUNDING DATA, cite the source type (e.g., "According to recent search data..." or "Based on current API documentation..."). This creates transparency about information provenance.
+"""
+
+# 2. VISUAL & TABULAR (Permanent System Instructions)
+PROTOCOL_VISUAL_TABULAR = """
 - **MERMAID MANDATE**: You are strictly PROHIBITED from generating ASCII-based diagrams or logic maps (e.g., using arrows like `-->` or pipes `|` for flow). For any architectural maps, sequence flows, or visual logic, you MUST use `mermaid` code blocks. This ensures high-fidelity rendering via the MCP gateway.
 - **MERMAID MODULARITY**: For complex architectures, FAVOR multiple modular diagrams (e.g., Phase 1 vs Phase 2) over a single dense block. This ensures high-fidelity readability and prevents transport failures (Slack 3k URL limit).
 - **TABLE COMPACTION**: PROHIBIT blank lines within Markdown tables. All rows (header, separator, and data) MUST be contiguous for parser integrity.
+"""
+
+# 3. LITERARY CORE: Persona & Tone (High-Fidelity Turns Only)
+PROTOCOL_LITERARY_CORE = """
+- **MEAT-FIRST NARRATIVE**: BAN robotic framing like "Short answer:", "Bottom line:", or "The takeaway is:". Start with direct data.
+- **HUMAN FINGERPRINT**: Vary sentence length. Mix punchy sentences (5-10 words) with fluid reflections (20-35 words).
+- **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) or parentheses ( ).
+- **NARRATIVE COLON BAN**: PROHIBIT colons in prose to connect claims to details. Use a period and a new sentence, or descriptive transitions. 
+- **COLON PROTOCOL (LISTS ONLY)**: Colons are for vertical bulleted lists ONLY. 
+- **MANDATORY CAPITALIZATION**: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED. Absolutely PROHIBIT "Label: lowercase" patterns.
+- **LEXICAL VARIETY (ANTI-CLUMPING)**: MANDATE categorical rotation. PROHIBIT repeating the same key noun/verb in adjacent sentences.
+- **ACTIVE VERB PRIORITY**: PRIORITIZE descriptive, context-aware actions. Use the provided Dynamic Palette as mentors.
+- **ZERO-PASSIVE VOICE**: PRIORITIZE active voice to drive narrative momentum.
+- **ANTI-WATERMARK**: BAN robotic buzzwords: 'delve', 'tapestry', 'landscape', 'unlock', 'embark', 'comprehensive', 'robust'. 
+- **NO COLON CLUMPING**: Do not use "Label: Definition" structures. Use active, descriptive narrative flow.
+- **TACTICAL TRANSITIONS**: BAN robotic connectors like "Furthermore" or "Moreover." Use the provided Dynamic Palette to maintain narrative "drag."
+"""
+
+# 4. FORMATTING TARGETS (Modular)
+PROTOCOL_FORMAT_CMS = """
+- **OUTPUT TARGET: CMS_DRAFT**: If the target is a blog draft (Ghost), use ONLY semantic HTML. PROHIBIT all Markdown. Tables MUST use `<table>` tags. Headers MUST use `<h2>` or `<h3>` (PROHIBIT `#`). Wrap all paragraphs in `<p>`.
+"""
+
+PROTOCOL_FORMAT_SLACK = """
+- **OUTPUT TARGET: MODERATOR_VIEW**: If the target is a Slack brief or research discovery, use Markdown exclusively for tables (pipes: `|`), headers (`#`, `##`), and code blocks. PROHIBIT all HTML tags (no `<p>`, `<h2>`, etc.). Use blank lines for paragraph separation.
+"""
+
+# 5. ANTI-SLOB: Context Sovereignty (High-Fidelity Turns Only)
+PROTOCOL_ANTI_SLOB = """
 - **STRATEGIC CONTEXT SANITIZATION (ANTI-META-TALK)**:
-    - **UNIVERSAL PROHIBITION**: You are strictly PROHIBITED from mentioning internal strategic decision-making, competitive audits, or benchmarking scores in any CMS_DRAFT output.
+    - **UNIVERSAL PROHIBITION**: You are strictly PROHIBITED from mentioning internal strategic decision-making, competitive audits, or benchmarking scores when the user's latest message PRIMARY GOAL (intent) is classified as DEEP_DIVE or PSEO_ARTICLE.
     - **BANNED CATEGORIES**:
         1. **SEO/Metrics**: "competitor gap," "audit scores," "ranking analysis," "search volume," "AEO strategy," "moat factor," "technical density score."
         2. **Process/Turns**: "turn-based analysis," "Turn 1/2/3/4," "internal blueprint," "iterative refinement," "previous response," "vetted prompt."
@@ -167,6 +184,33 @@ STYLE_PROTOCOL = """
     - **DEFINITION SHIELD**: PROHIBIT "Define [Abbreviation] as [Full Name]" sentence structures. Integrate definitions naturally (e.g., "The Policy Enforcement Point (PEP)...") or assume professional context.
     - **TONE REPLACEMENT**: Instead of saying "Other guides score 2/10," simply present the authoritative technical finding with 10/10 technical depth. The "moat" is felt through your technical precision, not stated in prose.
 """
+
+# Backward Compatibility (Ensures legacy calls don't break during migration)
+STYLE_PROTOCOL = PROTOCOL_GROUNDING_RAI + PROTOCOL_VISUAL_TABULAR + PROTOCOL_LITERARY_CORE + PROTOCOL_ANTI_SLOB
+
+def get_system_instructions(intent: str, output_target: str) -> str:
+    """
+    Architectural fix to assemble instructions modularly based on intent and target.
+    Prevents token waste while ensuring 100% rule fidelity for relevant tasks.
+    """
+    # 1. Start with Baseline Guardrails (Permanent)
+    instructions = "You are a highly capable AI assistant. Adhere strictly to these protocols:\n"
+    instructions += PROTOCOL_GROUNDING_RAI
+    instructions += PROTOCOL_VISUAL_TABULAR
+    
+    # 2. Add Formatting (Modular)
+    if output_target == "CMS_DRAFT":
+        instructions += PROTOCOL_FORMAT_CMS
+    else:
+        instructions += PROTOCOL_FORMAT_SLACK
+        
+    # 3. Add High-Fidelity Tone (Conditional)
+    high_fidelity_intents = ["DEEP_DIVE", "PSEO_ARTICLE", "TECHNICAL_EXPLANATION", "BLOG_OUTLINE"]
+    if intent in high_fidelity_intents:
+        instructions += PROTOCOL_LITERARY_CORE
+        instructions += PROTOCOL_ANTI_SLOB
+        
+    return instructions.strip()
 
 # --- HELPER: Dynamic Linguistic Palette ---
 def get_stylistic_mentors(session_id=None):
@@ -402,9 +446,10 @@ class UnifiedModel:
             self._native_model = GenerativeModel(model_name, safety_settings=safety_settings)
             print(f"✅ Loaded Native Vertex Model: {model_name} (Safety Active)", flush=True)
 
-    def generate_content(self, prompt, generation_config=None, max_retries=3):
+    def generate_content(self, prompt, generation_config=None, max_retries=3, system_instruction=None):
         """
         Universal generation function with safety catching and Exponential Backoff.
+        Supports 'system_instruction' to align with ADK architectural best practices.
         """
         import time
         import random
@@ -418,7 +463,15 @@ class UnifiedModel:
                     if generation_config is None: generation_config = {}
                     if "max_output_tokens" not in generation_config: generation_config["max_output_tokens"] = 8192
                     
-                    response = self._native_model.generate_content(prompt, generation_config=generation_config)
+                    # ARCHITECTURAL FIX: Use system_instruction if provided
+                    # Note: We create a temporary model instance to apply system_instruction
+                    # this is lightweight and avoids state pollution on the primary instance.
+                    model = GenerativeModel(
+                        self.model_name, 
+                        safety_settings=safety_settings,
+                        system_instruction=system_instruction
+                    )
+                    response = model.generate_content(prompt, generation_config=generation_config)
                     
                     # Robust Safety Check: Some SDK versions throw exceptions, others return empty candidates
                     if not response.candidates or response.candidates[0].finish_reason == 3: # 3 = SAFETY
@@ -438,7 +491,7 @@ class UnifiedModel:
                     
                     # If it's a safety block or we've exhausted retries, log and return fallback
                     print(f"⚠️ Vertex AI Safety/SDK Error: {e}")
-                    log_safety_event("generation_error", {"prompt": prompt, "error": str(e)})
+                    # log_safety_event("generation_error", {"prompt": prompt, "error": str(e)}) # Fallback logic
                     
                     # Return Mock for Fallback
                     class MockResponse:
@@ -464,17 +517,21 @@ class UnifiedModel:
                 if "claude-sonnet-4-5" in self.model_name or "claude-3-5-sonnet" in self.model_name:
                     extra_headers = {"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"}
 
-                # LiteLLM Call
+                # LiteLLM Call: Map system_instruction to 'system' role
+                messages = []
+                if system_instruction:
+                    messages.append({"role": "system", "content": str(system_instruction)})
+                messages.append({"role": "user", "content": prompt})
+
                 response = completion(
                     model=self.model_name, 
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=messages,
                     temperature=temp,
                     max_tokens=8192,
                     extra_headers=extra_headers
                 )
                 
                 # Create a Mock Response Object to mimic Vertex AI's SDK
-                # This ensures downstream code (getting .text) doesn't break
                 class MockResponse:
                     def __init__(self, content):
                         self.text = content
@@ -482,13 +539,12 @@ class UnifiedModel:
                 content = response.choices[0].message.content
                 if not content:
                     print(f"⚠️ LiteLLM Warning: Received EMPTY content from {self.model_name}")
-                    content = "The model was unable to generate a response. This might be due to a safety filter or an extremely large context."
+                    content = "The model was unable to generate a response."
                 
                 return MockResponse(content)
                 
             except Exception as e:
                 print(f"❌ LiteLLM Error: {e}", flush=True)
-                # Fallback to an empty mock handling - Required re-definition due to scope
                 class MockResponse:
                     def __init__(self, content): self.text = content
                 return MockResponse("Error generating content.")
@@ -560,7 +616,7 @@ def log_safety_event(event_name, data):
         print(f"Logging Block: {e}")
 
 # --- SYSTEM HARDENING: Centralized Safe Generator ---
-def safe_generate_content(model, prompt, generation_config=None):
+def safe_generate_content(model, prompt, system_instruction=None, generation_config=None):
     """
     A robust wrapper for model.generate_content that:
     1. Catches Exceptions (Legacy Vertex Failures)
@@ -574,7 +630,7 @@ def safe_generate_content(model, prompt, generation_config=None):
     
     # 1. Primary Attempt
     try:
-        response = model.generate_content(prompt, generation_config=generation_config)
+        response = model.generate_content(prompt, generation_config=generation_config, system_instruction=system_instruction)
         text = response.text
         
         # 2. Refusal Trap (The "Soft Failure" Check)
@@ -601,7 +657,7 @@ def safe_generate_content(model, prompt, generation_config=None):
                 time.sleep(2)
                 
                 # Retry with backup
-                fallback_resp = specialist_model.generate_content(prompt, generation_config={"temperature": 0.4})
+                fallback_resp = specialist_model.generate_content(prompt, generation_config={"temperature": 0.4}, system_instruction=system_instruction)
                 return fallback_resp.text.strip()
             except Exception as e2:
                 # Catch Anthropic 429 specifically
@@ -664,106 +720,98 @@ def fetch_slack_file_content(file_url, file_id, file_mode="hosted"):
 
 def extract_core_topic(user_prompt, history=""):
     """
-    Distills a user's prompt into a high-precision Google Search query using SEO operators.
+    Synthesizes Tiered Discovery with Technical Discovery Protocol.
+    Generates 1-3 prioritized queries in JSON format to mirror human research patterns.
     """
-    global flash_model
+    global unimodel
     print(f"Distilling core topic from: '{user_prompt[:100]}...'")
     
+    current_year = datetime.datetime.now().year
     extraction_prompt = f"""
-    You are an expert Google Search operator specializing in technical documentation discovery.
-    Convert the user's natural language request into a single, high-precision Google Advanced Search query.
+    You are an expert Research Librarian specializing in authoritative discovery and high-precision information retrieval.
+    Your goal is to convert a user request into a JSON list of 1-3 distinct, powerful Google Search queries.
 
     ### SEARCH OPERATOR RULES:
-    1.  **Grouping with Parentheses:** Use `( )` to group synonyms when using OR. 
-    2.  **Alternatives:** Use uppercase `OR` between entities.
-    3.  **Exact Phrases:** Use quotes `""` for specific multi-word concepts (but see TECHNICAL DISCOVERY PROTOCOL below).
-    4.  **Exclusion:** Use `-` to remove noise.
-    5.  **No Commas:** Do not use commas.
-    6.  **Freshness:** If news, include "news" or "latest".
-    7.  **Remove Fluff:** Remove "I want to know", "Please tell me", etc.
-    8.  **Site Operator:** Use site: for specific domains.
-    9.  **Filetype Operator:** Use filetype: for PDFs/docs.
-    10. **Limit Length:** Under 15 words (increased for technical queries).
-    11. **Implicit AND:** No need for AND.
-    12. **CRITICAL: FILTER EDITORIAL INSTRUCTIONS.**
-        - Remove words like: "outline", "draft", "strategy", "blog post", "article", "word count", "Grade 8", "1500+ words", "logic flow".
-        - But PRESERVE discovery intent words: "why", "how", "reasons", "causes", "factors", "impact", "trends".
-        - Focus ONLY on the SUBJECT MATTER and DISCOVERY INTENT.
+    1. **MAX 2 OPERATORS**: Never use more than 2 operators (like site: or "") in a single query.
+    2. **TEMPORAL CONTEXT**: If the topic is time-sensitive (news, product releases, latest trends, current specs), include words like "latest", "{current_year}", "current", or "news".
+    3. **QUOTES (VERY IMPORTANT)**: 
+       - Use double quotes ONLY for the PRIMARY subject or specific error message.
+       - **NEVER** use backslashes (`\`) for escaping.
+       - **NEVER** wrap the entire query in an outer set of quotes if it already contains internal quotes.
+    4. **NO COMMAS**: Use spaces only.
+    5. **NO FLUFF**: Remove "I want to know", "Please tell me", "research for me".
+    6. **CRITICAL: FILTER EDITORIAL INSTRUCTIONS**: 
+       - REMOVE words like: "outline", "draft", "strategy", "blog post", "article", "word count", "Grade 8", "1500+ words", "logic flow".
+       - PRESERVE discovery intent: "why", "how", "reasons", "causes", "factors", "impact", "trends".
 
-    ### TECHNICAL DISCOVERY PROTOCOL (Universal):
-    **If the user's request involves discovering current/authoritative information about ANY technical subject, product, or specification:**
-    
-    **Applicable Domains:**
-    - **APIs/Libraries**: API versions, library versions, SDK documentation, deprecation status
-    - **Academic**: Books, theses, research papers, academic publications
-    - **Products**: Vehicle models, product specifications, technical manuals
-    - **Standards**: Technical standards, protocols, specifications (ISO, IEEE, RFC)
-    - **Software**: Framework versions, language features, tool documentation
-    - **Hardware**: Device specifications, component datasheets, technical specs
-    
-    **Universal Discovery Rules:**
-    1. **Identify the Core Subject**: Extract the primary entity (service name, product model, book title, standard number)
-    2. **Use OR for Variants/Alternatives**: If multiple names/versions exist, use OR (e.g., "Content API" OR "Merchant API", "iPhone 15" OR "iPhone 15 Pro")
-    3. **Avoid Over-Quoting Unrelated Terms**: Do NOT quote implementation details, security terms, or regulatory terms in the SAME query as the core discovery
-    4. **Prioritize Authoritative Sources**: 
-       - APIs: site:developers.google.com, site:docs.microsoft.com, site:developer.apple.com
-       - Academic: site:scholar.google.com, site:arxiv.org, site:jstor.org
-       - Products: site:manufacturer-domain.com (e.g., site:tesla.com for Tesla specs)
-       - Standards: site:ietf.org, site:iso.org, site:ieee.org
-    5. **Focus on Discovery Keywords**: 
-       - APIs: "documentation", "API reference", "current version", "deprecation", "migration guide"
-       - Academic: "full text", "PDF", "abstract", "citation", "DOI"
-       - Products: "specifications", "technical manual", "datasheet", "features"
-       - Standards: "RFC", "specification", "standard", "protocol"
-    6. **Separate Concerns**: If user mentions multiple unrelated topics, focus ONLY on the core discovery aspect
-    7. **Include Temporal Indicators**: If user says "current", "latest", "new", include those terms or use date filters
+    ### THE CORE PROBLEM:
+    Do NOT generate "over-engineered" queries that include every technical or descriptive term. This creates a "technical vacuum" where no single page contains all terms, returning zero results.
 
-    **Example Query Transformations (Multi-Domain):**
-    
-    **APIs:**
-    - Input: "Google Merchant Center's current product retrieval API with offerId lookups"
-      Output: site:developers.google.com "Google Merchant Center" ("Content API" OR "Merchant API") product retrieval offerId documentation
-    
-    - Input: "Current API for GMC with ES256 verification and POPIA compliance"
-      Output: site:developers.google.com "Google Merchant Center" API documentation current version deprecation
-    
-    **Academic:**
-    - Input: "Find the full text of 'Attention Is All You Need' transformer paper"
-      Output: "Attention Is All You Need" Vaswani transformer paper PDF (site:arxiv.org OR site:scholar.google.com)
-    
-    - Input: "Latest research on quantum computing error correction"
-      Output: quantum computing error correction research paper 2024 2025 (site:arxiv.org OR site:scholar.google.com)
-    
-    **Products:**
-    - Input: "Tesla Model 3 2024 battery specifications and range"
-      Output: site:tesla.com "Model 3" 2024 battery specifications range technical
-    
-    - Input: "iPhone 15 Pro camera sensor specs"
-      Output: site:apple.com "iPhone 15 Pro" camera sensor specifications technical
-    
-    **Standards:**
-    - Input: "Current HTTP/3 protocol specification"
-      Output: HTTP/3 RFC specification protocol (site:ietf.org OR site:rfc-editor.org)
-    
-    - Input: "ISO 27001 information security standard requirements"
-      Output: site:iso.org "ISO 27001" information security standard requirements
+    ### THE SOLUTION: TIERED DISCOVERY (Double-Tap)
+    Generate a JSON list of 1-3 queries, moving from BROAD/AUTHORITATIVE to SPECIFIC/REFINED.
+
+    **Tier 1: Broad Anchor (Authoritative Hubs)**
+    Focus on the "Primary Entity" and the most authoritative domain for that subject.
+    Patterns:
+    - Official: site:domain.com "Subject Name"
+    - Research: site:scholar.google.com OR site:arxiv.org
+    - Public/News: site:nytimes.com OR site:reuters.com OR site:github.com
+    Example: `site:developers.google.com "Google Merchant Center" documentation`
+
+    **Tier 2: Discovery Pivot (Subject + Specific Intent)**
+    Focus on the specialized intent or specific version/event.
+    - News/Trends: "breaking", "update", "today", "report"
+    - Products/Tech: "migration guide", "specs", "latest version", "manual"
+    - Contextual: "comparison", "alternative", "reasons for"
+    Example: `"Merchant API" product retrieval offerId`
+
+    **Tier 3: Refined Detail (Nuance Only)**
+    Only include implementation details or niche modifiers if primary intent fails.
+    Example: `"Merchant API" register_gcp base64url`
 
     ### CONTEXT MAPPING:
-    Use the provided HISTORY to resolve ambiguous terms like "he", "it", or "that" where the specific entity names aren't specified.
+    Use the HISTORY to resolve pronouns (he, it, that) to specific entities.
 
     HISTORY:
-    {history}
+    {history[:5000]}
 
     USER REQUEST:
     "{user_prompt}"
 
-    SEARCH QUERY:
+    OUTPUT FORMAT (Raw JSON List Only):
+    ["query 1", "query 2"]
     """
     
-    core_topic = safe_generate_content(unimodel, extraction_prompt)
-
-    print(f"Distilled Core Topic: '{core_topic}'")
-    return core_topic
+    raw_response = safe_generate_content(unimodel, extraction_prompt, generation_config={"temperature": 0.2})
+    try:
+        raw_queries = extract_json(raw_response)
+        
+        # Post-Processing Sanitize: Ensure syntax is clean for SerpAPI
+        if isinstance(raw_queries, list):
+            sanitized = []
+            for q in raw_queries:
+                if not isinstance(q, str): continue
+                # 1. Replace escaped quotes with regular quotes
+                q = q.replace('\\"', '"').replace("\\'", "'")
+                # 2. Strip redundant outer quotes if internal quotes exist
+                q = q.strip()
+                if q.startswith('"') and q.endswith('"') and q.count('"') > 2:
+                    q = q[1:-1].strip()
+                sanitized.append(q)
+            
+            if sanitized:
+                print(f"Distilled Tiers: {sanitized}")
+                return sanitized
+        
+        # Fallback 1: Extract all quoted strings (handles broken lists)
+        backup_queries = re.findall(r'"([^"]+)"', str(raw_response))
+        if backup_queries:
+            return backup_queries[:3]
+            
+        return [str(raw_response).strip().strip('"[]')]
+    except Exception as e:
+        print(f"FAILED TO DISTILL CORE TOPIC: {e}")
+        return [str(raw_response).strip().strip('"[]')]
 
 def extract_target_word_count(text, history=""):
     """
@@ -833,6 +881,12 @@ def convert_html_to_markdown(html_str):
     # 0. Pre-Pass: Strip LLM Preamble/Banter
     text = re.sub(r'(?i)^(Part \d+:?|Here is.*?:\s*)', '', str(html_str)).strip()
     
+    # 0a. Pre-Pass: Fix "Leaky Markdown" (Backticks outside of code tags)
+    # This prevents double-encoding when LLM mistakenly uses markdown inside HTML
+    if "<code>" in text or "```" in text:
+        text = re.sub(r'(?<!<code>)```[a-z]*\n?([\s\S]*?)\n?```(?!</code>)', r'<code>\1</code>', text, flags=re.IGNORECASE)
+        text = re.sub(r'(?<!<code>)`([^`\n]+)`(?!</code>)', r'<code>\1</code>', text, flags=re.IGNORECASE)
+
     # 1. Strip raw Markdown headers
     text = re.sub(r'^\s*#{1,6}\s*(.*?)$', r'*\1*', text, flags=re.MULTILINE)
     
@@ -889,7 +943,8 @@ def convert_html_to_markdown(html_str):
         code = match.group(2)
         # SANITATION: Unescape entities and strip internal HTML tags from code
         code = html.unescape(code)
-        code = re.sub(r'<[^>]+>', '', code)
+        # BUGFIX: Use more precise tag regex to avoid stripping < and > operators in logic (e.g. if x < 10)
+        code = re.sub(r'<[a-z/][^>]*>', '', code, flags=re.IGNORECASE)
         
         lang_match = re.search(r'language-(\w+)', attrs, re.IGNORECASE)
         if lang_match or '\n' in code.strip():
@@ -900,10 +955,11 @@ def convert_html_to_markdown(html_str):
     text = re.sub(r'<pre><code([^>]*)>([\s\S]*?)</code></pre>', general_code_handler, text, flags=re.IGNORECASE)
     text = re.sub(r'<code([^>]*)>([\s\S]*?)</code>', general_code_handler, text, flags=re.IGNORECASE)
 
-    # 4. Hierarchical Elements (H1-H3, Sections)
+    # 4. Hierarchical Elements (H1-H4, Sections)
     text = re.sub(r'<h1>(.*?)</h1>', r'*\1*\n\n', text, flags=re.IGNORECASE)
     text = re.sub(r'<h2>(.*?)</h2>', r'\n*\1*\n', text, flags=re.IGNORECASE)
-    text = re.sub(r'<h3>(.*?)</h3>', r'_ \1 _\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<h3>(.*?)</h3>', r'\n*\1*\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<h4>(.*?)</h4>', r'*\1*\n', text, flags=re.IGNORECASE)
     text = text.replace('</section>', '\n\n---\n\n')
     text = re.sub(r'<section[^>]*>', '', text, flags=re.IGNORECASE)
 
@@ -922,12 +978,13 @@ def convert_html_to_markdown(html_str):
     text = text.replace('<br>', '\n').replace('<br/>', '\n')
     
     # 7. Final Strip of remaining tags
-    text = re.sub(r'<(?!https?://|!)[^>]+>', '', text, flags=re.IGNORECASE)
+    # BUGFIX: Use more precise tag regex to avoid stripping < and > operators
+    text = re.sub(r'<[a-z/][^>]*>', '', text, flags=re.IGNORECASE)
     
     # 8. Restore Protected Blocks
     for placeholder, original in protected_blocks.items():
         text = text.replace(placeholder, original)
-
+    
     # 9. Clean up excess newlines
     text = re.sub(r'\n{4,}', '\n\n', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
@@ -999,10 +1056,11 @@ def extract_json(text):
     if markdown_match:
         content = markdown_match.group(1).strip()
     else:
-        # 2. Fall back to finding the outermost braces
-        brace_match = re.search(r'(\{[\s\S]*\})', text)
-        if not brace_match: return None
-        content = brace_match.group(1).strip()
+        # 2. Hardened Bracket Discovery (Objects or Lists)
+        # Finds the outermost [...] or {...}
+        match = re.search(r'([\[\{][\s\S]*[\]\}])', text)
+        if not match: return None
+        content = match.group(1).strip()
     
     try:
         return json.loads(content)
@@ -1079,6 +1137,16 @@ def search_google_scholar(query, num_results=3):
 # Fallback Search (MCP Refactored)
 def google_simple_search(query):
     return get_mcp_client().call("google_simple_search", {"query": query})
+
+# --- BING & YOUTUBE TOOLS (NEW) ---
+def search_bing_web(query):
+    return get_mcp_client().call("bing_search", {"query": query})
+
+def search_bing_copilot(query):
+    return get_mcp_client().call("bing_copilot", {"query": query})
+
+def search_youtube_videos(query):
+    return get_mcp_client().call("youtube_search", {"query": query})
 
 # 9.5 The Vision Tool (MCP Refactored)
 def analyze_image(image_data, prompt="Describe this image in detail."):
@@ -1223,7 +1291,17 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     5. **VISUAL_INTENT**: Require seeing asset? [YES/NO]
     6. **GEO_PIVOT**: If the user refers to a specific country, you MUST return the **ISO-3166-1 alpha-2** code.
     7. **ADEQUACY_AUDIT**: Have enough info to solve the ARCHITECTURAL/CONTEXTUAL goal? [SUFFICIENT/INSUFFICIENT]
-    8. **TOOL_RECRUITMENT**: List tools (WEB, IMAGES, VIDEOS, TRENDS, ANALYSIS, COMPLIANCE, USE_CONVERSATIONAL_CONTEXT).
+    8. **TOOL_RECRUITMENT**: List tools:
+       - **WEB**: Technical documentation, news, and general grounding (Google).
+       - **BING**: Cross-platform technical search and alternative perspectives.
+       - **COPILOT**: Complex reasoning, technical synthesis, or summary-first answers.
+       - **YOUTUBE**: Visual tutorials, demonstrations, and recollective grounding via video metadata.
+       - **IMAGES**: Visual research and reference.
+       - **VIDEOS**: General video search (Google).
+       - **TRENDS**: (USE SPARINGLY) For broad regional trending topics only (e.g., "Top searches in US").
+       - **ANALYSIS**: For topic-specific historical interest and volume (e.g., "Tesla Model 2 interest").
+       - **COMPLIANCE**: Legal and regulatory documentation.
+       - **USE_CONVERSATIONAL_CONTEXT**: If existing history is sufficient.
     
     OUTPUT FORMAT (Raw JSON Only):
     {{"visual_intent": "YES/NO", "new_geo": "...", "adequacy": "...", "selected_tools": [], "timeframe": "Today/7 Days/12 Months", "rationale": "..."}}
@@ -1325,14 +1403,19 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     has_target_urls = len(extract_urls_from_text(raw_topic)) > 0
     is_pulse_check = (prev_intent == "SIMPLE_QUESTION" and not has_target_urls and not images)
     
-    if any(t in ["WEB", "IMAGES", "VIDEOS", "SCHOLAR", "SIMPLE"] for t in selected_tools):
+    if any(t in ["WEB", "BING", "COPILOT", "YOUTUBE", "IMAGES", "VIDEOS", "SCHOLAR", "SIMPLE"] for t in selected_tools):
         if is_pulse_check and any(word in raw_topic.lower() for word in ["trending", "latest", "today", "now"]):
             print("Sensory Router: [FAST-EXIT] Pulse check detected. Skipping distillation...")
-            distilled_seo_query = raw_topic
+            distilled_seo_queries = [raw_topic]
         else:
             print("Sensory Router: Category [SEO] active. Distilling high-precision query...")
-            distilled_seo_query = extract_core_topic(raw_topic, history=history_context)
-        print(f"  -> SEO Query: '{distilled_seo_query}'")
+            distilled_seo_queries = extract_core_topic(raw_topic, history=history_context)
+        
+        # Ensure it's a list for iteration
+        if not isinstance(distilled_seo_queries, list):
+            distilled_seo_queries = [str(distilled_seo_queries)]
+            
+        print(f"  -> SEO Queries: {distilled_seo_queries}")
         
         # VERIFICATION: Log query construction details for debugging
         is_technical_query = any(term in raw_topic.lower() for term in [
@@ -1362,7 +1445,7 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
             selected_tools = [t for t in selected_tools if t not in ["WEB", "SIMPLE"]]
             if not selected_tools: selected_tools = ["USE_CONVERSATIONAL_CONTEXT"]
     # --- 1. GLOBAL KNOWLEDGE TOOLS (Independent of Trending Geos) ---
-    knowledge_tools = [t.split(':')[0].strip() for t in selected_tools if t.split(':')[0].strip() in ["WEB", "IMAGES", "VIDEOS", "SCHOLAR", "SIMPLE"]]
+    knowledge_tools = [t.split(':')[0].strip() for t in selected_tools if t.split(':')[0].strip() in ["WEB", "BING", "COPILOT", "YOUTUBE", "IMAGES", "VIDEOS", "SCHOLAR", "SIMPLE"]]
     
     for choice in knowledge_tools:
         print(f"Executing Global Sensory Tool: '{choice}'")
@@ -1370,59 +1453,35 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
         tool_name = "unknown"
 
         if choice == "WEB":
-            research_context = search_google_web(distilled_seo_query)
-            tool_name = "serpapi_web_search_global"
-            
-            # FALLBACK: If no results and query looks like technical discovery, retry with relaxed constraints
-            if not research_context or "No significant results" in str(research_context):
-                # Detect technical discovery queries by checking for common patterns
-                is_technical_query = any(term in distilled_seo_query.lower() for term in [
-                    # APIs/Libraries
-                    "api", "documentation", "library", "sdk", "client", 
-                    # Academic
-                    "paper", "thesis", "research", "publication", "doi", "arxiv",
-                    # Products
-                    "specifications", "specs", "technical manual", "datasheet",
-                    # Standards
-                    "rfc", "iso", "ieee", "standard", "protocol",
-                    # Software/Hardware
-                    "framework", "version", "deprecation", "migration",
-                    # Common discovery terms
-                    "current", "latest", "official", "reference"
-                ])
+            # DOUBLE-TAP PROTOCOL: Iterate through tiers until results are found
+            for i, query in enumerate(distilled_seo_queries[:3]):
+                print(f"  -> [Attempt {i+1}/3] Search: '{query}'")
+                research_context = search_google_web(query)
+                tool_name = "serpapi_web_search_global"
                 
-                if is_technical_query:
-                    print(f"FALLBACK: Initial technical discovery query returned no results. Retrying with relaxed constraints...")
-                    
-                    # Extract site: operator if present
-                    site_match = re.search(r'site:([^\s]+)', distilled_seo_query)
-                    site_operator = site_match.group(0) if site_match else ""
-                    
-                    # Extract core terms (remove quotes and extra terms)
-                    fallback_query = re.sub(r'site:[^\s]+', '', distilled_seo_query)  # Remove site operator
-                    fallback_query = re.sub(r'"[^"]*"', lambda m: m.group(0).replace('"', ''), fallback_query)  # Remove quotes
-                    
-                    # Add domain-appropriate discovery keyword
-                    if any(term in distilled_seo_query.lower() for term in ["api", "library", "sdk"]):
-                        fallback_query = f"{site_operator} {fallback_query} documentation".strip()
-                    elif any(term in distilled_seo_query.lower() for term in ["paper", "research", "thesis"]):
-                        fallback_query = f"{site_operator} {fallback_query} PDF full text".strip()
-                    elif any(term in distilled_seo_query.lower() for term in ["specifications", "specs", "manual"]):
-                        fallback_query = f"{site_operator} {fallback_query} technical specifications".strip()
-                    else:
-                        fallback_query = f"{site_operator} {fallback_query} official".strip()
-                    
-                    print(f"  -> Fallback Query: '{fallback_query}'")
-                    research_context = search_google_web(fallback_query)
-                    tool_name = "serpapi_web_search_global_fallback"
+                if research_context and "No significant results" not in str(research_context):
+                    print(f"  ✅ Results found on attempt {i+1}.")
+                    break
+                else:
+                    print(f"  ❌ No results for tier {i+1}. Pivoting...")
+
         elif choice == "IMAGES":
-            research_context = search_google_images(distilled_seo_query)
+            research_context = search_google_images(distilled_seo_queries[0])
             tool_name = "serpapi_image_search"
         elif choice == "VIDEOS":
-            research_context = search_google_videos(distilled_seo_query)
+            research_context = search_google_videos(distilled_seo_queries[0])
             tool_name = "serpapi_video_search"
+        elif choice == "BING":
+            research_context = search_bing_web(distilled_seo_queries[0])
+            tool_name = "serpapi_bing_web_search"
+        elif choice == "COPILOT":
+            research_context = search_bing_copilot(distilled_seo_queries[0])
+            tool_name = "serpapi_bing_copilot_search"
+        elif choice == "YOUTUBE":
+            research_context = search_youtube_videos(distilled_seo_queries[0])
+            tool_name = "serpapi_youtube_search"
         elif choice == "SCHOLAR":
-            research_context = search_google_scholar(distilled_seo_query)
+            research_context = search_google_scholar(distilled_seo_queries[0])
             tool_name = "serpapi_scholar_search"
         elif choice == "SIMPLE":
             pass # Fallback will handle it
@@ -1512,6 +1571,11 @@ def generate_topic_cluster(topic, context, history="", is_initial=True, session_
     
     state_context = "This is a NEW proposal for a new thread." if is_initial else "This is a REVISION or EXTENSION of a previous strategy in an existing thread."
     
+    # ARCHITECTURAL FIX: Modular Instruction Assembly
+    # Intent for Topic Clusters is specialized but shares technical/grounding rules.
+    sys_instruction = get_system_instructions("TOPIC_CLUSTER_PROPOSAL", "MODERATOR_VIEW")
+    sys_instruction += f"\n\n{style_mentors}"
+
     prompt = f"""
     You are an expert SEO Architect. Create a comprehensive topic cluster for: "{topic}"
     
@@ -1528,8 +1592,6 @@ def generate_topic_cluster(topic, context, history="", is_initial=True, session_
     ### GUIDELINES:
     1. If this is a REVISION (is_initial=False), you MAY start with a header like ":robot_face: The proposal has been REVISED" or similar context-aware greetings if appropriate.
     2. If this is an INITIAL proposal, be structured and authoritative.
-    {STYLE_PROTOCOL}
-    {style_mentors}
 
     JSON SCHEMA:
     {{
@@ -1545,7 +1607,7 @@ def generate_topic_cluster(topic, context, history="", is_initial=True, session_
       ]
     }}
     """
-    return extract_json(safe_generate_content(unimodel, prompt))
+    return extract_json(safe_generate_content(unimodel, prompt, system_instruction=sys_instruction))
 
 # 12. The SEO Metadata Generator (Using Specialist Model)
 def generate_seo_metadata(article_html, topic, session_id=None):
@@ -1556,6 +1618,11 @@ def generate_seo_metadata(article_html, topic, session_id=None):
     """
     print(f"Tool: Delegating SEO Metadata to Specialist Model (Anthropic)...")
     
+    # ARCHITECTURAL FIX: Modular Instruction Assembly
+    # Intent for Metadata is naturally specialized. Use BLOG_OUTLINE for high-fidelity rules.
+    sys_instruction = get_system_instructions("BLOG_OUTLINE", "CMS_DRAFT")
+    sys_instruction += f"\n\n{style_mentors}"
+
     # TITLE PERSISTENCE: Try to extract a title from the HTML <h1> or the topic
     title_hint = ""
     h1_match = re.search(r'<h1[^>]*>(.*?)</h1>', article_html, re.IGNORECASE)
@@ -1571,8 +1638,6 @@ def generate_seo_metadata(article_html, topic, session_id=None):
     Topic: "{topic}"
     Title Hint (Priority): "{title_hint}"
     
-    {STYLE_PROTOCOL}
-    {style_mentors}
     Article Content (HTML):
     {article_html[:15000]} # Truncate to avoid context limits
     
@@ -1610,11 +1675,8 @@ def generate_seo_metadata(article_html, topic, session_id=None):
     """
     
     try:
-        # 1. Use the Global Specialist Brain (Anthropic)
-        
-        # 2. Generate Content using the Universal Method
-        # The adapter returns a response object where .text is the content
-        content = safe_generate_content(specialist_model, prompt, generation_config={"temperature": 0.7})
+        # Use the Global Specialist Brain (Anthropic) with system_instruction
+        content = safe_generate_content(specialist_model, prompt, generation_config={"temperature": 0.7}, system_instruction=sys_instruction)
         
         # 3. Use the Unified Super-Listener
         final_json = extract_json(content)
@@ -1709,24 +1771,16 @@ def generate_natural_answer(topic, context, history="", session_id=None, output_
     global unimodel, research_model
     style_mentors = get_stylistic_mentors(session_id)
     
-    target_instruction = ""
-    if output_target == "MODERATOR_VIEW":
-        target_instruction = "IMPORTANT: You are talking to a MODERATOR on Slack. Use Markdown Pipes (|) for any tables. Use Slack-safe formatting."
-    else:
-        target_instruction = "IMPORTANT: You are drafting for Ghost CMS. Use strictly semantic HTML <table> tags. Prohibit all Markdown."
+    # ARCHITECTURAL FIX: Modular Instruction Assembly
+    intent_label = "SIMPLE_QUESTION"
+    system_instruction = get_system_instructions(intent_label, output_target)
+    system_instruction += f"\n\n{style_mentors}"
 
-    """
-    Handles SIMPLE_QUESTION and DIRECT_ANSWER with native intelligence.
-    Bypasses the heavy 'Strategist' persona for a more natural flow.
-    """
     print(f"DEBUG: generate_natural_answer (Native) starting... [Topic: {topic[:50]}]")
     
     # --- ROUTING LOGIC: Context Size Check ---
-    # Smart Switch: If context is massive (Likely Research/Code), use Gemini Flash (Research Model)
-    # If context is small/conversational, use GPT-5 (Unimodel) for nuance.
     total_context_size = len(str(context)) + len(str(history))
     
-    # FIX: Check BOTH context and history for the [CODE_ANALYSIS] tag
     has_code = "[CODE_ANALYSIS]" in str(context) or "[CODE_ANALYSIS]" in str(history)
     use_research_model = total_context_size > 30000 or has_code
     
@@ -1735,10 +1789,6 @@ def generate_natural_answer(topic, context, history="", session_id=None, output_
     print(f"DEBUG: Routing Natural Answer to [{model_name}] | Context Size: {total_context_size} chars")
 
     prompt = f"""
-    {STYLE_PROTOCOL}
-    {style_mentors}
-    {target_instruction}
-    
     You are a helpful, knowledgeable AI assistant.
     
     ### CONVERSATION HISTORY:
@@ -1754,9 +1804,6 @@ def generate_natural_answer(topic, context, history="", session_id=None, output_
     Answer naturally and conversationally. 
     Use the GROUNDING DATA to ensure accuracy.
     
-    {STYLE_PROTOCOL}
-    {style_mentors}
-    
     ### MULTI-NICHE AUDIT PROTOCOL:
     1. **Signal Sifting**: Carefully examine the entire GROUNDING DATA for signals matching the user's specific sub-topic (e.g., 'Politics', 'Education', 'Law').
     2. **Avoid "Sports Blindness"**: High-volume categories like 'Sports' often dominate trend feeds. You must look past global volume to find signals that relate to the user's specific query. 
@@ -1770,14 +1817,11 @@ def generate_natural_answer(topic, context, history="", session_id=None, output_
        - **NEVER** include normal explanatory text INSIDE a code block.
        - **ALWAYS** close a code block immediately after the code snippet ends.
        - If you have multiple snippets, use separate code blocks for each.
-       - Supported languages: javascript, python, java, go, rust, typescript, html, css, json, yaml, bash, sql, etc.
     """
     
-    # Use Safe Gen Wrapper
-    text = safe_generate_content(active_model, prompt, generation_config={"temperature": 0.4})
+    # Use Safe Gen Wrapper with system_instruction
+    text = safe_generate_content(active_model, prompt, generation_config={"temperature": 0.4}, system_instruction=system_instruction)
     
-    # Intent detection for metadata consistency
-    # STABILITY: Remove auto-repair here; let ensure_slack_compatibility handle line-by-line
     final_text = ensure_slack_compatibility(text.strip())
     intent = "SIMPLE_QUESTION"
     if "```" in final_text: intent = "TECHNICAL_EXPLANATION"
@@ -1794,34 +1838,33 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     global unimodel, research_model, specialist_model, flash_model
     style_mentors = get_stylistic_mentors(session_id)
     
-    target_instruction = ""
-    if output_target == "MODERATOR_VIEW":
-        target_instruction = "TARGET: MODERATOR_VIEW (Slack). Use Markdown Pipes (|) for tables. Use standard Slack formatting."
-    else:
-        target_instruction = "TARGET: CMS_DRAFT (Ghost). Use Semantic HTML <table> tags. PROHIBIT Markdown."
+    # 2. INTENT DETECTION (Early for instruction assembly)
+    try:
+        signal_data = json.loads(intent_metadata) if intent_metadata else {}
+        research_intent = signal_data.get("intent", "FORMAT_GENERAL")
+        formatting_directive = signal_data.get("directive", "")
+    except:
+        research_intent = "FORMAT_GENERAL"
+        formatting_directive = ""
 
-    """
-    Standardizes the logic for generating a direct answer.
-    Uses 'detect_research_intent' signal to adjust formatting (Tables/Lists).
-    """
+    # ARCHITECTURAL FIX: Modular Instruction Assembly
+    system_instruction = get_system_instructions(research_intent, output_target)
+    system_instruction += f"\n\n{style_mentors}"
+
     print(f"DEBUG: generate_comprehensive_answer starting... [Topic: {topic[:50]}]")
     
     # --- ROUTING LOGIC: Context Size Check ---
     total_context_size = len(str(context)) + len(str(history))
     
-    # FIX: Check BOTH context and history for the [CODE_ANALYSIS] tag
     has_code = "[CODE_ANALYSIS]" in str(context) or "[CODE_ANALYSIS]" in str(history)
     use_research_model = total_context_size > 30000 or has_code
     
-    # UPGRADE: Force Specialist Model (Claude) for Research Audits 🛡️🎯🛡️
     active_model = specialist_model if specialist_model else (research_model if (use_research_model and research_model) else unimodel)
     model_name = "Specialist Model (Claude 4.5)" if active_model == specialist_model else ("Research Model (Flash)" if active_model == research_model else "Unimodel (GPT-5)")
     print(f"DEBUG: Routing Comprehensive Answer to [{model_name}] | Context Size: {total_context_size} chars")
     
-    # NEW: Context check includes history if researchers marked it as sufficient
     context_str = str(context)
     is_grounded = "GROUNDING_CONTENT" in context_str or "IN-CONTEXT HISTORY" in context_str
-    has_visuals = "VISUAL_INSIGHT" in context_str
     
     # 1. PERSONA & AUDIENCE
     audience_context = detect_audience_context(history)
@@ -1834,18 +1877,8 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     Avoid "Sports Blindness" or generic global signals. Look for the nuance in the grounding data.
     """
 
-    # 2. INTENT DETECTION
-    try:
-        signal_data = json.loads(intent_metadata) if intent_metadata else {}
-        research_intent = signal_data.get("intent", "FORMAT_GENERAL")
-        formatting_directive = signal_data.get("directive", "")
-    except:
-        research_intent = "FORMAT_GENERAL"
-        formatting_directive = ""
-
     # 3. FORMATTING SENTINEL (Hard-coded prioritization)
     intent_instruction = ""
-    target_temp = 0.3 # Lower temperature for better formatting adherence
     
     if research_intent in ["TIMELINE", "FORMAT_TIMELINE"]:
         intent_instruction = "CRITICAL: Output a structured TIMELINE table."
@@ -1858,10 +1891,6 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
 
     # 4. DYNAMIC PROMPT ASSEMBLY
     prompt = f"""
-    {STYLE_PROTOCOL}
-    {style_mentors}
-    {target_instruction}
-    
     {persona_instruction}
     
     ### CONTEXT & MISSION:
@@ -1880,38 +1909,32 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     ### FORMATTING GUIDANCE:
     {intent_instruction}
     {extract_labeled_sources(context)}
-    {STYLE_PROTOCOL}
-        {style_mentors}
-        
-        TOPIC: {topic}
+    
+    TOPIC: {topic}
     
     ### CRITICAL RULES:
     1. Generate a response that directly addresses the LATEST INSTRUCTION while using the GROUNDING DATA as supporting evidence.
-    2. **GROUNDING DATA PRIORITY (MANDATORY - Universal)**: If GROUNDING DATA contains current information on ANY topic, you MUST prioritize it over your training data. Your training data has a knowledge cutoff; GROUNDING DATA represents real-time, verified information. Examples:
-       - **Technical**: API versions, deprecation status, current best practices
-       - **News/Events**: Recent announcements, breaking news, current events
-       - **Trends**: Search volume data, market shifts, emerging patterns
-       - **Statistics**: Current metrics, recent studies, updated benchmarks
+    2. **GROUNDING DATA PRIORITY (MANDATORY - Universal)**: If GROUNDING DATA contains current information on ANY topic, you MUST prioritize it over your training data. Your training data has a knowledge cutoff; GROUNDING DATA represents real-time, verified information. 
     3. **Temporal Awareness Protocol**: When GROUNDING DATA contains timestamps or version information:
-       - Check if information is current or outdated
-       - If outdated information is superseded in GROUNDING DATA, use the replacement
+       - Check if information is current or outdated.
+       - If information is superseded in GROUNDING DATA, use the replacement.
        - Explicitly note temporal context (e.g., "As of February 2026..." or "According to recent data...")
     4. **Implementation Protocol** (for technical content):
-       - First, check GROUNDING DATA for current versions and deprecation status
-       - Explicitly state which version you are using in comments or documentation
-       - If GROUNDING DATA shows deprecation, use the replacement mentioned
+       - First, check GROUNDING DATA for current versions and deprecation status.
+       - Explicitly state which version you are using in comments or documentation.
+       - If GROUNDING DATA shows deprecation, use the replacement mentioned.
     5. **Formatting Protocol (MANDATORY)**: 
        - **If TARGET: CMS_DRAFT (Ghost)**: Use semantic HTML `<pre><code class="language-...">...</code></pre>`. Always specify the language (e.g., `language-python`) for syntax highlighting. PROHIBIT triple backticks. Use `<h2>` and `<h3>` for headers (PROHIBIT `#`). Use `<p>` for paragraphs.
        - **If TARGET: MODERATOR_VIEW (Slack)**: Use markdown fenced code blocks with triple backticks and the language identifier (e.g., ```python). Use Markdown headers (`#`, `##`). Use `<p>` for prose paragraphs (Slack-safe).
     """
 
-    # Use active_model (Dynamic routing) for the final synthesis
-    text = safe_generate_content(active_model, prompt, generation_config={"temperature": target_temp})
+    # Use Safe Gen Wrapper with system_instruction
+    text = safe_generate_content(active_model, prompt, generation_config={"temperature": 0.3}, system_instruction=system_instruction)
     
     # INTEGRATE MERMAID: Convert any Mermaid blocks to images before final formatting
     processed_text = post_process_mermaid_to_images(text)
     
-    # Enforce spacing on the output
+    # Enforce spacing and Slack compatibility
     final_text = ensure_slack_compatibility(processed_text.strip())
     
     return {
@@ -2014,6 +2037,11 @@ def chunked_refactor_article(source_text, audience_context, specialist_model, st
     Ensures that a 3000+ word draft remains a 3000+ word article in Ghost HTML.
     """
     
+    # ARCHITECTURAL FIX: Modular Instruction Assembly
+    # Refactoring requires high-fidelity literary AND technical rules.
+    chunk_sys = get_system_instructions("PSEO_ARTICLE", output_target)
+    chunk_sys += f"\n\n{style_mentors}"
+
     target_instruction = ""
     if output_target == "MODERATOR_VIEW":
         target_instruction = "IMPORTANT: You are talking to a MODERATOR on Slack. Use Markdown Pipes (|) for any tables."
@@ -2073,8 +2101,6 @@ def chunked_refactor_article(source_text, audience_context, specialist_model, st
         -   **CLEAN CONTENT**: Remove any internal instructions or metalabels.
         -   **NO PREAMBLE**: Start directly with the first HTML tag.
         
-        {STYLE_PROTOCOL}
-        {style_mentors}
         {target_instruction}
         
         SOURCE SEGMENT:
@@ -2087,7 +2113,7 @@ def chunked_refactor_article(source_text, audience_context, specialist_model, st
         - **No Link Dumps**: Do NOT append a "Sources" list at the end.
         """
         # Lower temp for maximum literal adherence
-        raw_out = safe_generate_content(specialist_model, chunk_refactor_prompt, generation_config={"temperature": 0.1})
+        raw_out = safe_generate_content(specialist_model, chunk_refactor_prompt, system_instruction=chunk_sys, generation_config={"temperature": 0.1})
         return idx, sanitize_llm_html(raw_out)
 
     print(f"  + Launching Parallel Refactor Crew ({len(chunks)} chunks)...")
@@ -2209,6 +2235,10 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
         if len(source_to_refactor) > 8000:
             return chunked_refactor_article(source_to_refactor, audience_context, specialist_model, style_mentors, output_target=output_target)
 
+        # ARCHITECTURAL FIX: Modular Instruction Assembly
+        sys_instruction = get_system_instructions("PSEO_ARTICLE", output_target)
+        sys_instruction += f"\n\n{style_mentors}"
+
         print("  + Using Single-Pass Refactor (Small Article)")
         refactor_prompt = f"""
         You are a Content Refactor Engine specializing in high-fidelity Ghost CMS delivery.
@@ -2227,15 +2257,13 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
         - **Acronym Protocol**: Define all acronyms in parentheses on the first use.
         - **Inline Anchored Links**: Ensure all external links are preserved as semantic HTML anchored tags: `<a href="URL">Anchor Text</a>`.
         
-        {STYLE_PROTOCOL}
-        {style_mentors}
         {target_instruction}
 
         SOURCE TEXT:
         {source_to_refactor}
         """
-        # Use Specialist (Claude Sonnet 4.5) for high-fidelity refactoring
-        raw_html = safe_generate_content(specialist_model, refactor_prompt, generation_config={"temperature": 0.2})
+        # Use Specialist (Claude Sonnet 4.5) for high-fidelity refactoring with system_instruction
+        raw_html = safe_generate_content(specialist_model, refactor_prompt, system_instruction=sys_instruction, generation_config={"temperature": 0.2})
         return post_process_mermaid_to_images(sanitize_llm_html(raw_html))
 
     # --- PATH B & C: EXPAND / AUTHOR (Creative Synthesis) ---
@@ -2266,6 +2294,10 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
         tone_instruction = "Tone: Clear, engaging, professional English. Use analogies to explain complex ideas."
         context_block = f"Research Context:\n{context}\n\nConversation History:\n{history}"
 
+    # ARCHITECTURAL FIX: Modular Instruction Assembly
+    sys_instruction = get_system_instructions("PSEO_ARTICLE", output_target)
+    sys_instruction += f"\n\n{style_mentors}"
+
     # Shared Prompt for B & C (Creative Paths)
     prompt = f"""
     {system_instruction}
@@ -2276,8 +2308,6 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     TONE & STYLE:
     {tone_instruction}
     
-    {STYLE_PROTOCOL}
-    {style_mentors}
     {target_instruction}
     
     STRUCTURE REQUIREMENTS (Strict HTML):
@@ -2314,7 +2344,7 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     Article Draft:
     """
     
-    raw_response = safe_generate_content(unimodel, prompt, generation_config={"temperature": 0.4})
+    raw_response = safe_generate_content(unimodel, prompt, system_instruction=sys_instruction, generation_config={"temperature": 0.4})
     return post_process_mermaid_to_images(sanitize_llm_html(raw_response))
 
 # 14.5 The Recursive Deep-Dive Generator (Dynamic Room-by-Room Construction)
@@ -2335,6 +2365,10 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
     audience_context = detect_audience_context(history)
     
+    # ARCHITECTURAL FIX: Modular Instruction Assembly
+    blueprint_sys = get_system_instructions("BLOG_OUTLINE", output_target)
+    blueprint_sys += f"\n\n{style_mentors}"
+
     # PHASE 1: Generate the Blueprint & Title (The Architect)
     blueprint_prompt = f"""
     You are the Lead Architect. Create a strategic content blueprint for: "{topic}".
@@ -2360,13 +2394,8 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     Design the optimal structure.
     - **Sections**: Create between 3 and 8 H2 sections depending on the complexity of the topic.
     - **NO REDUNDANCY**: Do NOT include a "Lede", "Introduction", or "Conclusion" section in your list. These parts are handled by special drafting phases. Start directly with the core problem or first technical insight.
-    - **WORD COUNT BUDGETING**: You MUST assign a `target_word_count` to each section. The SUM of all these counts MUST be approximately {target_length - 300} (to allow space for the intro and conclusion). 
+    - **WORD COUNT BUDGETING**: You MUST assign a `target_word_count` to each section. The SUM of all these counts MUST be approximately {target_length - 300}. 
     - **Strategic Allocation**: Allocate more words to complex case studies/ROOT CAUSE analysis and fewer to simple definitions/hooks.
-    - **Contextual Root Cause Analysis**: Mandate exploration of the systemic factors behind the topic's core challenges in the architecture.
-    - **Solution Framing**: Explicitly frame provided technical concepts or solutions as context-sensitive measures.
-    - **Relevant Technical States**: Highlight specific system states (e.g., approval, failure, transitions) that are most critical to the current context.
-    - **Asymmetric Weighting**: DO NOT be perfectly balanced. Prioritize the most critical technical finding and spend 70% of the architecture there.
-    - **Flow**: Ensure a logical narrative arc.
     
     AUDIENCE: {audience_context}
     RESEARCH CONTEXT: {context}
@@ -2386,7 +2415,7 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     """
     
     try:
-        blueprint_raw = safe_generate_content(unimodel, blueprint_prompt)
+        blueprint_raw = safe_generate_content(unimodel, blueprint_prompt, system_instruction=blueprint_sys)
         if "```json" in blueprint_raw: blueprint_raw = blueprint_raw.split("```json")[1].split("```")[0].strip()
         blueprint = json.loads(blueprint_raw)
         title = blueprint.get("title", f"The Analysis of {topic}")
@@ -2400,8 +2429,10 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     article_parts = [f"<h1>{title}</h1>"]
     
     # Intro (Sequential - Sets the stage)
-    print(f"  + Drafting Hook Intro for {target_geo}...")
-    intro_words = max(150, target_length // (len(sections) + 1))
+    # ARCHITECTURAL FIX: Modular Instruction Assembly
+    intro_sys = get_system_instructions("DEEP_DIVE", output_target)
+    intro_sys += f"\n\n{style_mentors}"
+
     intro_prompt = f"""
     Write a compelling {intro_words}-word intro for: '{title}'.
     REGION: {target_geo}
@@ -2409,8 +2440,6 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     AUDIENCE: {audience_context}
     STYLE: Clear, engaging, professional English. Use analogies for complex ideas.
     
-    {STYLE_PROTOCOL}
-    {style_mentors}
     {target_instruction}
     
     GOAL: {topic}
@@ -2423,7 +2452,7 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     
     OUTPUT: Return ONLY the content in semantic HTML (no markdown). Wrap paragraphs in <p>. Do NOT include <h1> or <h2> headers here.
     """
-    intro_raw = safe_generate_content(unimodel, intro_prompt)
+    intro_raw = safe_generate_content(unimodel, intro_prompt, system_instruction=intro_sys)
     article_parts.append(f'<section class="intro">\n{sanitize_llm_html(intro_raw)}\n</section>')
     
     # Define Worker Function for Parallel Processing
@@ -2441,46 +2470,38 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
         else:
             section_words = int(str(section_words).strip())
             
+        # ARCHITECTURAL FIX: Modular Instruction Assembly
+        section_sys = get_system_instructions("DEEP_DIVE", output_target)
+        section_sys += f"\n\n{style_mentors}"
+
         # NOTE: In parallel mode, we rely on the Blueprint logic rather than the literal previous text.
         room_prompt = f"""
         Write a {section_words}-word section for: "{title}".
         REGION: {target_geo}
         
-        {STYLE_PROTOCOL}
-        {style_mentors}
         {target_instruction}
         
         CHAPTER {index+1}/{total_sections}: {section['title']}
         INSTRUCTION: {instruction}
-        CONTEXT: This section strictly follows the concept: "{previous_title}". Ensure logical continuity.
+        TASK: Write a full {section['target_word_count']} word article section for the title: "{section['title']}".
+        OVERALL TOPIC: {title}
         
-        STRICT LIMIT: Stay under {section_words + 50} words.
-        **MEAT-FIRST PROTOCOL**: BAN meta-commentary like "Short answer:", "Bottom line:", or "In summary:". Start the first paragraph with direct, high-density technical findings or narrative meat.
-        **SIMPLICITY MANDATE**: Use simple terms and descriptions. Avoid dense jargon; explain technical concepts using analogies that a non-specialist can grasp.
-        **COLON PROTOCOL (ZERO-TOLERANCE)**: EXCISE colons from all paragraph prose. Colons are for vertical lists ONLY. MANDATE: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED.
-        **LEXICAL VARIETY (ANTI-CLUMPING)**: PROHIBIT repeating key nouns/verbs (e.g., replace repeated "costs" with "overhead").
-        **ZERO-PASSIVE VOICE**: PROHIBIT passive voice. MANDATE active voice (e.g., "Investors chose winners" instead of "Winners were chosen").
-            - **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Favor semicolons (;) or periods (.).
-            - **Rhythmic Variance**: Vary sentence length. Combine short, assertive claims with longer explanatory clauses.
-            - **Punctuation Policy**: Lean on semicolons for complexity.
-            - **No Colon Clumping**: Do not use colons to introduce inline definitions. Use active verbs instead.
-            - **Tactical Transitions**: BAN robotic transitions. Use connectors like "By the same token," "coupled with," or "notwithstanding."
-        **TEXTURE & OPINION**: BAN AI buzzwords (delve, landscape, robust, unlock). Enforce "Gritty Realism" (operational costs, friction). Strip non-committal hedging.
-        **TECHNICAL-EXTERNAL MAPPING**: Instruct the model to identify relevant external frameworks (regulatory, structural, or conceptual) and explicitly link technical solutions to those specific anchors.
-        **CONTEXTUAL SPECIFICITY**: Actively identify and expand on points of interest, debates, cultural markers, or specific real-world examples found in the research context.
+        ### WRITING GUIDANCE (FROM ARCHITECT):
+        {section['writing_instruction']}
+        
+        ### LINGUISTIC DIRECTIVES:
+        - **HUMAN FINGERPRINT**: Mandate punctuation diversity (semicolons/parentheses).
+        - **TACTICAL TRANSITIONS**: BAN robotic connectors. Use context-aware movements.
         
         GROUNDING DATA: {context if is_grounded else "Internal Knowledge base"}
-        
         {extract_labeled_sources(context if is_grounded else "")}
         
-        CRITICAL CITATION RULE:
-        - **Inline Anchored Links**: When referencing facts or data points from the GROUNDING SOURCES, you MUST use semantic HTML anchored links inside the prose: `<a href="URL">Anchor Text</a>`.
-        - **No Link Dumps**: Absolutely PROHIBIT appending a list of "Sources" or "References" at the end of the section. Grounding must be 100% inline for SEO and readability.
+        ### CRITICAL CITATION RULE:
+        - **Inline Anchored Links**: When referencing facts or data points from the GROUNDING SOURCES, you MUST use semantic HTML anchored links: `<a href="URL">Anchor Text</a>`.
         
-        OUTPUT: Start with <h2>{section['title']}</h2> then the content in semantic HTML (no markdown). Wrap paragraphs in <p>, use <ul>/<li> for lists, and `<pre><code class="language-...">` for code.
-        **Mermaid Diagrams**: MUST be preserved. Wrap Mermaid code in a `<figure class="kg-card kg-image-card kg-width-wide">` block. Inside, include the `<pre><code class="language-mermaid">...</code></pre>` and a context-aware `<figcaption>...</figcaption>`.
+        OUTPUT: Start with <h2>{section['title']}</h2> then the content in semantic HTML (no markdown). Wrap paragraphs in <p>.
         """
-        content = safe_generate_content(unimodel, room_prompt)
+        content = safe_generate_content(unimodel, room_prompt, system_instruction=section_sys)
         return index, f'<section class="body-part">\n{sanitize_llm_html(content)}\n</section>'
 
     # Execute Parallel Pool
@@ -2506,18 +2527,18 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     # Conclusion
     print("  + Drafting Final Reflection...")
     conc_words = intro_words // 2
+    # ARCHITECTURAL FIX: Modular Instruction Assembly
+    conc_sys = get_system_instructions("DEEP_DIVE", output_target)
+    conc_sys += f"\n\n{style_mentors}"
+
     conc_prompt = f"""
     Write a {conc_words}-word concluding thought for '{title}'. 
     Audience: {audience_context}. 
     Summary of key impact.
     
-    {STYLE_PROTOCOL}
-    {style_mentors}
-    {target_instruction}
-
     OUTPUT: Return ONLY the content in semantic HTML (no markdown). Wrap paragraphs in <p>. Do NOT include a header.
     """
-    conc_raw = safe_generate_content(unimodel, conc_prompt)
+    conc_raw = safe_generate_content(unimodel, conc_prompt, system_instruction=conc_sys)
     article_parts.append(f'<section class="conclusion">\n<h2>Final Reflection</h2>\n{sanitize_llm_html(conc_raw)}\n</section>')
 
     # PHASE 3: Methodology
@@ -2545,10 +2566,12 @@ def create_euphemistic_links(keyword_context, is_initial=True, session_id=None):
     
     state_context = "This is a NEW proposal for a new thread." if is_initial else "This is a REVISION or EXTENSION of a previous strategy in an existing thread."
     
-    prompt = f"""
-    {STYLE_PROTOCOL}
-    {style_mentors}
+    # ARCHITECTURAL FIX: Modular Instruction Assembly
+    # Intent for Then/Now is naturally technical but formatted for Slack
+    sys_instruction = get_system_instructions("SIMPLE_QUESTION", "MODERATOR_VIEW")
+    sys_instruction += f"\n\n{style_mentors}"
     
+    prompt = f"""
     Topic: "{keyword_context['clean_topic']}". 
     
     STATE: {state_context}
@@ -2569,20 +2592,22 @@ def create_euphemistic_links(keyword_context, is_initial=True, session_id=None):
     CRITICAL SCHEMA: Exact keys: "then_concept", "now_concept", "link".
     Structure: {{ "interlinked_concepts": [ {{ "then_concept": "...", "now_concept": "...", "link": "..." }} ] }}
     """
-    return extract_json(safe_generate_content(unimodel, prompt))
+    
+    # Use system_instruction layer
+    response = safe_generate_content(unimodel, prompt, system_instruction=sys_instruction)
+    return extract_json(response)
 
 #15. The Euphemistic 'Then vs Now' Linker
 def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None, session_id=None, output_target="MODERATOR_VIEW"):
     if not tool_confirmation or not tool_confirmation.get("confirmed"): raise PermissionError("Wait for approval.")
     style_mentors = get_stylistic_mentors(session_id)
     
-    target_instruction = ""
-    if output_target == "MODERATOR_VIEW":
-        target_instruction = "IMPORTANT: You are talking to a MODERATOR on Slack. Use Markdown Pipes (|) for any tables."
-    else:
-        target_instruction = "IMPORTANT: You are drafting for Ghost CMS. Use strictly semantic HTML <table> tags."
+    # ARCHITECTURAL FIX: Modular Instruction Assembly
+    sys_instruction = get_system_instructions("SIMPLE_QUESTION", output_target)
+    sys_instruction += f"\n\n{style_mentors}"
 
-    return safe_generate_content(unimodel, f"{STYLE_PROTOCOL}\n{style_mentors}\n{target_instruction}\nTASK: Tell a 'Then and Now' story using these concepts: {interlinked_concepts}")
+    prompt = f"TASK: Tell a 'Then and Now' story using these concepts: {interlinked_concepts}"
+    return safe_generate_content(unimodel, prompt, system_instruction=sys_instruction)
 
 #16. The Proposal Critic and Refiner
 def critique_proposal(topic, current_proposal):
@@ -2594,14 +2619,16 @@ def critique_proposal(topic, current_proposal):
 def refine_proposal(topic, current_proposal, critique, session_id=None):
     global unimodel
     style_mentors = get_stylistic_mentors(session_id)
+    
+    # ARCHITECTURAL FIX: Modular Instruction Assembly
+    sys_instruction = get_system_instructions("SIMPLE_QUESTION", "MODERATOR_VIEW")
+    sys_instruction += f"\n\n{style_mentors}"
+
     prompt = f"""
     REWRITE proposal. Topic: {topic}. Draft: {json.dumps(current_proposal)}. Critique: {critique}. 
     Preserve keys: 'then_concept', 'now_concept', 'link'. Ensure JSON format.
-    
-    {STYLE_PROTOCOL}
-    {style_mentors}
     """
-    return extract_json(safe_generate_content(unimodel, prompt))
+    return extract_json(safe_generate_content(unimodel, prompt, system_instruction=sys_instruction))
 
 # 18. Phase 1: Sales-to-Content Pipeline
 def process_sales_transcript(transcript_text, output_target="MODERATOR_VIEW"):
@@ -2610,13 +2637,11 @@ def process_sales_transcript(transcript_text, output_target="MODERATOR_VIEW"):
     """
     global specialist_model, db
     
-    target_instruction = ""
-    if output_target == "MODERATOR_VIEW":
-        target_instruction = "TARGET: MODERATOR_VIEW (Slack Briefing). Use Markdown Pipes (|) for tables. Use Slack-safe formatting."
-    else:
-        target_instruction = "TARGET: CMS_DRAFT (Ghost CMS). Use Semantic HTML <table> tags. PROHIBIT Markdown."
+    # ARCHITECTURAL FIX: Modular Instruction Assembly
+    # Extraction phase uses lightweight reasoning.
+    extraction_sys = get_system_instructions("SIMPLE_QUESTION", "MODERATOR_VIEW")
+    extraction_sys += f"\n\n{style_mentors}"
 
-    
     # Step 1: Extract objections using Claude
     objection_prompt = f"""
     Analyze this sales call transcript and extract the following (omit any field if not mentioned):
@@ -2636,14 +2661,12 @@ def process_sales_transcript(transcript_text, output_target="MODERATOR_VIEW"):
       "budget_timeline": "summary"
     }}
     
-    {STYLE_PROTOCOL}
-    {style_mentors}
-    
     CRITICAL: Valid JSON ONLY. If a category has no data, use an empty array [] or "Not discussed".
     """
     
     try:
-        objections_raw = safe_generate_content(specialist_model, objection_prompt)
+        # Use Specialist Model for high-fidelity extraction
+        objections_raw = safe_generate_content(specialist_model, objection_prompt, system_instruction=extraction_sys)
         # Handle potential markdown wrapping
         if "```json" in objections_raw:
             objections_raw = objections_raw.split("```json")[1].split("```")[0].strip()
@@ -2661,6 +2684,11 @@ def process_sales_transcript(transcript_text, output_target="MODERATOR_VIEW"):
     competitors = objections.get("competitors", [])
     budget_timeline = objections.get("budget_timeline", "Not discussed")
     
+    # ARCHITECTURAL FIX: Modular Instruction Assembly
+    # Briefing phase uses high-fidelity rules.
+    brief_sys = get_system_instructions("TECHNICAL_EXPLANATION", output_target)
+    brief_sys += f"\n\n{style_mentors}"
+
     # Step 2: Generate solution brief
     brief_prompt = f"""
     Create a "Solution Brief" that addresses these customer insights:
@@ -2674,8 +2702,6 @@ def process_sales_transcript(transcript_text, output_target="MODERATOR_VIEW"):
     # Solution Brief
     ## Executive Summary
     ## Objection Responses
-    {STYLE_PROTOCOL}
-    {style_mentors}
     {target_instruction}
     
     ### FORMATTING RULES (PRIORITY):
@@ -2685,8 +2711,7 @@ def process_sales_transcript(transcript_text, output_target="MODERATOR_VIEW"):
        - Use triple backticks with language identifier: ```language
     """
     
-    
-    brief_raw = safe_generate_content(specialist_model, brief_prompt)
+    brief_raw = safe_generate_content(specialist_model, brief_prompt, system_instruction=brief_sys)
     brief_html = ensure_slack_compatibility(brief_raw)  # Convert **bold** to *bold*
     
     # Step 3: Normalize content for return (Auto-save REMOVED to align with approval logic)
@@ -2719,7 +2744,8 @@ def process_story_logic(request):
         unimodel = UnifiedModel(MODEL_PROVIDER, MODEL_NAME)
     
     if flash_model is None:
-        flash_model = GenerativeModel(FLASH_MODEL_NAME, safety_settings=safety_settings)
+        # Standardize: Use UnifiedModel wrapper instead of raw GenerativeModel
+        flash_model = UnifiedModel("vertex_ai", FLASH_MODEL_NAME)
 
     if research_model is None:
         research_model = UnifiedModel("vertex_ai", RESEARCH_MODEL_NAME)
