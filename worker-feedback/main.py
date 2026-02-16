@@ -34,7 +34,7 @@ class UnifiedModel:
             self._native_model = GenerativeModel(model_name, safety_settings=safety)
             print(f"✅ Loaded Unified Vertex Model: {model_name}")
 
-    def generate_content(self, prompt, generation_config=None, max_retries=3):
+    def generate_content(self, prompt, generation_config=None, max_retries=3, system_instruction=None):
         import time
         import random
         
@@ -42,6 +42,18 @@ class UnifiedModel:
             retries = 0
             while retries <= max_retries:
                 try:
+                    # ADK FIX: Modular System Instruction Support
+                    if system_instruction:
+                        from vertexai.generative_models import GenerativeModel
+                        # Re-init model with system instruction for this turn
+                        # (Note: In production, we might want to cache models per instruction hash)
+                        temp_model = GenerativeModel(
+                            self.model_name, 
+                            safety_settings=self._native_model._safety_settings if hasattr(self._native_model, '_safety_settings') else None,
+                            system_instruction=system_instruction
+                        )
+                        return temp_model.generate_content(prompt, generation_config=generation_config)
+                    
                     return self._native_model.generate_content(prompt, generation_config=generation_config)
                 except Exception as e:
                     error_msg = str(e).lower()
@@ -64,12 +76,22 @@ class UnifiedModel:
             if api_key:
                 os.environ["ANTHROPIC_API_KEY"] = api_key
             
+            messages = []
+            if system_instruction:
+                messages.append({"role": "system", "content": str(system_instruction)})
+            messages.append({"role": "user", "content": prompt})
+            
             response = litellm.completion(
                 model=self.model_name,
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
                 temperature=generation_config.get("temperature", 0.7) if generation_config else 0.7
             )
-            return response.choices[0].message
+            
+            content = response.choices[0].message.content
+            
+            class MockResponse:
+                def __init__(self, c): self.text = c
+            return MockResponse(content)
         return None
 
 # --- Config ---
@@ -138,52 +160,80 @@ tasks_client = None
 secret_client = None
 logging_v_client = None
 
-# --- STYLE & SANITIZATION PROTOCOL (Global Constant) ---
-# This ensures 100% linguistic consistency across all generation paths
-# to prevent "Context Pollution" in long-running threads.
-STYLE_PROTOCOL = """
-### STYLE & SANITIZATION PROTOCOL (ZERO-TOLERANCE):
-- **MEAT-FIRST NARRATIVE**: BAN robotic framing like "Short answer:", "Bottom line:", or "The takeaway is:". Start with direct data.
-- **OUTPUT TARGETS (MANDATORY)**:
-    1. **CMS_DRAFT**: If the target is a blog draft (Ghost), use ONLY semantic HTML. PROHIBIT all Markdown. Tables MUST use `<table>` tags. Headers MUST use `<h2>` or `<h3>` (PROHIBIT `#`). Wrap all paragraphs in `<p>`.
-    2. **MODERATOR_VIEW**: If the target is a Slack brief or research discovery, use Markdown exclusively for tables (pipes: `|`), headers (`#`, `##`), and code blocks. PROHIBIT all HTML tags (no `<p>`, `<h2>`, etc.). Use blank lines for paragraph separation.
-- **TAG ENFORCEMENT**: In CMS_DRAFT mode, wrap all paragraphs in `<p>`. In MODERATOR_VIEW, use Slack-safe line breaks.
-- **HUMAN FINGERPRINT**: Vary sentence length. Mix punchy sentences (5-10 words) with fluid reflections (20-35 words).
-- **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) or parentheses ( ).
-- **NARRATIVE COLON BAN**: PROHIBIT colons in prose to connect claims to details. Use a period and a new sentence, or descriptive transitions. 
-- **COLON PROTOCOL (LISTS ONLY)**: Colons are for vertical bulleted lists ONLY. 
-- **MANDATORY CAPITALIZATION**: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED. Absolutely PROHIBIT "Label: lowercase" patterns.
-- **LEXICAL VARIETY (ANTI-CLUMPING)**: MANDATE categorical rotation. PROHIBIT repeating the same key noun/verb in adjacent sentences.
-- **ACTIVE VERB PRIORITY**: PRIORITIZE descriptive, context-aware actions. Use the provided Dynamic Palette as mentors.
-- **ZERO-PASSIVE VOICE**: PRIORITIZE active voice to drive narrative momentum.
-- **ANTI-WATERMARK**: BAN robotic buzzwords: 'delve', 'tapestry', 'landscape', 'unlock', 'embark', 'comprehensive', 'robust'. 
-- **NO COLON CLUMPING**: Do not use "Label: Definition" structures. Use active, descriptive narrative flow.
-- **TACTICAL TRANSITIONS**: BAN robotic connectors like "Furthermore" or "Moreover." Use the provided Dynamic Palette to maintain narrative "drag."
-- **CONTEXTUAL INTEGRITY (ZERO-INVENTION)**:
-    1. **DATA FIDELITY**: You are FORBIDDEN from generating any specific statistic (%), project count (e.g., "120 projects"), or implementation claim that is not explicitly in the USER PROMPT, PROVIDED FILES, or VERIFIED SEARCH RESULTS. Use qualitative descriptions if data is absent.
-    2. **LINK VERIFICATION**: Only generate URLs that have been explicitly provided or verified in the current turn's context. Never "guess" a logical URL path.
-    3. **ARCHITECTURAL ANCHORING**: Claims must align with the provided context (e.g., architectural or contextual specs). If a claim contradicts the Primary Anchor (Prompt/Files), the anchor takes precedence.
-    4. **GROUNDING DATA SUPREMACY (Universal)**: When GROUNDING DATA contains current information on ANY topic (APIs, news events, trend data, regulatory changes, market statistics, etc.), you MUST prioritize that information over your training data. Your training data has a knowledge cutoff; GROUNDING DATA represents real-time, verified information. Specific applications:
-       - **Technical**: API versions, library deprecations, framework updates
-       - **News/Events**: Current events, breaking news, recent announcements
-       - **Trends**: Search volume data, market shifts, emerging patterns
-       - **Regulatory**: New laws, policy changes, compliance updates
-       - **Statistics**: Current metrics, recent studies, updated benchmarks
-    5. **TEMPORAL VERIFICATION**: When GROUNDING DATA contains timestamps, publication dates, or version numbers, treat those as authoritative. If GROUNDING DATA shows information is outdated or superseded, you MUST use the current replacement mentioned in GROUNDING DATA.
-    6. **EXPLICIT SOURCE ATTRIBUTION**: When using information from GROUNDING DATA, cite the source type (e.g., "According to recent search data..." or "Based on current API documentation..."). This creates transparency about information provenance.
-- **MERMAID MANDATE**: You are strictly PROHIBITED from generating ASCII-based diagrams or logic maps (e.g., using arrows like `-->` or pipes `|` for flow). For any architectural maps, sequence flows, or visual logic, you MUST use `mermaid` code blocks. This ensures high-fidelity rendering via the MCP gateway.
-- **MERMAID MODULARITY**: For complex architectures, FAVOR multiple modular diagrams (e.g., Phase 1 vs Phase 2) over a single dense block. This ensures high-fidelity readability and prevents transport failures (Slack 3k URL limit).
-- **TABLE COMPACTION**: PROHIBIT blank lines within Markdown tables. All rows (header, separator, and data) MUST be contiguous for parser integrity.
-- **STRATEGIC CONTEXT SANITIZATION (ANTI-META-TALK)**:
-    - **UNIVERSAL PROHIBITION**: You are strictly PROHIBITED from mentioning internal strategic decision-making, competitive audits, or benchmarking scores in any CMS_DRAFT output.
-    - **BANNED CATEGORIES**:
-        1. **SEO/Metrics**: "competitor gap," "audit scores," "ranking analysis," "search volume," "AEO strategy," "moat factor," "technical density score."
-        2. **Process/Turns**: "turn-based analysis," "Turn 1/2/3/4," "internal blueprint," "iterative refinement," "previous response," "vetted prompt."
-        3. **Implementation Meta**: "strategic decision primitives," "policy enforcement point (PEP) architecture," "architectural logic implementation."
-        4. **Comparative Bias**: "technical vacuum," "marketing hype," "marketing fluff," "displace leaders."
-    - **DEFINITION SHIELD**: PROHIBIT "Define [Abbreviation] as [Full Name]" sentence structures. Integrate definitions naturally (e.g., "The Policy Enforcement Point (PEP)...") or assume professional context.
-    - **TONE REPLACEMENT**: Instead of saying "Other guides score 2/10," simply present the authoritative technical finding with 10/10 technical depth. The "moat" is felt through your technical precision, not stated in prose.
+# --- STYLE & SANITIZATION PROTOCOL (Modularized) ---
+PROTOCOL_GROUNDING_RAI = """
+### CONTEXTUAL INTEGRITY (ZERO-INVENTION):
+- **DATA FIDELITY**: You are FORBIDDEN from generating any specific statistic (%), project count (e.g., "120 projects"), or implementation claim that is not explicitly in the USER PROMPT, PROVIDED FILES, or VERIFIED SEARCH RESULTS. Use qualitative descriptions if data is absent.
+- **LINK VERIFICATION**: Only generate URLs that have been explicitly provided or verified in the current turn's context. Never "guess" a logical URL path.
+- **ARCHITECTURAL ANCHORING**: Claims must align with the provided context (e.g., architectural or contextual specs).
+- **GROUNDING DATA SUPREMACY**: When GROUNDING DATA contains current info, you MUST prioritize that over your training data. Your training data has a knowledge cutoff; GROUNDING DATA is real-time.
+- **EXPLICIT SOURCE ATTRIBUTION**: Cite source type (e.g., "According to recent search data...") for transparency.
 """
+
+PROTOCOL_VISUAL_TABULAR = """
+### VISUAL & LOGIC PROTOCOLS:
+- **MERMAID MANDATE**: You are strictly PROHIBITED from generating ASCII-based diagrams (arrows, pipes). Use `mermaid` code blocks.
+- **MERMAID MODULARITY**: FAVOR multiple modular diagrams over a single dense block.
+- **TABLE COMPACTION**: PROHIBIT blank lines within Markdown tables. All rows MUST be contiguous.
+"""
+
+PROTOCOL_LITERARY_CORE = """
+### LITERARY & NARRATIVE ARCHITECTURE:
+- **MEAT-FIRST NARRATIVE**: BAN robotic framing. Start with direct data.
+- **HUMAN FINGERPRINT**: Vary sentence length. Mix punchy (5-10 word) with fluid (20-35 word) sentences.
+- **EM-DASH RESTRAINT**: Limit em-dashes to max ONE per paragraph. Use semicolons or periods.
+- **NARRATIVE COLON BAN**: PROHIBIT colons in prose to connect claims to details.
+- **COLON PROTOCOL**: Colons for vertical lists ONLY. THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED.
+- **LEXICAL VARIETY**: PROHIBIT repeating the same key noun/verb in adjacent sentences.
+- **ACTIVE VERB PRIORITY**: Use descriptive, context-aware active verbs.
+- **TONE REPLACEMENT**: Don't state quality; show it through technical precision.
+"""
+
+PROTOCOL_FORMAT_CMS = """
+### TARGET: CMS_DRAFT (Ghost CMS)
+- **HTML ONLY**: Use semantic HTML. PROHIBIT Markdown.
+- **TABLES**: Use `<table>` tags.
+- **HEADERS**: Use `<h2>` or `<h3>`. PROHIBIT `#`.
+- **PARAGRAPHS**: Wrap all paragraphs in `<p>`.
+"""
+
+PROTOCOL_FORMAT_SLACK = """
+### TARGET: MODERATOR_VIEW (Slack)
+- **MARKDOWN ONLY**: Use Markdown exclusively. PROHIBIT HTML tags.
+- **SPACING**: Use blank lines for paragraph separation.
+"""
+
+PROTOCOL_ANTI_SLOB = """
+### ANTI-WATERMARK & NOISE REDUCTION:
+- **BANNED BUZZWORDS**: 'delve', 'tapestry', 'landscape', 'unlock', 'embark', 'comprehensive', 'robust'.
+- **NO COLON CLUMPING**: Do not use "Label: Definition" structures. Use active narrative flow.
+- **STRATEGIC SANITIZATION**: PROHIBIT mentioning internal strategy (SEO metrics, turn-counts, internal benchmarks) in public drafts.
+"""
+
+# Backward Compatibility
+STYLE_PROTOCOL = PROTOCOL_GROUNDING_RAI + PROTOCOL_VISUAL_TABULAR + PROTOCOL_LITERARY_CORE + PROTOCOL_ANTI_SLOB
+
+def get_system_instructions(intent: str, output_target: str) -> str:
+    """
+    Architectural fix to assemble instructions modularly based on intent and target.
+    Prevents token waste while ensuring 100% rule fidelity for relevant tasks.
+    """
+    instructions = "You are a highly capable AI assistant. Adhere strictly to these protocols:\n"
+    instructions += PROTOCOL_GROUNDING_RAI
+    instructions += PROTOCOL_VISUAL_TABULAR
+    
+    if output_target == "CMS_DRAFT":
+        instructions += PROTOCOL_FORMAT_CMS
+    else:
+        instructions += PROTOCOL_FORMAT_SLACK
+        
+    # Condition: Literary and Anti-Slob protocols are for High-Fidelity content generation.
+    high_fidelity_intents = ["DEEP_DIVE", "PSEO_ARTICLE", "TECHNICAL_EXPLANATION", "REWRITE", "REFINE", "THEN_VS_NOW_PROPOSAL"]
+    if intent in high_fidelity_intents:
+        instructions += PROTOCOL_LITERARY_CORE
+        instructions += PROTOCOL_ANTI_SLOB
+        
+    return instructions.strip()
 # --- HELPER: Dynamic Linguistic Palette ---
 def get_stylistic_mentors(session_id=None):
     """
@@ -360,9 +410,28 @@ def convert_html_to_markdown(html_str):
 
 # --- Utils ---
 def extract_json(text):
-    match = re.search(r'\{.*\}', text, re.DOTALL)
-    if not match: raise ValueError(f"No JSON found")
-    return json.loads(match.group(0))
+    """
+    Super-Listener: Hardened extraction of JSON from LLM responses.
+    Handles markdown fences (```json) and raw braced strings/lists.
+    """
+    if not text: return None
+    
+    # 1. Look for Markdown-wrapped blocks first
+    markdown_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+    if markdown_match:
+        content = markdown_match.group(1).strip()
+    else:
+        # 2. Hardened Bracket Discovery (Objects or Lists)
+        # Finds the outermost [...] or {...}
+        match = re.search(r'([\[\{][\s\S]*[\]\}])', text)
+        if not match: return None
+        content = match.group(1).strip()
+    
+    try:
+        return json.loads(content)
+    except Exception as e:
+        print(f"FAILED FEEDBACK JSON PARSE: {e}")
+        raise ValueError(f"No valid JSON found in response.")
 
 def extract_url_from_text(text):
     url_pattern = r'(https?://[^\s<>|]+)'
@@ -407,7 +476,7 @@ def log_safety_event(event_name, data):
     except Exception as e:
         print(f"Safety Event Logged (Local): {event_name} - {data} | Error: {e}")
 
-def safe_generate_content(model, prompt):
+def safe_generate_content(model, prompt, system_instruction=None, generation_config=None):
     """
     Robust wrapper for ALL LLM calls.
     Handles:
@@ -417,7 +486,7 @@ def safe_generate_content(model, prompt):
     """
     global specialist_model
     try:
-        response = model.generate_content(prompt)
+        response = model.generate_content(prompt, system_instruction=system_instruction, generation_config=generation_config)
         text_out = response.text.strip()
         
         # Detect soft refusal
@@ -438,7 +507,7 @@ def safe_generate_content(model, prompt):
         time.sleep(2)
         
         # Retry with backup
-        fallback_resp = specialist_model.generate_content(prompt, generation_config={"temperature": 0.4})
+        fallback_resp = specialist_model.generate_content(prompt, system_instruction=system_instruction, generation_config=generation_config or {"temperature": 0.4})
         return fallback_resp.content.strip() if hasattr(fallback_resp, 'content') else fallback_resp.text.strip()
     except Exception as e2:
         # Catch Anthropic 429 specifically
@@ -481,6 +550,10 @@ def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None, sessio
         
     style_mentors = get_stylistic_mentors(session_id)
     
+    # ARCHITECTURAL FIX: Modular Instruction Assembly
+    sys_instruction = get_system_instructions("THEN_VS_NOW_PROPOSAL", output_target)
+    sys_instruction += f"\n\n{style_mentors}"
+
     # --- STRATEGIC CONTEXT SANITIZATION ---
     if output_target == "CMS_DRAFT":
         internal_keywords = [
@@ -491,29 +564,18 @@ def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None, sessio
         for kw in internal_keywords:
             interlinked_concepts = re.sub(rf"(?i){kw}.*?\n?", "[STRATEGIC_CONTEXT_OMITTED] ", str(interlinked_concepts))
     
-    # Determined Output Target
-    target_instruction = ""
-    if output_target == "MODERATOR_VIEW":
-        target_instruction = "IMPORTANT: TARGET: MODERATOR_VIEW (Slack). Use Markdown Pipes (|) for tables."
-    else:
-        target_instruction = "IMPORTANT: TARGET: CMS_DRAFT (Ghost CMS). Use strictly semantic HTML <table> tags."
-    
     prompt = f"""
-    {STYLE_PROTOCOL}
-    {style_mentors}
-    {target_instruction}
-    
     TASK: Tell a 'Then and Now' story using these concepts: {interlinked_concepts}
     
     {extract_labeled_sources(interlinked_concepts)}
     
-    CRITICAL CITATION RULE:
+    ### CRITICAL CITATION RULE:
     - **Inline Anchored Links**: When referencing facts supported by the GROUNDING SOURCES, you MUST use semantic HTML anchored links: `<a href="URL">Anchor Text</a>`.
     - **No Link Dumps**: Do NOT append a "Sources" list at the end.
     """
     
     print(f"DEBUG: tell_then_and_now_story: Using Specialist Model for high-fidelity synthesis. [Target: {output_target}]")
-    return safe_generate_content(specialist_model, prompt)
+    return safe_generate_content(specialist_model, prompt, system_instruction=sys_instruction)
 
 def refine_proposal(topic, current_proposal, critique, session_id=None):
     global specialist_model
@@ -523,6 +585,11 @@ def refine_proposal(topic, current_proposal, critique, session_id=None):
         specialist_model = UnifiedModel(provider="anthropic", model_name="claude-sonnet-4-5")
         
     style_mentors = get_stylistic_mentors(session_id)
+    
+    # ARCHITECTURAL FIX: Modular Instruction Assembly
+    sys_instruction = get_system_instructions("REFINE", "MODERATOR_VIEW")
+    sys_instruction += f"\n\n{style_mentors}"
+
     prompt = f"""
     REWRITE the following content proposal blueprint based on the user's critique.
     CRITIQUE: {critique}
@@ -530,12 +597,9 @@ def refine_proposal(topic, current_proposal, critique, session_id=None):
     CURRENT PROPOSAL: {json.dumps(current_proposal)}
     
     Return ONLY a valid JSON object matching the input structure.
-    
-    {STYLE_PROTOCOL}
-    {style_mentors}
     """
     print(f"DEBUG: refine_proposal: Using Specialist Model for high-fidelity instruction adherence.")
-    raw_text = safe_generate_content(specialist_model, prompt)
+    raw_text = safe_generate_content(specialist_model, prompt, system_instruction=sys_instruction)
     return extract_json(raw_text)
 
 def get_output_target(intent: str) -> str:
@@ -654,6 +718,10 @@ def process_feedback_logic(request):
         intent = "APPROVE"
         print(f"Quick Approval detected. Forcing APPROVE intent.")
     else:
+        # ARCHITECTURAL FIX: Modular Instruction Assembly
+        # Triage doesn't need the full STYLE_PROTOCOL, but benefits from baseline guardrails.
+        triage_sys = get_system_instructions("SIMPLE_QUESTION", "MODERATOR_VIEW")
+
         feedback_triage_prompt = f"""
         Analyze the user's latest message in the context of the conversation history. Classify the user's INTENT into one of three categories:
 
@@ -673,7 +741,7 @@ def process_feedback_logic(request):
 
         Respond with ONLY the category name (APPROVE, REFINE, or DELEGATE).
         """
-        intent = safe_generate_content(unimodel, feedback_triage_prompt).upper()
+        intent = safe_generate_content(unimodel, feedback_triage_prompt, system_instruction=triage_sys).upper()
     
     print(f"Feedback Triage classified intent as: {intent}")
     
