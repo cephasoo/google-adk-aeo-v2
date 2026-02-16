@@ -41,3 +41,5 @@ worker-tracker/mcp_logs*.json
 worker-tracker/
 ops/
 
+
+n8n-key.json
