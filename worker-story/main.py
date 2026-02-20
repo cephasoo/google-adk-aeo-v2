@@ -35,12 +35,41 @@ try:
 except Exception:
     logging_v_client = None # Fallback to standard logging if local
 
+# --- SECRET MANAGER ---
+secret_client = None
+def get_secret(secret_id):
+    """
+    Retrieves a secret from Google Cloud Secret Manager.
+    Includes an environment variable fallback for local development or manual overrides.
+    """
+    global secret_client
+    
+    # 1. Check environment variables first (High Speed / Local Dev)
+    env_key = secret_id.upper().replace("-", "_")
+    env_val = os.environ.get(env_key)
+    if env_val:
+        return env_val.strip()
+        
+    # 2. Fallback to Secret Manager
+    try:
+        if secret_client is None:
+            secret_client = secretmanager.SecretManagerServiceClient()
+        
+        name = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest"
+        response = secret_client.access_secret_version(request={"name": name})
+        return response.payload.data.decode("UTF-8").strip()
+    except Exception as e:
+        print(f"⚠️ Secret Manager error for {secret_id}: {e}")
+        return None
+
 # --- Configuration ---
-try:
-    _, project_id_auth = google.auth.default()
-    PROJECT_ID = os.environ.get("PROJECT_ID", project_id_auth)
-except:
-    PROJECT_ID = os.environ.get("PROJECT_ID")
+PROJECT_ID = os.environ.get("PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")
+if not PROJECT_ID:
+    try:
+        _, project_id_auth = google.auth.default()
+        PROJECT_ID = project_id_auth
+    except:
+        PROJECT_ID = None
 
 LOCATION = os.environ.get("LOCATION")
 MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.5-pro") 
@@ -51,6 +80,14 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL") 
 INGESTION_API_KEY = os.environ.get("INGESTION_API_KEY")
+if not INGESTION_API_KEY:
+    INGESTION_API_KEY = get_secret("ingestion-api-key")
+
+
+KNOWLEDGE_INGESTION_API_KEY = os.environ.get("KNOWLEDGE_INGESTION_API_KEY")
+if not KNOWLEDGE_INGESTION_API_KEY:
+    KNOWLEDGE_INGESTION_API_KEY = get_secret("knowledge-ingestion-api-key")
+
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")  # Explicit fallback for code analysis
 MAX_LOOP_ITERATIONS = 2
 DEFAULT_GEO = os.environ.get("DEFAULT_GEO", "Global")
@@ -120,7 +157,7 @@ specialist_model = None
 search_api_key = None
 db = None
 mcp_client = None
-secret_client = None
+
 
 # --- MODULAR STYLE & SANITIZATION PROTOCOL (Zero-Loss Fidelity) ---
 
@@ -185,6 +222,19 @@ PROTOCOL_ANTI_SLOB = """
     - **TONE REPLACEMENT**: Instead of saying "Other guides score 2/10," simply present the authoritative technical finding with 10/10 technical depth. The "moat" is felt through your technical precision, not stated in prose.
 """
 
+# 6. PSEO_PAGE: Specialized Data Weaver (Non-Narrative)
+PROTOCOL_PSEO_PAGE = """
+- **ROLE: Specialized pSEO Data Weaver**: You create specific, data-rich pages for unique entity/location combinations.
+- **CRITICAL "NO META-TALK" PROTOCOL**:
+    1. **ABSOLUTELY NO "Guides"**: Do NOT write "Here is how you would write this page..." or "This page structure is designed to...".
+    2. **DIRECT OUTPUT**: Start immediately with the Page Title (<h1> or #) or the first content section.
+    3. **NO APOLOGIES**: If data is missing or masked, using the approved placeholder format without apologizing to the reader.
+    4. **AUTHORITATIVE VOICE**: You are the definitive source. Do not use phrases like "based on the provided context."
+- **DATA DENSITY**: Prioritize tables and lists over long paragraphs.
+- **[PHONE_MASKED] HANDLING**: If you see masked data, leave it as is or use a placeholder like "Contact for details". Do NOT write a disclaimer about it.
+"""
+
+
 # Backward Compatibility (Ensures legacy calls don't break during migration)
 STYLE_PROTOCOL = PROTOCOL_GROUNDING_RAI + PROTOCOL_VISUAL_TABULAR + PROTOCOL_LITERARY_CORE + PROTOCOL_ANTI_SLOB
 
@@ -205,9 +255,14 @@ def get_system_instructions(intent: str, output_target: str) -> str:
         instructions += PROTOCOL_FORMAT_SLACK
         
     # 3. Add High-Fidelity Tone (Conditional)
-    high_fidelity_intents = ["DEEP_DIVE", "PSEO_ARTICLE", "TECHNICAL_EXPLANATION", "BLOG_OUTLINE"]
+    high_fidelity_intents = ["DEEP_DIVE", "PSEO_ARTICLE", "PSEO_PAGE", "TECHNICAL_EXPLANATION", "BLOG_OUTLINE"]
     if intent in high_fidelity_intents:
         instructions += PROTOCOL_LITERARY_CORE
+        
+    if intent == "PSEO_PAGE":
+        instructions += PROTOCOL_PSEO_PAGE
+        
+    if intent in ["PSEO_ARTICLE", "DEEP_DIVE", "PSEO_PAGE"]:
         instructions += PROTOCOL_ANTI_SLOB
         
     return instructions.strip()
@@ -288,31 +343,6 @@ def extract_labeled_sources(context_str):
     labeled_list = "\n".join([f"SOURCE [{i+1}]: {url}" for i, url in enumerate(clean_urls[:8])])
     return f"\nADK_CITATION_GROUNDING_RESOURCES:\n{labeled_list}\n"
 
-# --- SECRET MANAGER ---
-def get_secret(secret_id):
-    """
-    Retrieves a secret from Google Cloud Secret Manager.
-    Includes an environment variable fallback for local development or manual overrides.
-    """
-    global secret_client
-    
-    # 1. Check environment variables first (High Speed / Local Dev)
-    env_key = secret_id.upper().replace("-", "_")
-    env_val = os.environ.get(env_key)
-    if env_val:
-        return env_val
-        
-    # 2. Fallback to Secret Manager
-    try:
-        if secret_client is None:
-            secret_client = secretmanager.SecretManagerServiceClient()
-        
-        name = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest"
-        response = secret_client.access_secret_version(request={"name": name})
-        return response.payload.data.decode("UTF-8")
-    except Exception as e:
-        print(f"⚠️ Secret Manager error for {secret_id}: {e}")
-        return None
 
 # --- MCP CLIENT ---
 class RemoteTools:
@@ -865,6 +895,63 @@ def extract_target_word_count(text, history=""):
             return int(match.group(1))
         return 1500
 
+
+# --- HELPER: Market Data Extraction (pSEO) ---
+def extract_market_data(context_text, history_text, topic_slug):
+    """
+    Extracts structured market data points from the research context AND conversation history.
+    Ensures pSEO data cards reflect the full threaded context (User inputs + RAG findings).
+    """
+    extraction_prompt = f"""
+    You are a Market Data Analyst. Extract specific economic metrics for "{topic_slug}".
+    
+    1. ANALYZE CONVERSATION HISTORY (User inputs & previous data):
+    {history_text[:5000]}
+    
+    2. ANALYZE RESEARCH CONTEXT (Fresh Grounding):
+    {context_text[:15000]} 
+    
+    Required Data Points:
+    1. hub_capital: The commercial or consumption capital city.
+    2. spend_trend: Specific consumption expenditure stats (e.g., "% of GDP", "Growth Rate").
+    3. market_tier: Classify as "Emerging", "High Growth", "Maturing", or "Frontier".
+    4. region: The specific sub-region (e.g., "West Africa", "East Africa").
+    
+    Output Format (JSON Only):
+    {{
+      "hub_capital": "City Name or 'Analyze'",
+      "spend_trend": "Stat or 'Analyze'",
+      "market_tier": "Classification",
+      "region": "Sub-Region"
+    }}
+    
+    Rules:
+    - Prioritize recent Research Context, but fill gaps from History.
+    - If data is missing, use "Analyze" or reasonable inference based on region.
+    - Be concise.
+    """
+    
+    try:
+        # Use Specialist Model for precision
+        raw_json = safe_generate_content(specialist_model or unimodel, extraction_prompt, generation_config={"temperature": 0.2})
+        
+        # Sanitize JSON
+        if "```json" in raw_json:
+            raw_json = raw_json.split("```json")[1].split("```")[0].strip()
+        elif "```" in raw_json:
+            raw_json = raw_json.split("```")[1].split("```")[0].strip()
+            
+        data = json.loads(raw_json)
+        return data
+    except Exception as e:
+        print(f"⚠️ Market Data Extraction Failed: {e}")
+        return {
+            "hub_capital": "Analyze",
+            "spend_trend": "Data Pending",
+            "market_tier": "Emerging",
+            "region": "Sub-Saharan Africa"
+        }
+
 def strip_html_tags(text):
     """Removes HTML tags for clean context stitching and plain-text views."""
     return re.sub(r'<[^>]+>', '', text).strip()
@@ -955,7 +1042,41 @@ def convert_html_to_markdown(html_str):
     text = re.sub(r'<pre><code([^>]*)>([\s\S]*?)</code></pre>', general_code_handler, text, flags=re.IGNORECASE)
     text = re.sub(r'<code([^>]*)>([\s\S]*?)</code>', general_code_handler, text, flags=re.IGNORECASE)
 
-    # 4. Hierarchical Elements (H1-H4, Sections)
+    # 5. Tables (Simple to Pipe conversion for Slack)
+    def table_handler(match):
+        table_html = match.group(0)
+        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table_html, re.DOTALL | re.IGNORECASE)
+        if not rows: return ""
+        md_table = []
+        for i, row in enumerate(rows):
+            cols = re.findall(r'<(?:td|th)[^>]*>(.*?)</(?:td|th)>', row, re.DOTALL | re.IGNORECASE)
+            # Strip internal tags from columns
+            cols = [re.sub(r'<[^>]+>', '', c).strip() for c in cols]
+            if not cols: continue
+            md_table.append("| " + " | ".join(cols) + " |")
+            if i == 0 and len(rows) > 1: # Add separator after header
+                md_table.append("| " + " | ".join(["---"] * len(cols)) + " |")
+        return "\n" + "\n".join(md_table) + "\n"
+
+    # 5. Tables (Simple to Pipe conversion for Slack)
+    def table_handler(match):
+        table_html = match.group(0)
+        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table_html, re.DOTALL | re.IGNORECASE)
+        if not rows: return ""
+        md_table = []
+        for i, row in enumerate(rows):
+            cols = re.findall(r'<(?:td|th)[^>]*>(.*?)</(?:td|th)>', row, re.DOTALL | re.IGNORECASE)
+            # Strip internal tags from columns
+            cols = [re.sub(r'<[^>]+>', '', c).strip() for c in cols]
+            if not cols: continue
+            md_table.append("| " + " | ".join(cols) + " |")
+            if i == 0 and len(rows) > 1: # Add separator after header
+                md_table.append("| " + " | ".join(["---"] * len(cols)) + " |")
+        return "\n" + "\n".join(md_table) + "\n"
+
+    text = re.sub(r'<table[^>]*>(.*?)</table>', table_handler, text, flags=re.DOTALL | re.IGNORECASE)
+
+    # 6. Hierarchical Elements (H1-H4, Sections)
     text = re.sub(r'<h1>(.*?)</h1>', r'*\1*\n\n', text, flags=re.IGNORECASE)
     text = re.sub(r'<h2>(.*?)</h2>', r'\n*\1*\n', text, flags=re.IGNORECASE)
     text = re.sub(r'<h3>(.*?)</h3>', r'\n*\1*\n', text, flags=re.IGNORECASE)
@@ -963,7 +1084,7 @@ def convert_html_to_markdown(html_str):
     text = text.replace('</section>', '\n\n---\n\n')
     text = re.sub(r'<section[^>]*>', '', text, flags=re.IGNORECASE)
 
-    # 5. Lists
+    # 7. Lists
     def list_item_handler(match):
         content = match.group(1).strip()
         if re.match(r'^(\d+\.|•|-|\*)', content):
@@ -1078,9 +1199,15 @@ def extract_json(text):
             return None
 
 def extract_urls_from_text(text):
-    """Extracts ALL URLs from a given string."""
-    url_pattern = r'(https?://[^\s<>|]+)'
-    return re.findall(url_pattern, text)
+    """Extracts ALL URLs from a given string, stripping trailing punctuation."""
+    # Matches http/https, allows typical URL chars, but stops before trailing punctuation like ), ], } or final dots/commas
+    raw_urls = re.findall(r'(https?://[^\s<>|]+)', text)
+    clean_urls = []
+    for url in raw_urls:
+        # Strip common trailing punctuation often caught by greedy regex
+        clean_url = url.rstrip(').],;')
+        clean_urls.append(clean_url)
+    return clean_urls
 
 def chunk_text(text, chunk_size=1500, overlap=300):
     chunks = []
@@ -1112,7 +1239,82 @@ def search_compliance_knowledge(query, doc_type=None, geo_scope=None):
 
 #4. The Specialist Google Web Search Tool (MCP Refactored)
 def search_google_web(query):
-    return get_mcp_client().call("google_web_search", {"query": query})
+    """
+    Project-Wide Upgrade: Deep Research Protocol.
+    Instead of just reading SERP Snippets, this function:
+    1. Fetches the SERP (Headlines).
+    2. Identifies Top URLs.
+    3. Autonomously 'Clicks' (Scrapes) the most relevant page.
+    4. Performs a 'Double-Tap' if the first page is thin or irrelevant.
+    """
+    print(f"TELEMETRY: Executing Deep Research Search for: '{query}'")
+    
+    # 1. Fetch Headlines (SERP)
+    try:
+        serp_results = get_mcp_client().call("google_web_search", {"query": query})
+    except Exception as e:
+        print(f"⚠️ SERP Fetch Failed: {e}")
+        return "Search Failed."
+
+    # 2. Extract Candidates
+    urls = extract_urls_from_text(serp_results)
+    unique_urls = []
+    [unique_urls.append(x) for x in urls if x not in unique_urls]
+    
+    # 3. Deep Research Loop (The "Click")
+    deep_context = [serp_results]
+    
+    if unique_urls:
+        print(f"  -> Found {len(unique_urls)} candidates. Initiating Deep Content Retrieval...")
+        
+        # We try up to 2 URLs (The Double-Tap)
+        attempts = 0
+        max_attempts = 2 
+        
+        for url in unique_urls[:3]: # Look at top 3, scrape max 2
+            if attempts >= max_attempts: break
+            
+            # Skip likely junk (navigation/policy pages)
+            if any(x in url.lower() for x in ['privacy', 'terms', 'signup', 'login']): continue
+            
+            try:
+                print(f"  -> Deep Scraping ({attempts+1}/{max_attempts}): {url}")
+                content = fetch_article_content(url)
+                
+                if not content or len(content) < 500:
+                    print(f"     ❌ Content too thin ({len(content) if content else 0} chars). Skipping.")
+                    continue
+                
+                # 4. Semantic Validation (Relevance Check)
+                # Does the content actually contain keywords from the user's query?
+                # Simple heuristic: Split query into words (>3 chars), check existence in content.
+                query_words = [w.lower() for w in query.split() if len(w) > 3]
+                relevance_score = sum(1 for w in query_words if w in content.lower())
+                
+                # If we have 0 matches for query keywords, it's likely a navigation wrapper or captcha.
+                if relevance_score == 0:
+                    print(f"     ⚠️ Low Relevance (Score 0). Content might be garbage. Double-Tapping...")
+                    # We still append it? Maybe not. Let's append but try next.
+                    deep_context.append(f"\n[DEEP_CONTENT (Low Confidence) - {url}]:\n{content[:5000]}...")
+                    attempts += 1
+                    continue
+                
+                # High Relevance!
+                print(f"     ✅ Content Valid (Score {relevance_score}). Appending.")
+                deep_context.append(f"\n[DEEP_CONTENT - {url}]:\n{content[:25000]}") # 25k chars limit
+                
+                # If it's REALLY good (lots of keywords), we can stop early?
+                # User asked for "thinks through another". So maybe we just do 1 good one?
+                # Let's say: If score > 2, we are happy with 1.
+                if relevance_score > 2:
+                    break
+                
+                attempts += 1
+                
+            except Exception as e:
+                print(f"     ⚠️ Scrape Error: {e}")
+                
+    return "\n".join(deep_context)
 
 #5. The Specialist Google Trends Tool (MCP Refactored)
 def search_google_trends(geo="US"):
@@ -1560,7 +1762,7 @@ def get_output_target(intent: str) -> str:
     Centralized mapping logic for target-aware formatting.
     """
     intent = intent.upper().strip()
-    if intent == "PSEO_ARTICLE":
+    if intent in ["PSEO_ARTICLE", "PSEO_PAGE"]:
         return "CMS_DRAFT"
     return "MODERATOR_VIEW"
 
@@ -1610,7 +1812,7 @@ def generate_topic_cluster(topic, context, history="", is_initial=True, session_
     return extract_json(safe_generate_content(unimodel, prompt, system_instruction=sys_instruction))
 
 # 12. The SEO Metadata Generator (Using Specialist Model)
-def generate_seo_metadata(article_html, topic, session_id=None):
+def generate_seo_metadata(article_html, topic, session_id=None, intent=None):
     global unimodel
     style_mentors = get_stylistic_mentors(session_id)
     """
@@ -1635,6 +1837,7 @@ def generate_seo_metadata(article_html, topic, session_id=None):
     You are a World-Class SEO Strategist and Copywriter.
     
     INPUT CONTEXT:
+    Intent: "{intent or 'PSEO_ARTICLE'}"
     Topic: "{topic}"
     Title Hint (Priority): "{title_hint}"
     
@@ -1642,10 +1845,12 @@ def generate_seo_metadata(article_html, topic, session_id=None):
     {article_html[:15000]} # Truncate to avoid context limits
     
     TASK:
-    Generate highly optimized, click-worthy metadata for this article.
+    Generate highly optimized, click-worthy metadata for this article or data page.
     
     REQUIREMENTS:
-    1. **title**: The primary H1 title. If a clear, substantive title exists in the provided HTML (<h1>) or the 'Topic', PRESERVE IT EXACTLY. Do not rewrite if the input is high-quality.
+    1. **title**: The primary H1 title. 
+       - If a clear, substantive title exists in the provided HTML (<h1>) or the 'Topic', PRESERVE IT EXACTLY. 
+       - SPECIAL RULE FOR PSEO_PAGE: If no high-quality title exists, synthesize one using the format "[Entity] [Insight Name] Insight". Analyze the content to determine a relatable "Insight Name" (e.g., "Nigeria Market Penetration Insight").
     2. **meta_title**: The SEO Title tag (Max 60 chars). Try to align this with the main title but ensure the primary keyword is at the front.
     3. **meta_description**: A compelling summary for SERPs (Max 155 chars). Must include a call-to-action or hook.
     4. **custom_excerpt**: A social-media friendly summary (Max 200 chars).
@@ -2347,6 +2552,118 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     raw_response = safe_generate_content(unimodel, prompt, system_instruction=sys_instruction, generation_config={"temperature": 0.4})
     return post_process_mermaid_to_images(sanitize_llm_html(raw_response))
 
+def generate_pseo_page(topic, context, history="", history_events=None, is_initial_post=True, session_id=None, output_target="CMS_DRAFT"):
+    """
+    Generates a data-rich, non-narrative pSEO page for a specific entity/location.
+    Uses reverse-engineered logic from generate_pseo_article for robust AUTHOR/REFACTOR paths.
+    """
+    global unimodel, specialist_model
+    
+    topic_lower = topic.lower()
+    style_mentors = get_stylistic_mentors(session_id)
+    audience_context = detect_audience_context(history)
+    is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
+
+    # 1. Mode Detection (Reverse-engineered from generate_pseo_article)
+    # Tri-State Logic: REFACTOR vs EXPAND vs AUTHOR
+    start_mode = "AUTHOR"
+    
+    # Path A Signals (Verbatim Finalization)
+    is_repurpose_cmd = any(kw in topic_lower for kw in ["dump", "repurpose", "re-purpose", "refactor", "correct", "fix", "update", "refine", "publish", "provision", "finalize"])
+    
+    # Path B Signals (Creative Iteration)
+    is_expand_cmd = any(kw in topic_lower for kw in ["expand", "flesh out", "write from", "based on outline", "polish", "rewrite"])
+    
+    has_outline_structure = "## " in str(history) and len(str(history)) < 3500
+    has_full_draft_structure = ("## " in str(history) or "<table>" in str(history)) and len(str(history)) > 3500
+
+    if not is_initial_post and not is_repurpose_cmd and not is_expand_cmd and not has_full_draft_structure and not has_outline_structure:
+        start_mode = "AUTHOR"
+    elif is_repurpose_cmd and (has_full_draft_structure or not is_initial_post):
+        start_mode = "REFACTOR"
+    elif (is_expand_cmd and "## " in str(history)) or (has_outline_structure and not is_repurpose_cmd):
+        start_mode = "EXPAND"
+    elif is_repurpose_cmd and has_outline_structure:
+        start_mode = "EXPAND" 
+    elif not is_initial_post:
+        start_mode = "REFACTOR"
+        
+    print(f"  + pSEO Page Generation Mode Selected: {start_mode}")
+
+    # 2. De-copy-cat: Disable Article-style "Fast-Track" for Pages
+    # Unlike Articles, Pages only deliver synthesis/insights to Slack, not raw HTML drafts.
+    # We must ALWAYS refactor based on the holistic thread history.
+    best_source_text = None
+    if history:
+         best_source_text = history
+         print(f"  + Holistic Grounding: Using full thread history ({len(history)} chars) for refactor/update.")
+
+    # 3. Instruction Assembly
+    sys_instruction = get_system_instructions("PSEO_PAGE", output_target)
+    sys_instruction += f"\n\n{style_mentors}"
+
+    # 4. Prompt Engineering
+    if start_mode == "REFACTOR":
+        print("  + Executing pSEO Page REFACTOR with Specialist Model")
+        source_to_refactor = best_source_text or history
+        
+        prompt = f"""
+        You are a Data Page Refactor Engine.
+        TASK: Convert/Update the 'SOURCE TEXT' into a high-fidelity pSEO Data Page.
+        
+        AUDIENCE: {audience_context}
+        
+        SOURCE TEXT:
+        {source_to_refactor}
+        """
+        # Use Specialist for updates
+        raw_response = safe_generate_content(specialist_model, prompt, system_instruction=sys_instruction, generation_config={"temperature": 0.2})
+    elif start_mode == "EXPAND":
+        print("  + Executing pSEO Page EXPAND with Unimodel")
+        # EXPANSION PROMPT: Use history as a skeleton.
+        prompt = f"""
+        You are a Specialized Data Page Writer.
+        TASK: Write a comprehensive pSEO entity page based on the provided OUTLINE/STRUCTURE.
+        
+        AUDIENCE: {audience_context}
+        
+        STRUCTURE/OUTLINE:
+        {history}
+        
+        REQUIRED METRICS:
+        You MUST include/address the following 4 core market metrics in your expansion:
+        1. hub_capital
+        2. spend_trend
+        3. market_tier
+        4. region
+        
+        Research Context:
+        {context}
+        """
+        raw_response = safe_generate_content(unimodel, prompt, system_instruction=sys_instruction, generation_config={"temperature": 0.2})
+    else:
+        print("  + Executing pSEO Page AUTHOR with Unimodel")
+        context_block = f"Research Context:\n{context}" if is_grounded else "Use internal knowledge."
+        
+        prompt = f"""
+        TOPIC: {topic}
+        TASK: Generate a NEW data-rich pSEO page.
+        
+        AUDIENCE: {audience_context}
+        
+        {context_block}
+        
+        STRUCTURE REQUIREMENTS:
+        1. **Title**: <h1> or # Based on target.
+        2. **Overview**: Key stats and high-density summary.
+        3. **Details**: Nested tables and specific data breaks.
+        4. **FAQ**: Technical/Locational Q&A.
+        """
+        raw_response = safe_generate_content(unimodel, prompt, system_instruction=sys_instruction, generation_config={"temperature": 0.2})
+
+    return post_process_mermaid_to_images(sanitize_llm_html(raw_response))
+
+
 # 14.5 The Recursive Deep-Dive Generator (Dynamic Room-by-Room Construction)
 def generate_deep_dive_article(topic, context, history="", history_events=None, target_length=1500, target_geo="Global", session_id=None, output_target="MODERATOR_VIEW"):
     global unimodel
@@ -3001,28 +3318,32 @@ def process_story_logic(request):
                 *   *POSITIVE TRIGGERS:* "Compare human-centric", "Do a then vs now", "Show trajectory", "Contrast eras".
                 *   *Rule:* Use this ONLY for explicit trajectory/comparison requests.
 
-            5.  **PSEO_ARTICLE**: **Ghost CMS Content Hook.** Select this whenever the user includes the super-keyword "**pSEO**" in their request, or when they explicitly target the **Ghost CMS** platform ("update the post", "push to ghost").
-                *   *Super-Keyword Rule:* If the prompt contains "pSEO" or "Ghost" or "Ghost CMS", this is MANDATORY.
-                *   *Dichotomy Rule:* Use this for remote publication/updates. If the goal is just to see a summary or reformat the current Slack chat, use **OPERATIONAL_REFORMAT**.
-                *   *Triggers:* "Update the pSEO draft", "Push this pSEO article to Ghost", "Refine the Ghost post for the v1 migration".
+            5.  **PSEO_ARTICLE**: **Ghost CMS Content Hook (Narrative).** Select this whenever the user includes the super-keywords "**pSEO**", "**pSEO Ghost**", or "**pSEO Ghost CMS**" in their request.
+                *   *Super-Keyword Rule:* If the prompt contains "pSEO", "pSEO Ghost", or "pSEO Ghost CMS" (WITHOUT the word "Page"), this is MANDATORY.
+                *   *Dichotomy Rule:* Use this for remote publication/updates of narrative articles.
+                *   *Triggers:* "Update the pSEO draft", "Push this pSEO article to Ghost".
 
-            6.  **SALES_TRANSCRIPT**: **Sales Analysis.** Select this if the user provides a transcript or asks to analyze a sales call for objections, solution briefs, or deal coaching.
+            6.  **PSEO_PAGE**: **Data-Rich Page Generation (Non-Narrative).** Select this if the user includes the super-keywords "**pSEO Ghost Page**", "**pSEO Ghost CMS Page**".
+                *   *Super-Keyword Rule:* If the prompt contains "pSEO Ghost Page" or "pSEO Ghost CMS Page", this is MANDATORY.
+                *   *Triggers:* "Create a pSEO Ghost Page for NYC", "Generate the entity page on pSEO Ghost CMS", "Build the location specific page on pSEO Ghost CMS".
+
+            7.  **SALES_TRANSCRIPT**: **Sales Analysis.** Select this if the user provides a transcript or asks to analyze a sales call for objections, solution briefs, or deal coaching.
                 *   *Triggers:* "Analyze this call", "Create a solution brief", "Extract objections", "What were the pain points?".
                 *   *Rule:* If the user requests a "Solution Brief" from text, select this.
 
-            7.  **SIMPLE_QUESTION**: **The Factual Scout.** For fact-checks, definitions, or retrieving specific data points that require external grounding or RAG search.
+            8.  **SIMPLE_QUESTION**: **The Factual Scout.** For fact-checks, definitions, or retrieving specific data points that require external grounding or RAG search.
                 *   *Triggers:* "What is...", "Explain the concept of...", "Find me the rules for...", "Check the status of...".
                 *   *Rule:* Use this for initial questions about the world. If the user asks for a STRUCTURE (Outline/Brief), pick **OPERATIONAL_REFORMAT** instead.
 
-            8.  **DIRECT_ANSWER**: **The Research Architect.** Select this ONLY for **NOVEL SYNTHESIS** or **TECHNICAL AUDITS** that require combining multiple external data sources into a new expert opinion. 
+            9.  **DIRECT_ANSWER**: **The Research Architect.** Select this ONLY for **NOVEL SYNTHESIS** or **TECHNICAL AUDITS** that require combining multiple external data sources into a new expert opinion. 
                 *   *Example:* "Analyze the security layer of AP2 vs standard PCI-DSS." 
 
-            9.  **OPERATIONAL_REFORMAT**: **The Efficiency Engine.** Select this for any structural command whose COMPLETE context is already available in the history.
+            10.  **OPERATIONAL_REFORMAT**: **The Efficiency Engine.** Select this for any structural command whose COMPLETE context is already available in the history.
                 *   *Triggers:* "Summarize our progress", "Reformat these points as bullets", "Make it more professional", "Convert this into a brief".
                 *   *CRITICAL:* If the request is purely about structural formatting of existing knowledge, select this.
                 *   *EXCEPTION:* If the user says "Repurpose... for pSEO" or "Create a pSEO article", select **PSEO_ARTICLE**. 
 
-            10. **BLOG_OUTLINE**: **The Content Blueprint.** Select this for requests to create, repurpose, or draft a Blog Outline, Content Structure, or Strategy Document.
+            11. **BLOG_OUTLINE**: **The Content Blueprint.** Select this for requests to create, repurpose, or draft a Blog Outline, Content Structure, or Strategy Document.
                 *   *Triggers:* "Repurpose the strategy into a proper blog outline", "Create an outline", "Develop a content structure", "Draft a plan".
                 *   *Rule:* If the user asks for a structural blueprint (not the full 2500 word article yet), pick this.
 
@@ -3037,13 +3358,30 @@ def process_story_logic(request):
             USER REQUEST (THE COMMAND): "{sanitized_topic}"
             MISSION SUBJECT: "{original_topic}"
 
-            CRITICAL: Respect the "No Outlines in Deep_Dive" rule. Select OPERATIONAL_REFORMAT for Outlines, checklists, or formatting requests using existing data. Select DIRECT_ANSWER ONLY for new, complex synthesis of external data. Respond with ONLY the category name.
+            CRITICAL: Respect the "Action Priority" rule. Update and Refactor requests for Ghost/pSEO content must stay in the pSEO pipeline. Select OPERATIONAL_REFORMAT for Outlines, checklists, or formatting requests using existing data. Select DIRECT_ANSWER ONLY for new, complex synthesis of external data. Respond with ONLY the category name.
 
             """
         # --- EXECUTION: Triage Model Selection ---
         # Triage on the Command (sanitized_topic) but with history context
         # Use Flash Model for Speed/Cost Efficiency (Gemini 2.0 Flash)
         intent = safe_generate_content(flash_model, triage_prompt)
+        
+        # ADK HARDENING: Deterministic Triage Override (Keyword Overlord)
+        # This prevents the LLM from misclassifying Ghost/pSEO requests as Operational Reformats.
+        keyword_payload = sanitized_topic.lower()
+        
+        # PSEO_PAGE: Force intent for explicit page requests (First priority)
+        if any(kw in keyword_payload for kw in ["pseo ghost page", "pseo ghost cms page"]):
+            if "PSEO_PAGE" not in intent:
+                print(f"🎯 TRIAGE OVERRIDE: Forcing PSEO_PAGE due to keywords in '{sanitized_topic[:30]}'")
+                intent = "PSEO_PAGE"
+        
+        # PSEO_ARTICLE: Preserved logic (Noun base is sufficient as per user yardstick)
+        elif any(kw in keyword_payload for kw in ["pseo", "pseo ghost", "pseo ghost cms"]):
+            if "PSEO_ARTICLE" not in intent and "PSEO_PAGE" not in intent:
+                print(f"🎯 TRIAGE OVERRIDE: Forcing PSEO_ARTICLE due to keywords in '{sanitized_topic[:30]}'")
+                intent = "PSEO_ARTICLE"
+
         print(f"TELEMETRY: Triage V6.0 -> Intent classified as: [{intent}] for command: '{sanitized_topic[:50]}...'")
 
         # Initialize variables for the response
@@ -3099,7 +3437,14 @@ def process_story_logic(request):
                 "type": "social",
                 "last_updated": expire_time
             })
-            safe_n8n_delivery({"session_id": session_id, "type": "social", "message": reply_text, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
+            safe_n8n_delivery({
+                "session_id": session_id, 
+                "type": "social", 
+                "message": reply_text, 
+                "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
+                "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'), 
+                "is_initial_post": is_initial_post
+            })
             return jsonify({"msg": "Social reply sent"}), 200
 
         # === PATH B: OPERATIONAL REFORMAT / FAST FOLLOW-UP (Fast Exit) ===
@@ -3127,19 +3472,19 @@ def process_story_logic(request):
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
                     events_ref.add(event)
 
-                session_ref.update({
+                session_ref.set({
                     "status": "completed",
                     "type": "operational_answer",
                     "last_updated": expire_time
-                })
+                }, merge=True)
                 
                 safe_n8n_delivery({
                     "session_id": session_id, 
                     "type": "social", 
                     "message": answer_text, 
                     "intent": "OPERATIONAL_REFORMAT",
-                    "channel_id": slack_context['channel'], 
-                    "thread_ts": slack_context['ts'],
+                    "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
+                    "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'),
                     "is_initial_post": is_initial_post
                 })
                 return jsonify({"msg": "Operational reformat sent"}), 200
@@ -3212,11 +3557,11 @@ def process_story_logic(request):
                 events_ref.add(event)
 
             # Update session status
-            session_ref.update({
+            session_ref.set({
                 "status": "awaiting_feedback",
                 "type": "solution_brief",
                 "last_updated": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
-            })
+            }, merge=True)
 
             # Send to N8N for distribution
             safe_n8n_delivery({
@@ -3367,13 +3712,13 @@ def process_story_logic(request):
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
                 events_ref.add(event)
 
-            session_ref.update({
+            session_ref.set({
                 "status": "blocked",
                 "type": "safety_violation",
                 "detected_geo": final_geo,
                 "intent": final_intent_key,
                 "last_updated": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
-            })
+            }, merge=True)
             safe_n8n_delivery({
                 "session_id": session_id, 
                 "type": "social", 
@@ -3423,7 +3768,7 @@ def process_story_logic(request):
                 "last_updated": expire_time
             }
             if is_initial_post: update_data["topic"] = clean_topic
-            session_ref.update(update_data)
+            session_ref.set(update_data, merge=True)
 
             safe_n8n_delivery({
                 "session_id": session_id, 
@@ -3462,7 +3807,7 @@ def process_story_logic(request):
                 "last_updated": expire_time
             }
             if is_initial_post: update_data["topic"] = clean_topic
-            session_ref.update(update_data)
+            session_ref.set(update_data, merge=True)
 
             safe_n8n_delivery({
                 "session_id": session_id, 
@@ -3510,7 +3855,7 @@ def process_story_logic(request):
                 "last_updated": expire_time
             }
             if is_initial_post: update_data["topic"] = seo_data.get('title', clean_topic)
-            session_ref.update(update_data)
+            session_ref.set(update_data, merge=True)
 
             safe_n8n_delivery({
                 "session_id": session_id, 
@@ -3549,7 +3894,7 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.update(update_data)
+                session_ref.set(update_data, merge=True)
                 
                 # Align with N8N Parser: Wrap JSON in markdown for regex extraction
                 cluster_msg = f"```json\n{json.dumps(cluster_data, indent=2)}\n```"
@@ -3558,8 +3903,8 @@ def process_story_logic(request):
                     "type": "answer", 
                     "message": cluster_msg,
                     "intent": "TOPIC_CLUSTER_PROPOSAL",
-                    "channel_id": slack_context['channel'], 
-                    "thread_ts": slack_context['ts'],
+                    "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
+                    "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'),
                     "is_initial_post": is_initial_post
                 })
                 return jsonify({"msg": "Topic cluster sent"}), 200
@@ -3588,7 +3933,7 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.update(update_data)
+                session_ref.set(update_data, merge=True)
                 safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
                 return jsonify({"msg": "Cluster Fallback Answer sent"}), 200
         elif intent == "THEN_VS_NOW_PROPOSAL":
@@ -3632,15 +3977,15 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.update(update_data)
+                session_ref.set(update_data, merge=True)
 
                 safe_n8n_delivery({
                     "session_id": session_id, 
                     "type": "answer_proposal", 
                     "proposal": current_proposal['interlinked_concepts'], 
                     "approval_id": approval_id, 
-                    "channel_id": slack_context['channel'], 
-                    "thread_ts": slack_context['ts'],
+                    "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
+                    "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'),
                     "is_initial_post": is_initial_post
                 })
                 return jsonify({"msg": "Then-vs-Now proposal sent"}), 200
@@ -3670,19 +4015,23 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.update(update_data)
+                session_ref.set(update_data, merge=True)
                 safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
                 return jsonify({"msg": "Fallback answer sent"}), 200
 
         # === PATH C: PSEO ARTICLE GENERATION (Dual-Agent Path) ===
-        elif intent == "PSEO_ARTICLE":
+        elif intent in ["PSEO_ARTICLE", "PSEO_PAGE"]:
             try:
                 # 1. AGENT A (Gemini): Generate the Body Content (Prioritizing Latest Feedback)
                 target = get_output_target(intent)
-                article_html = generate_pseo_article(sanitized_topic, research_data['context'], history=history_text, history_events=history_events, is_initial_post=is_initial_post, output_target=target)
+                
+                if intent == "PSEO_PAGE":
+                     article_html = generate_pseo_page(sanitized_topic, research_data['context'], history=history_text, history_events=history_events, is_initial_post=is_initial_post, output_target=target)
+                else:
+                     article_html = generate_pseo_article(sanitized_topic, research_data['context'], history=history_text, history_events=history_events, is_initial_post=is_initial_post, output_target=target)
                 
                 # 2. AGENT B (Claude): Generate the Semantic Metadata
-                seo_data = generate_seo_metadata(article_html, original_topic, session_id=session_id)
+                seo_data = generate_seo_metadata(article_html, original_topic, session_id=session_id, intent=intent)
                 
                 # 3. Get session reference (used throughout this handler)
                 session_ref = db.collection('agent_sessions').document(session_id)
@@ -3694,36 +4043,56 @@ def process_story_logic(request):
                     session_data = session_ref.get().to_dict()
                     ghost_post_id = session_data.get('ghost_post_id') if session_data else None
                 
-                # 5. Determine operation type
-                operation_type = "pseo_update" if ghost_post_id else "pseo_draft"
+                # 5. Determine operation type (ADK Interoperability: Support Pages of Posts)
+                is_page_target = (intent == "PSEO_PAGE") or any(kw in original_topic.lower() or kw in sanitized_topic.lower() for kw in ["pseo page", "collection page", "page template", "ghost page", "page slug"])
                 
-                # 6. Build Ghost CMS payload (WITHOUT featured_image_prompt)
-                # Note: featured_image_prompt is preserved in seo_data for future Slack image feature
-                ghost_payload = {
-                    # REQUIRED FIELDS
+                if is_page_target:
+                    operation_type = "pseo_page_update" if ghost_post_id else "pseo_page_create"
+                else:
+                    operation_type = "pseo_update" if ghost_post_id else "pseo_draft"
+                
+                # 6. Build Payload (Schema-Aware for Ghost or Next.js)
+                delivery_payload = {
                     "title": seo_data.get("title", "Untitled Draft"),
                     "html": article_html,
-                    
-                    # HIGH PRIORITY FIELDS
                     "tags": seo_data.get("tags", []),
                     "meta_title": seo_data.get("meta_title"),
                     "meta_description": seo_data.get("meta_description"),
-                    
-                    # OPTIONAL FIELDS
                     "custom_excerpt": seo_data.get("custom_excerpt")
                 }
+                
+                # Page-Specific Metadata
+                if is_page_target:
+                    # Extract slug from topic (e.g., "Nigeria Consumption Insights" -> "nigeria")
+                    slug = re.sub(r'[^a-zA-Z0-9-]', '', original_topic.lower().replace(' ', '-'))
+                    
+                    # ADK FIX: Support Manual Slug Override via Prompt
+                    request_text = (feedback_text or original_topic).lower()
+                    slug_match = re.search(r'(?:slug|link)\s+(?:to|be|is|=)\s*["\']?([a-zA-Z0-9-]+)["\']?', request_text)
+                    if slug_match:
+                        manual_slug = slug_match.group(1).strip()
+                        print(f"🎯 MANUAL SLUG OVERRIDE: '{manual_slug}'")
+                        slug = manual_slug
+                        
+                    delivery_payload["slug"] = slug
+                    # Placeholder for structured data points
+                    # DYNAMIC EXTRACTION: Use the helper to get real data
+                    print(f"🔍 Extracting Market Data for slug: {slug}...")
+                    market_data = extract_market_data(research_data.get('context', ''), history_text, slug)
+                    
+                    delivery_payload["data_points"] = market_data
                 
                 # Set status to 'draft' ONLY for CREATE operations
                 # For UPDATE operations, omit status to preserve current status (draft or published)
                 if not ghost_post_id:
-                    ghost_payload["status"] = "draft"
+                    delivery_payload["status"] = "draft"
                 
                 # Add ghost_post_id for updates
                 if ghost_post_id:
-                    ghost_payload["ghost_post_id"] = ghost_post_id
+                    delivery_payload["ghost_post_id"] = ghost_post_id
                 
                 # Remove None values to avoid N8N errors
-                ghost_payload = {k: v for k, v in ghost_payload.items() if v is not None}
+                delivery_payload = {k: v for k, v in delivery_payload.items() if v is not None}
                 
                 # 7. SUCCESS: Log the event to subcollection
                 new_events.append({
@@ -3749,15 +4118,15 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = seo_data.get('title', clean_topic)
-                session_ref.update(update_data)
+                session_ref.set(update_data, merge=True)
                 
                 # 9. Send STRUCTURED DATA to N8N (Restored Wrapper for GhostNode Harmony)
                 safe_n8n_delivery({
                     "session_id": session_id, 
-                    "type": operation_type,  # "pseo_draft" or "pseo_update"
-                    "payload": ghost_payload,
-                    "channel_id": slack_context['channel'], 
-                    "thread_ts": slack_context['ts'],
+                    "type": operation_type,  # "pseo_draft", "pseo_update", "pseo_page_create", or "pseo_page_update"
+                    "payload": delivery_payload,
+                    "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
+                    "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'),
                     "is_initial_post": is_initial_post
                 })
                 
@@ -3793,7 +4162,7 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.update(update_data)
+                session_ref.set(update_data, merge=True)
                 if intent == "PSEO_ARTICLE":
                     safe_n8n_delivery({
                         "session_id": session_id, 
@@ -3839,7 +4208,7 @@ def process_story_logic(request):
                 "last_updated": expire_time
             }
             if is_initial_post: update_data["topic"] = clean_topic
-            session_ref.update(update_data)
+            session_ref.set(update_data, merge=True)
 
             safe_n8n_delivery({
                 "session_id": session_id, 
@@ -3847,8 +4216,8 @@ def process_story_logic(request):
                 "message": answer_text, 
                 "intent": research_intent,
                 "directive": formatting_directive,
-                "channel_id": slack_context['channel'], 
-                "thread_ts": slack_context['ts'],
+                "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
+                "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'),
                 "is_initial_post": is_initial_post
             })
             
@@ -3874,8 +4243,9 @@ def ingest_knowledge(request):
         return jsonify({"error": "Missing or invalid Authorization header"}), 401
     
     provided_key = auth_header.replace('Bearer ', '')
-    if provided_key != INGESTION_API_KEY:
-        print(f"⚠️ Unauthorized access attempt from IP: {request.remote_addr}")
+    # COMPATIBILITY: Allow either Knowledge Key or original Ingestion Key (for legacy n8n flows)
+    if provided_key != KNOWLEDGE_INGESTION_API_KEY and provided_key != INGESTION_API_KEY:
+        print(f"⚠️ Unauthorized knowledge ingestion attempt from IP: {request.remote_addr}")
         return jsonify({"error": "Invalid API key"}), 403
 
     global db, unimodel
@@ -3886,13 +4256,17 @@ def ingest_knowledge(request):
     req = request.get_json(silent=True) or {}
     session_id = req.get('session_id', 'unknown')
     topic = req.get('topic', 'unknown')
-    final_story = req.get('story', '')
+    
+    # COMPATIBILITY: Support legacy 'text' or 'content' fields alongside new 'story' field
+    final_story = req.get('story') or req.get('text') or req.get('content', '')
     
     # Unified Ingestion Router (Determines destination collection)
     ingest_type = req.get('type', 'knowledge') # 'knowledge' or 'solution_brief'
     
     if ingest_type == 'solution_brief':
-        # Solution Briefs are structured, not chunked for vector search (Session Memory focus)
+        # ROUTING: Solution Briefs -> 'solution_briefs' collection
+        # NOTE: This path BYPASSES the vector embedding pipeline. 
+        # Briefs are structured session memories, not RAG knowledge chunks.
         db.collection('solution_briefs').add({
             'session_id': session_id,
             'topic': topic,
@@ -3902,32 +4276,39 @@ def ingest_knowledge(request):
         })
         return jsonify({"msg": "Solution brief ingested."}), 200
 
-    # Knowledge Base Path: Chunk and Embed
-    chunks = chunk_text(final_story)
-    embeddings = embedding_model.get_embeddings([c for c in chunks])
-    
-    batch = db.batch()
-    count = 0
-    for i, (text_segment, embedding_obj) in enumerate(zip(chunks, embeddings)):
-        doc_ref = db.collection('knowledge_base').document(f"{session_id}_{i}")
-        batch.set(doc_ref, {
-            "content": scrub_pii(text_segment),
-            "embedding": Vector(embedding_obj.values),
-            "topic_trigger": scrub_pii(topic), 
-            "source_session": session_id,
-            "chunk_index": i,
-            "created_at": datetime.datetime.now(datetime.timezone.utc)
-        })
-        count += 1
-        if count >= 499:
-            batch.commit()
-            batch = db.batch()
-            count = 0
+    elif ingest_type in ['knowledge', 'grounding_data']:
+        # Knowledge Base Path: Chunk and Embed
+        # SUPPORT: 'grounding_data' (Raw CSV) and 'knowledge' (Approved Synthesis)
+        chunks = chunk_text(final_story)
+        embeddings = embedding_model.get_embeddings([c for c in chunks])
+        
+        batch = db.batch()
+        count = 0
+        for i, (text_segment, embedding_obj) in enumerate(zip(chunks, embeddings)):
+            doc_ref = db.collection('knowledge_base').document(f"{session_id}_{i}")
+            batch.set(doc_ref, {
+                "content": text_segment, # BYPASS_PII: scrub_pii(text_segment) to prevent [PHONE_MASKED] corruption on years/prices
+                "embedding": Vector(embedding_obj.values),
+                "topic_trigger": topic, # BYPASS_PII: scrub_pii(topic) 
+                "source_session": session_id,
+                "knowledge_type": ingest_type, # NEW: Explicitly track type (grounding_data vs knowledge)
+                "chunk_index": i,
+                "created_at": datetime.datetime.now(datetime.timezone.utc)
+            })
+            count += 1
+            if count >= 499:
+                batch.commit()
+                batch = db.batch()
+                count = 0
 
-    if count > 0: batch.commit()
+        if count > 0: batch.commit()
 
-    print(f"Ingested {len(chunks)} chunks.")
-    return jsonify({"msg": "Knowledge ingested."}), 200
+        print(f"Ingested {len(chunks)} chunks.")
+        return jsonify({"msg": "Knowledge ingested."}), 200
+
+    else:
+        print(f"⚠️ Unknown ingestion type: {ingest_type}")
+        return jsonify({"error": f"Unknown type: {ingest_type}"}), 400
 
 
 
@@ -3946,7 +4327,7 @@ def ingest_compliance_docs(request):
     
     provided_key = auth_header.replace('Bearer ', '')
     if provided_key != INGESTION_API_KEY:
-        print(f"⚠️ Unauthorized access attempt from IP: {request.remote_addr}")
+        print(f"⚠️ Unauthorized compliance ingestion attempt from IP: {request.remote_addr}")
         return jsonify({"error": "Invalid API key"}), 403
     
     # Initialize clients
@@ -3999,7 +4380,7 @@ def ingest_compliance_docs(request):
     for i, (chunk, embedding_obj) in enumerate(zip(chunks, embeddings)):
         doc_ref = db.collection('compliance_knowledge').document(f"{doc_type}_{doc_version}_{i}")
         batch.set(doc_ref, {
-            "content": scrub_pii(chunk),
+            "content": chunk,
             "embedding": Vector(embedding_obj.values),
             "doc_type": doc_type,
             "doc_source": doc_url,
