@@ -483,12 +483,34 @@ def handle_tool_call(name, arguments):
 
                 text = soup.get_text(separator='\n\n')
                 clean_text = re.sub(r'\n\s*\n', '\n\n', text).strip()
+                
+                # --- SEO UPGRADE: Header and Schema Extraction (Expert Phase 1) ---
+                headers = []
+                for h in soup.find_all(['h1', 'h2', 'h3']):
+                    headers.append(f"{h.name.upper()}: {h.get_text().strip()}")
+                header_context = "\n\n[DETECTED_HEADERS]:\n" + "\n".join(headers[:25]) if headers else ""
+
+                schemas = []
+                for script in soup.find_all("script", type="application/ld+json"):
+                    try:
+                        schema_data = json.loads(script.string)
+                        if isinstance(schema_data, dict):
+                            stype = schema_data.get("@type", "Unknown")
+                            schemas.append(f"- Schema Type: {stype}")
+                        elif isinstance(schema_data, list):
+                            for item in schema_data:
+                                if isinstance(item, dict):
+                                    stype = item.get("@type", "Unknown")
+                                    schemas.append(f"- Schema Type: {stype}")
+                    except: continue
+                schema_context = "\n\n[DETECTED_SCHEMA]:\n" + "\n".join(list(set(schemas))[:10]) if schemas else ""
+
                 image_context = "\n\n[DETECTED_IMAGES]:\n" + "\n".join(found_images) if found_images else ""
                 link_context = "\n\n[DETECTED_LINKS]:\n" + "\n".join(found_links) if found_links else ""
                 acronym_defs = extract_acronym_definitions(clean_text)
                 def_context = "\n\n[DETECTED_DEFINITIONS]:\n" + "\n".join(acronym_defs) if acronym_defs else ""
                 
-                result = (def_context + "\n\n" + clean_text[:18000] + image_context + link_context).strip()
+                result = (def_context + header_context + schema_context + "\n\n" + clean_text[:18000] + image_context + link_context).strip()
 
         except Exception as e:
             result = f"Error in hybrid scrape: {str(e)}"
@@ -497,28 +519,47 @@ def handle_tool_call(name, arguments):
         query = arguments.get("query")
         session_id = arguments.get("session_id")
         if not query: return "Error: Missing query."
-        if not session_id: return "Error: Missing session_id for isolated memory search."
+        if not session_id: return "Error: Missing session_id."
         
         db = get_db()
         embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
         query_embedding = embedding_model.get_embeddings([query[:6000]])[0].values
         
-        # Enforce Session-Level Isolation (ADK Principle)
-        collection = db.collection('knowledge_base')
-        results = collection.where("source_session", "==", session_id).find_nearest(
-            vector_field="embedding",
-            query_vector=Vector(query_embedding),
-            distance_measure=DistanceMeasure.COSINE,
-            limit=8
-        ).get()
-        
-        memories = []
-        for res in results:
-            data = res.to_dict()
-            if data and 'content' in data:
-                trigger = data.get('topic_trigger', 'Unknown Topic')
-                memories.append(f"PAST SUCCESSFUL OUTPUT (Trigger: '{trigger}'):\n{data.get('content')}")
-        result = "\n".join(memories) if memories else "No relevant memories found."
+        try:
+            # 1. PRIMARY SEARCH: Active Session (Isolated Knowledge)
+            collection = db.collection('knowledge_base')
+            results = collection.where("source_session", "==", session_id).find_nearest(
+                vector_field="embedding",
+                query_vector=Vector(query_embedding),
+                distance_measure=DistanceMeasure.COSINE,
+                limit=8
+            ).get()
+            
+            # 2. TYPE-SAFE FALLBACK: Global Grounding Mission (Prefix Match)
+            if not results:
+                print(f"MCP Hub: Session {session_id} empty. Falling back to Type-Safe Global Grounding...")
+                # Use range query to simulate "starts_with" for the global mission prefix
+                mission_prefix = "pseo_grounding_mission"
+                results = collection.where("knowledge_type", "==", "grounding_data")\
+                                  .where("source_session", ">=", mission_prefix)\
+                                  .where("source_session", "<", mission_prefix + "\uf8ff")\
+                                  .find_nearest(
+                    vector_field="embedding",
+                    query_vector=Vector(query_embedding),
+                    distance_measure=DistanceMeasure.COSINE,
+                    limit=8
+                ).get()
+            
+            memories = []
+            for res in results:
+                data = res.to_dict()
+                if data and 'content' in data:
+                    trigger = data.get('topic_trigger', 'Unknown Topic')
+                    memories.append(f"GROUNDING_DATA (Topic: '{trigger}'):\n{data.get('content')}")
+            result = "\n".join(memories) if memories else "No relevant memories or grounding data found."
+        except Exception as e:
+            print(f"RAG Search Error (Likely Missing Index): {e}")
+            result = f"RAG Search Failed: {e}"
 
     elif name == "compliance_rag_search":
         query = arguments.get("query")
@@ -1008,16 +1049,13 @@ def handle_tool_call(name, arguments):
     else:
         return f"Error: Tool '{name}' implementation logic not found."
 
-    # Post-Processing: PII Scrubbing (Privacy Safety)
-    scrubbed_result = scrub_pii(result)
-    
     # 5. Output Telemetry (Precision Observability)
-    print(f"TELEMETRY: MCP Hub: [{name}] execution complete. Size: {len(str(scrubbed_result))} chars.")
-    if scrubbed_result and len(str(scrubbed_result)) > 0:
-        snippet = str(scrubbed_result)[:200].replace('\n', ' ')
+    print(f"TELEMETRY: MCP Hub: [{name}] execution complete. Size: {len(str(result))} chars.")
+    if result and len(str(result)) > 0:
+        snippet = str(result)[:200].replace('\n', ' ')
         print(f"  -> Snippet: {snippet}...")
         
-    return scrubbed_result
+    return result
 
 # --- The Lightweight MCP Messenger ---
 @app.post("/messages")

@@ -2,7 +2,7 @@
 import functions_framework
 from flask import jsonify
 import vertexai
-from vertexai.generative_models import GenerativeModel
+from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, FinishReason, SafetySetting
 import os
 import json
 import re
@@ -16,6 +16,34 @@ import random
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# --- Safety Configuration (ADK/RAI Compliant) ---
+PROJECT_ID = os.environ.get("PROJECT_ID")
+LOCATION = os.environ.get("LOCATION", "us-central1")
+MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.0-flash-exp")
+
+safety_settings = [
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_HARASSMENT,
+        threshold=HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        threshold=HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+        threshold=HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        threshold=HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    ),
+    SafetySetting(
+        category=HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY,
+        threshold=HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    ),
+]
+
 # --- UNIFIED MODEL ADAPTER (The Brain Switch) ---
 class UnifiedModel:
     def __init__(self, provider, model_name):
@@ -23,16 +51,8 @@ class UnifiedModel:
         self.model_name = model_name
         if provider == "vertex_ai":
             vertexai.init(project=PROJECT_ID, location=LOCATION)
-            from vertexai.generative_models import GenerativeModel, SafetySetting
-            # Standard safety settings
-            safety = [
-                SafetySetting(category=SafetySetting.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH),
-                SafetySetting(category=SafetySetting.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH),
-                SafetySetting(category=SafetySetting.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH),
-                SafetySetting(category=SafetySetting.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=SafetySetting.HarmBlockThreshold.BLOCK_ONLY_HIGH),
-            ]
-            self._native_model = GenerativeModel(model_name, safety_settings=safety)
-            print(f"✅ Loaded Unified Vertex Model: {model_name}")
+            self._native_model = GenerativeModel(model_name, safety_settings=safety_settings)
+            print(f"✅ Loaded Unified Vertex Model: {model_name} (Safety Active)")
 
     def generate_content(self, prompt, generation_config=None, max_retries=3, system_instruction=None):
         import time
@@ -210,6 +230,17 @@ PROTOCOL_ANTI_SLOB = """
 - **STRATEGIC SANITIZATION**: PROHIBIT mentioning internal strategy (SEO metrics, turn-counts, internal benchmarks) in public drafts.
 """
 
+# 6. PSEO_PAGE: Specialized Data Weaver (Non-Narrative)
+PROTOCOL_PSEO_PAGE = """
+- **ROLE: Specialized pSEO Data Weaver**: You create specific, data-rich pages for unique entity/location combinations.
+- **CRITICAL "NO META-TALK" PROTOCOL**:
+    1. **ABSOLUTELY NO "Guides"**: Do NOT write "Here is how you would write this page..." or "This page structure is designed to...".
+    2. **DIRECT OUTPUT**: Start immediately with the Page Title (<h1> or #) or the first content section.
+    3. **NO APOLOGIES**: If data is missing or masked, using the approved placeholder format without apologizing to the reader.
+    4. **AUTHORITATIVE VOICE**: You are the definitive source. Do not use phrases like "based on the provided context."
+- **DATA DENSITY**: Prioritize tables and lists over long paragraphs.
+"""
+
 # Backward Compatibility
 STYLE_PROTOCOL = PROTOCOL_GROUNDING_RAI + PROTOCOL_VISUAL_TABULAR + PROTOCOL_LITERARY_CORE + PROTOCOL_ANTI_SLOB
 
@@ -218,6 +249,7 @@ def get_system_instructions(intent: str, output_target: str) -> str:
     Architectural fix to assemble instructions modularly based on intent and target.
     Prevents token waste while ensuring 100% rule fidelity for relevant tasks.
     """
+    intent = intent.upper().strip()
     instructions = "You are a highly capable AI assistant. Adhere strictly to these protocols:\n"
     instructions += PROTOCOL_GROUNDING_RAI
     instructions += PROTOCOL_VISUAL_TABULAR
@@ -227,10 +259,15 @@ def get_system_instructions(intent: str, output_target: str) -> str:
     else:
         instructions += PROTOCOL_FORMAT_SLACK
         
-    # Condition: Literary and Anti-Slob protocols are for High-Fidelity content generation.
-    high_fidelity_intents = ["DEEP_DIVE", "PSEO_ARTICLE", "TECHNICAL_EXPLANATION", "REWRITE", "REFINE", "THEN_VS_NOW_PROPOSAL"]
+    # Condition: High-Fidelity intents get the full Literary and Anti-Slob treatment.
+    high_fidelity_intents = ["DEEP_DIVE", "PSEO_ARTICLE", "PSEO_PAGE", "TECHNICAL_EXPLANATION", "REWRITE", "REFINE", "THEN_VS_NOW_PROPOSAL"]
     if intent in high_fidelity_intents:
         instructions += PROTOCOL_LITERARY_CORE
+        
+    if intent == "PSEO_PAGE":
+        instructions += PROTOCOL_PSEO_PAGE
+        
+    if intent in ["PSEO_ARTICLE", "DEEP_DIVE", "PSEO_PAGE"]:
         instructions += PROTOCOL_ANTI_SLOB
         
     return instructions.strip()
@@ -375,14 +412,32 @@ def convert_html_to_markdown(html_str):
     text = re.sub(r'<pre><code([^>]*)>([\s\S]*?)</code></pre>', general_code_handler, text, flags=re.IGNORECASE)
     text = re.sub(r'<code([^>]*)>([\s\S]*?)</code>', general_code_handler, text, flags=re.IGNORECASE)
 
-    # 4. Hierarchical Elements (H1-H3, Sections)
+    # 5. Tables (Simple to Pipe conversion for Slack)
+    def table_handler(match):
+        table_html = match.group(0)
+        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table_html, re.DOTALL | re.IGNORECASE)
+        if not rows: return ""
+        md_table = []
+        for i, row in enumerate(rows):
+            cols = re.findall(r'<(?:td|th)[^>]*>(.*?)</(?:td|th)>', row, re.DOTALL | re.IGNORECASE)
+            # Strip internal tags from columns
+            cols = [re.sub(r'<[^>]+>', '', c).strip() for c in cols]
+            if not cols: continue
+            md_table.append("| " + " | ".join(cols) + " |")
+            if i == 0 and len(rows) > 1: # Add separator after header
+                md_table.append("| " + " | ".join(["---"] * len(cols)) + " |")
+        return "\n" + "\n".join(md_table) + "\n"
+
+    text = re.sub(r'<table[^>]*>(.*?)</table>', table_handler, text, flags=re.DOTALL | re.IGNORECASE)
+
+    # 6. Hierarchical Elements (H1-H3, Sections)
     text = re.sub(r'<h1>(.*?)</h1>', r'*\1*\n\n', text, flags=re.IGNORECASE)
     text = re.sub(r'<h2>(.*?)</h2>', r'\n*\1*\n', text, flags=re.IGNORECASE)
     text = re.sub(r'<h3>(.*?)</h3>', r'_ \1 _\n', text, flags=re.IGNORECASE)
     text = text.replace('</section>', '\n\n---\n\n')
     text = re.sub(r'<section[^>]*>', '', text, flags=re.IGNORECASE)
 
-    # 5. Lists
+    # 7. Lists
     def list_item_handler(match):
         content = match.group(1).strip()
         if re.match(r'^(\d+\.|•|-|\*)', content):
@@ -438,6 +493,28 @@ def extract_url_from_text(text):
     match = re.search(url_pattern, text)
     if match: return match.group(1)
     return None
+
+# --- Safety Utils ---
+def run_global_safety_check(text):
+    """
+    Perform a pre-flight safety scan using the Vertex AI native model.
+    Ensures feedback is checked before ingestion or routing.
+    """
+    global unimodel
+    if not text or not isinstance(text, str): return False
+    
+    try:
+        test_prompt = f"Analyze the following user feedback for potential safety policy violations (harassment, hate speech, or promotion of harm). Distinguish between harmful intent and the informational/social discussion of sensitive topics. Feedback: {text}"
+        response = unimodel._native_model.generate_content(test_prompt, safety_settings=safety_settings)
+        
+        if not response.candidates or response.candidates[0].finish_reason == FinishReason.SAFETY:
+            return True
+        return False
+    except Exception as e:
+        print(f"⚠️ Feedback Safety Check Exception: {e}")
+        if "safety" in str(e).lower(): return True
+        return False
+
 
 def get_secret(secret_id):
     """Unified secret retrieval with env fallback."""
@@ -630,12 +707,93 @@ def process_feedback_logic(request):
     user_feedback = req.get('feedback', '')
     images = req.get('images', []) # New sensory input array
     print(f"DEBUG: Feedback Worker images count: {len(images)}")
+
+    # 0. Global Safety Shield (Safety Pre-flight)
+    if run_global_safety_check(user_feedback):
+        print(f"🛑 GLOBAL SAFETY SHIELD: Block triggered for feedback: '{user_feedback[:50]}...'")
+        refusal_text = "I'm sorry, I cannot process this feedback as it violates my safety guidelines. If you are in Nigeria and need support, please contact the Nigerian Mental Health helplines: https://www.nigerianmentalhealth.org/helplines"
+        
+        # Log to Firestore
+        db.collection('agent_sessions').document(session_id).collection('events').add({
+            "event_type": "safety_block",
+            "text": refusal_text,
+            "reason": "RAI_FILTER",
+            "timestamp": datetime.datetime.now(datetime.timezone.utc)
+        })
+        
+        # Send refusal back to Slack/n8n
+        safe_n8n_delivery({
+            "session_id": session_id,
+            "type": "social",
+            "message": refusal_text
+        })
+        return jsonify({"msg": "Safety refusal sent"}), 200
     
     doc_ref = db.collection('agent_sessions').document(session_id)
     session_doc = doc_ref.get()
-    if not session_doc.exists: return jsonify({"error": "Session not found"}), 404
-    session_data = session_doc.to_dict()
-    slack_context = session_data.get('slack_context', {})
+    session_data = {}
+    if not session_doc.exists:
+        # PSEO RESILIENCE: Check if the 'events' subcollection has history (Shadow Session)
+        events_ref = doc_ref.collection('events')
+        # Get recent events to find metadata (Topic, Type, Slack Context)
+        history_stream = events_ref.order_by('timestamp', direction=firestore.Query.DESCENDING).limit(10).stream()
+        history_events = [d.to_dict() for d in history_stream]
+        
+        if history_events:
+            print(f"⚠️ SHADOW SESSION DETECTED: {session_id}. Attempting auto-heal...")
+            # Try to reconstruct from history
+            recovered_topic = "Recovered Session"
+            recovered_type = "general"
+            recovered_slack = {}
+            recovered_ghost_id = None
+            
+            for event in history_events:
+                # Look for topic, type, or slack context in both event root and nested payloads
+                event_topic = event.get('topic') or event.get('proposal_data', {}).get('topic')
+                if event_topic and recovered_topic == "Recovered Session":
+                    recovered_topic = event_topic
+                    
+                event_type = event.get('type') or event.get('proposal_type')
+                if event_type and recovered_type == "general":
+                    recovered_type = event_type
+                    
+                event_slack = event.get('slack_context')
+                if event_slack and not recovered_slack:
+                    recovered_slack = event_slack
+                
+                # ADK FIX: Recover Ghost Post ID if it exists in any proposal event
+                event_ghost_id = event.get('ghost_post_id') or event.get('proposal_data', {}).get('ghost_post_id')
+                if event_ghost_id and not recovered_ghost_id:
+                    recovered_ghost_id = event_ghost_id
+            
+            session_data = {
+                "status": "self_healing",
+                "topic": recovered_topic,
+                "type": recovered_type,
+                "slack_context": recovered_slack,
+                "ghost_post_id": recovered_ghost_id,
+                "last_updated": datetime.datetime.now(datetime.timezone.utc)
+            }
+            # Commit the healed root document to prevent repetitive recovery overhead
+            doc_ref.set(session_data, merge=True)
+        else:
+            return jsonify({"error": "Session not found"}), 404
+    else:
+        session_data = session_doc.to_dict()
+    
+    # FIX: Robustly merge Slack Context from request and (potentially healed) session data
+    req_slack = req.get('slack_context', {})
+    # Use request context as baseline for identity/channel, then augment from database for thread history
+    slack_context = {**session_data.get('slack_context', {}), **req_slack}
+    
+    # Ensure turn-specific signals are correctly mapped (Fixes KeyError: 'channel')
+    if req.get('slack_ts'): slack_context['ts'] = req.get('slack_ts')
+    if req.get('slack_thread_ts'): slack_context['thread_ts'] = req.get('slack_thread_ts')
+    if req.get('channel_id') and not slack_context.get('channel'): slack_context['channel'] = req.get('channel_id')
+    
+    # Fallback for channel if still missing (Fixes 500 error in worker-story)
+    if not slack_context.get('channel'):
+        slack_context['channel'] = req.get('channel') or "UNKNOWN_CHANNEL"
 
     # --- SYSTEM FILTER: Prevent Infinite Loops & Redundant Ingestion ---
     # Case: The message is a confirmation notification (e.g., from N8N/Ghost)
@@ -651,10 +809,10 @@ def process_feedback_logic(request):
     # Always check for a URL first. It's the fastest and most reliable signal.
     if extract_url_from_text(user_feedback):
         print("URL detected in feedback. Delegating to research worker immediately.")
-        doc_ref.update({
+        doc_ref.set({
             "status": "delegating_research",
             "last_updated": expire_time
-            })
+            }, merge=True)
         # FIX: Persist the feedback into the events subcollection
         doc_ref.collection('events').add({
             "event_type": "user_feedback",
@@ -664,13 +822,6 @@ def process_feedback_logic(request):
             "timestamp": datetime.datetime.now(datetime.timezone.utc)
         })
         
-        # FIX: Inject precise Slack Timestamps to prevent Idempotency Clashing in Worker Story
-        # Worker Story deduplicates based on slack_context['ts']. If we send the stale session ts, it skips.
-        if req.get('slack_ts'):
-            slack_context['ts'] = req.get('slack_ts')
-        if req.get('slack_thread_ts'):
-            slack_context['thread_ts'] = req.get('slack_thread_ts')
-            
         dispatch_task({
             "session_id": session_id, 
             "topic": session_data.get('topic'), 
@@ -749,10 +900,10 @@ def process_feedback_logic(request):
     if intent == "DELEGATE":
         # This now handles all factual questions, meta-questions, and simple chat.
         print("Intent requires new research or is conversational. Delegating to story worker...")
-        doc_ref.update({
+        doc_ref.set({
             "status": "delegating_research",
             "last_updated": expire_time
-            })
+            }, merge=True)
         # FIX: Persist the feedback into the events subcollection
         doc_ref.collection('events').add({
             "event_type": "user_feedback",
@@ -851,11 +1002,11 @@ def process_feedback_logic(request):
                 dispatch_task({"session_id": session_id, "topic": session_data.get('topic'), "story": rag_content, "type": "knowledge"}, INGEST_KNOWLEDGE_URL)
         
         # FIX: Update parent status, but write events to subcollection
-        doc_ref.update({
+        doc_ref.set({
             "status": "completed", 
             "final_story": target_content,
             "last_updated": expire_time
-        })
+        }, merge=True)
         
         events_ref.add(user_event)
         events_ref.add({"event_type": "final_output", "content": target_content, "timestamp": datetime.datetime.now(datetime.timezone.utc)})
@@ -912,7 +1063,7 @@ def process_feedback_logic(request):
         events_ref.add({"event_type": "agent_proposal", "proposal_data": new_prop, "timestamp": ts})
         events_ref.add({"event_type": "adk_request_confirmation", "approval_id": new_id, "payload": new_prop['interlinked_concepts'], "timestamp": ts})
         
-        doc_ref.update({"last_updated": expire_time})
+        doc_ref.set({"last_updated": expire_time}, merge=True)
         
         safe_n8n_delivery({
             "session_id": session_id, 
