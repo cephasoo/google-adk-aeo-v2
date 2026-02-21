@@ -96,10 +96,11 @@ MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8080")
 
 # --- Safety Configuration (ADK/RAI Compliant) ---
 safety_settings = {
-    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
-    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
-    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
-    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
 }
 
 # --- HELPER: Safe n8n Webhook Delivery ---
@@ -243,6 +244,7 @@ def get_system_instructions(intent: str, output_target: str) -> str:
     Architectural fix to assemble instructions modularly based on intent and target.
     Prevents token waste while ensuring 100% rule fidelity for relevant tasks.
     """
+    intent = intent.upper().strip()
     # 1. Start with Baseline Guardrails (Permanent)
     instructions = "You are a highly capable AI assistant. Adhere strictly to these protocols:\n"
     instructions += PROTOCOL_GROUNDING_RAI
@@ -254,8 +256,8 @@ def get_system_instructions(intent: str, output_target: str) -> str:
     else:
         instructions += PROTOCOL_FORMAT_SLACK
         
-    # 3. Add High-Fidelity Tone (Conditional)
-    high_fidelity_intents = ["DEEP_DIVE", "PSEO_ARTICLE", "PSEO_PAGE", "TECHNICAL_EXPLANATION", "BLOG_OUTLINE"]
+    # Condition: High-Fidelity intents get the full Literary and Anti-Slob treatment.
+    high_fidelity_intents = ["DEEP_DIVE", "PSEO_ARTICLE", "PSEO_PAGE", "TECHNICAL_EXPLANATION", "BLOG_OUTLINE", "AUTHOR", "REWRITE", "REFINE", "THEN_VS_NOW_PROPOSAL"]
     if intent in high_fidelity_intents:
         instructions += PROTOCOL_LITERARY_CORE
         
@@ -520,13 +522,11 @@ class UnifiedModel:
                             continue
                     
                     # If it's a safety block or we've exhausted retries, log and return fallback
-                    print(f"⚠️ Vertex AI Safety/SDK Error: {e}")
-                    # log_safety_event("generation_error", {"prompt": prompt, "error": str(e)}) # Fallback logic
-                    
-                    # Return Mock for Fallback
-                    class MockResponse:
-                        def __init__(self, content): self.text = content
-                    return MockResponse("I encountered a safety limit or internal error. Could you rephrase?")
+                print(f"⚠️ Vertex AI Safety/SDK Error: {e}. Attempting Specialist Failover to Claude 4.5...")
+                
+                # ADK FIX: Automatic Failover to Specialist Model (Claude 4.5)
+                failover_model = UnifiedModel(provider="anthropic", model_name="claude-sonnet-4-5")
+                return failover_model.generate_content(prompt, system_instruction=system_instruction, generation_config=generation_config)
 
         # PATH B: Universal Route (OpenAI / Anthropic via LiteLLM)
         else:
@@ -3094,8 +3094,14 @@ def process_story_logic(request):
     
     # --- IDEMPOTENCY CHECK (Prevent Double-Trigger) ---
     # Construct a unique event ID from the Slack Timestamp
-    slack_context = req.get('slack_context', {})
-    unique_event_id = slack_context.get('ts') or req.get('event_ts') or req.get('client_msg_id')
+    # NORMALIZE: Ensure Slack Context is usable
+    slack_context = req.get('slack_context', {}).copy()
+    if not slack_context.get('channel'):
+        slack_context['channel'] = req.get('slack_channel') or req.get('channel')
+    if not slack_context.get('ts'):
+        slack_context['ts'] = req.get('slack_ts') or req.get('ts')
+
+    unique_event_id = slack_context.get('ts') or req.get('client_msg_id')
     
     if unique_event_id:
         # Check if we've already seen this event ID in the last 30 minutes
@@ -3147,13 +3153,16 @@ def process_story_logic(request):
     session_data = {}
     if session_doc.exists:
         session_data = session_doc.to_dict()
-        # SAFETY NET: Recover Slack Context if stripped by n8n (Non-Destructive)
-        if session_data.get('slack_context'):
-            db_ctx = session_data['slack_context']
-            for key in ['channel', 'ts', 'thread_ts']:
-                if not slack_context.get(key) and db_ctx.get(key):
-                    print(f"INFO: Recovering missing {key} from Firestore...")
-                    slack_context[key] = db_ctx[key]
+        
+    # LIGHT ARCHITECTURE: Context Inheritance (Dispatcher-Anchored)
+    slack_context = {**session_data.get('slack_context', {}), **req.get('slack_context', {})}
+
+    # --- ANCHOR SESSION (Early Initialization) ---
+    # We commit the root document immediately to prevent "headless" sessions 
+    # if a crash occurs during the research/generation phase.
+    if not session_doc.exists:
+        print(f"❌ SESSION NOT FOUND: {session_id}")
+        return jsonify({"error": "Session not found"}), 404
 
     history_events = []
     history_text = ""
@@ -3385,7 +3394,7 @@ def process_story_logic(request):
         print(f"TELEMETRY: Triage V6.0 -> Intent classified as: [{intent}] for command: '{sanitized_topic[:50]}...'")
 
         # Initialize variables for the response
-        new_events = [] 
+        new_events = [{"event_type": "user_request", "text": sanitized_topic, "slack_context": slack_context}]
         
         # Retroactive Event Logging for Code Analysis (since we ran it early)
         if code_files and code_analysis_snippets:
@@ -3472,11 +3481,11 @@ def process_story_logic(request):
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
                     events_ref.add(event)
 
-                session_ref.set({
+                session_ref.update({
                     "status": "completed",
                     "type": "operational_answer",
                     "last_updated": expire_time
-                }, merge=True)
+                })
                 
                 safe_n8n_delivery({
                     "session_id": session_id, 
@@ -3522,8 +3531,8 @@ def process_story_logic(request):
                 "type": "social", 
                 "message": answer_text, 
                 "intent": "BLOG_OUTLINE",
-                "channel_id": slack_context['channel'], 
-                "thread_ts": slack_context['ts'],
+                "channel_id": slack_context.get('channel'), 
+                "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })
             return jsonify({"msg": "Blog outline sent"}), 200
@@ -3557,20 +3566,20 @@ def process_story_logic(request):
                 events_ref.add(event)
 
             # Update session status
-            session_ref.set({
+            session_ref.update({
                 "status": "awaiting_feedback",
                 "type": "solution_brief",
                 "last_updated": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
-            }, merge=True)
+            })
 
             # Send to N8N for distribution
             safe_n8n_delivery({
                 "session_id": session_id,
-                "type": "solution_brief",
+                "type": "social", # Changed from solution_brief to social for Slack visibility
                 "objections": result['objections'],
                 "brief": result['brief'],
                 "channel_id": slack_context.get('channel'),
-                "thread_ts": slack_context.get('ts'),
+                "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })
             
@@ -3712,19 +3721,19 @@ def process_story_logic(request):
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
                 events_ref.add(event)
 
-            session_ref.set({
+            session_ref.update({
                 "status": "blocked",
                 "type": "safety_violation",
                 "detected_geo": final_geo,
                 "intent": final_intent_key,
                 "last_updated": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
-            }, merge=True)
+            })
             safe_n8n_delivery({
                 "session_id": session_id, 
                 "type": "social", 
                 "message": reply_text, 
-                "channel_id": slack_context['channel'], 
-                "thread_ts": slack_context['ts']
+                "channel_id": slack_context.get('channel'), 
+                "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts')
             })
             return jsonify({"msg": "Safety block applied"}), 200
 
@@ -3758,25 +3767,24 @@ def process_story_logic(request):
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
                 events_ref.add(event)
 
-            # UPDATE METADATA
             update_data = {
                 "status": "awaiting_feedback", 
                 "type": "work_answer", 
                 "slack_context": slack_context,
                 "detected_geo": final_geo,
-                "intent": final_intent_key,
+                "intent": research_intent,
                 "last_updated": expire_time
             }
             if is_initial_post: update_data["topic"] = clean_topic
-            session_ref.set(update_data, merge=True)
+            session_ref.update(update_data)
 
             safe_n8n_delivery({
                 "session_id": session_id, 
                 "type": "social", 
                 "message": convert_html_to_markdown(answer_text), 
                 "intent": research_intent,
-                "channel_id": slack_context['channel'], 
-                "thread_ts": slack_context['ts'],
+                "channel_id": slack_context.get('channel'), 
+                "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })
             return jsonify({"msg": "High-fidelity answer sent"}), 200
@@ -3803,11 +3811,11 @@ def process_story_logic(request):
                 "type": "work_answer", 
                 "slack_context": slack_context,
                 "detected_geo": final_geo,
-                "intent": final_intent_key,
+                "intent": research_intent,
                 "last_updated": expire_time
             }
             if is_initial_post: update_data["topic"] = clean_topic
-            session_ref.set(update_data, merge=True)
+            session_ref.update(update_data)
 
             safe_n8n_delivery({
                 "session_id": session_id, 
@@ -3815,8 +3823,8 @@ def process_story_logic(request):
                 "message": convert_html_to_markdown(answer_text), 
                 "intent": research_intent,
                 "directive": formatting_directive,
-                "channel_id": slack_context['channel'], 
-                "thread_ts": slack_context['ts'],
+                "channel_id": slack_context.get('channel'), 
+                "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })
             return jsonify({"msg": "Natural answer sent"}), 200
@@ -3848,21 +3856,20 @@ def process_story_logic(request):
 
             update_data = {
                 "status": "awaiting_feedback", 
-                "type": "work_proposal", 
+                "type": "work_answer", 
                 "slack_context": slack_context,
                 "detected_geo": final_geo,
-                "intent": final_intent_key,
+                "intent": "DEEP_DIVE",
                 "last_updated": expire_time
             }
-            if is_initial_post: update_data["topic"] = seo_data.get('title', clean_topic)
-            session_ref.set(update_data, merge=True)
+            session_ref.update(update_data)
 
             safe_n8n_delivery({
                 "session_id": session_id, 
                 "type": "social", 
                 "message": convert_html_to_markdown(article_html), 
-                "channel_id": slack_context['channel'], 
-                "thread_ts": slack_context['ts'],
+                "channel_id": slack_context.get('channel'), 
+                "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })
             return jsonify({"msg": "Deep-Dive article sent"}), 200
@@ -3894,7 +3901,7 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.set(update_data, merge=True)
+                session_ref.update(update_data)
                 
                 # Align with N8N Parser: Wrap JSON in markdown for regex extraction
                 cluster_msg = f"```json\n{json.dumps(cluster_data, indent=2)}\n```"
@@ -3903,8 +3910,8 @@ def process_story_logic(request):
                     "type": "answer", 
                     "message": cluster_msg,
                     "intent": "TOPIC_CLUSTER_PROPOSAL",
-                    "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
-                    "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'),
+                    "channel_id": slack_context.get('channel'), 
+                    "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                     "is_initial_post": is_initial_post
                 })
                 return jsonify({"msg": "Topic cluster sent"}), 200
@@ -3933,7 +3940,7 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.set(update_data, merge=True)
+                session_ref.update(update_data)
                 safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
                 return jsonify({"msg": "Cluster Fallback Answer sent"}), 200
         elif intent == "THEN_VS_NOW_PROPOSAL":
@@ -3977,15 +3984,15 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.set(update_data, merge=True)
+                session_ref.update(update_data)
 
                 safe_n8n_delivery({
                     "session_id": session_id, 
                     "type": "answer_proposal", 
                     "proposal": current_proposal['interlinked_concepts'], 
                     "approval_id": approval_id, 
-                    "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
-                    "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'),
+                    "channel_id": slack_context.get('channel'), 
+                    "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                     "is_initial_post": is_initial_post
                 })
                 return jsonify({"msg": "Then-vs-Now proposal sent"}), 200
@@ -4015,7 +4022,7 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.set(update_data, merge=True)
+                session_ref.update(update_data)
                 safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
                 return jsonify({"msg": "Fallback answer sent"}), 200
 
@@ -4108,25 +4115,24 @@ def process_story_logic(request):
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
                     events_ref.add(event)
 
-                # 9. UPDATE METADATA: Preserve Mission Topic
                 update_data = {
                     "status": "awaiting_feedback", 
-                    "type": "work_proposal", 
+                    "type": "work_article", 
                     "slack_context": slack_context,
                     "detected_geo": final_geo,
-                    "intent": final_intent_key,
+                    "intent": intent,
                     "last_updated": expire_time
                 }
-                if is_initial_post: update_data["topic"] = seo_data.get('title', clean_topic)
-                session_ref.set(update_data, merge=True)
+                if is_initial_post: update_data["topic"] = clean_topic
+                session_ref.update(update_data)
                 
                 # 9. Send STRUCTURED DATA to N8N (Restored Wrapper for GhostNode Harmony)
                 safe_n8n_delivery({
                     "session_id": session_id, 
                     "type": operation_type,  # "pseo_draft", "pseo_update", "pseo_page_create", or "pseo_page_update"
                     "payload": delivery_payload,
-                    "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
-                    "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'),
+                    "channel_id": slack_context.get('channel'), 
+                    "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                     "is_initial_post": is_initial_post
                 })
                 
@@ -4158,11 +4164,11 @@ def process_story_logic(request):
                     "type": "work_answer", 
                     "slack_context": slack_context,
                     "detected_geo": final_geo,
-                    "intent": final_intent_key,
+                    "intent": research_intent,
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.set(update_data, merge=True)
+                session_ref.update(update_data)
                 if intent == "PSEO_ARTICLE":
                     safe_n8n_delivery({
                         "session_id": session_id, 
@@ -4172,12 +4178,12 @@ def process_story_logic(request):
                             "html": answer_text,
                             "status": "draft_fallback"
                         },
-                        "channel_id": slack_context['channel'], 
-                        "thread_ts": slack_context['ts'],
+                        "channel_id": slack_context.get('channel'), 
+                        "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                         "is_initial_post": is_initial_post
                     })
                 else:
-                    safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
+                    safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "intent": research_intent, "channel_id": slack_context.get('channel'), "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'), "is_initial_post": is_initial_post})
                 return jsonify({"msg": "pSEO Fallback Answer sent"}), 200
 
 
@@ -4198,17 +4204,16 @@ def process_story_logic(request):
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
                 events_ref.add(event)
 
-            # UPDATE METADATA (Fallback Persistence)
             update_data = {
                 "status": "awaiting_feedback", 
                 "type": "work_answer", 
                 "slack_context": slack_context,
                 "detected_geo": final_geo,
-                "intent": final_intent_key,
+                "intent": research_intent,
                 "last_updated": expire_time
             }
             if is_initial_post: update_data["topic"] = clean_topic
-            session_ref.set(update_data, merge=True)
+            session_ref.update(update_data)
 
             safe_n8n_delivery({
                 "session_id": session_id, 
@@ -4216,8 +4221,8 @@ def process_story_logic(request):
                 "message": answer_text, 
                 "intent": research_intent,
                 "directive": formatting_directive,
-                "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
-                "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'),
+                "channel_id": slack_context.get('channel'), 
+                "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })
             

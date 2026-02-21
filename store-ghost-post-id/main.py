@@ -164,17 +164,15 @@ def store_ghost_post_id(request):
                 "received": list(data.keys())
             }), 400, headers
         
-        # Store in Firestore (Standardized Resilience)
+        # Store in Firestore
         db = get_db()
         session_ref = db.collection('agent_sessions').document(session_id)
         
-        # ADK FIX: Standardize on .set(merge=True) to ensure ID is recorded 
-        # even if root document was recently deleted (Shadow Session).
-        session_ref.set({
+        session_ref.update({
             "ghost_post_id": ghost_post_id,
             "ghost_post_created_at": datetime.datetime.now(datetime.timezone.utc),
             "last_updated": datetime.datetime.now(datetime.timezone.utc)
-        }, merge=True)
+        })
         
         db_done = datetime.datetime.now()
         print(f"✅ Stored Ghost post ID: {ghost_post_id} for session: {session_id}")
