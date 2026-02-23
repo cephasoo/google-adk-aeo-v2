@@ -5,6 +5,17 @@ import vertexai
 from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, FinishReason, SafetySetting
 import os
 import json
+
+import sys
+import os
+from shared.utils import (
+    get_secret, 
+    _firestore_call_with_timeout, 
+    safe_n8n_delivery, 
+    UnifiedModel,
+    get_n8n_operation_type,
+    get_output_target
+)
 import re
 import uuid
 import datetime
@@ -16,162 +27,75 @@ import random
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# --- Safety Configuration (ADK/RAI Compliant) ---
-PROJECT_ID = os.environ.get("PROJECT_ID")
-LOCATION = os.environ.get("LOCATION", "us-central1")
-MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.0-flash-exp")
+safety_settings = {
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+}
 
-safety_settings = [
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_HARASSMENT,
-        threshold=HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-    ),
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-        threshold=HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-    ),
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-        threshold=HarmBlockThreshold.BLOCK_ONLY_HIGH,
-    ),
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-        threshold=HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-    ),
-    SafetySetting(
-        category=HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY,
-        threshold=HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-    ),
-]
-
-# --- UNIFIED MODEL ADAPTER (The Brain Switch) ---
-class UnifiedModel:
-    def __init__(self, provider, model_name):
-        self.provider = provider
-        self.model_name = model_name
-        if provider == "vertex_ai":
-            vertexai.init(project=PROJECT_ID, location=LOCATION)
-            self._native_model = GenerativeModel(model_name, safety_settings=safety_settings)
-            print(f"✅ Loaded Unified Vertex Model: {model_name} (Safety Active)")
-
-    def generate_content(self, prompt, generation_config=None, max_retries=3, system_instruction=None):
-        import time
-        import random
-        
-        if self.provider == "vertex_ai":
-            retries = 0
-            while retries <= max_retries:
-                try:
-                    # ADK FIX: Modular System Instruction Support
-                    if system_instruction:
-                        from vertexai.generative_models import GenerativeModel
-                        # Re-init model with system instruction for this turn
-                        # (Note: In production, we might want to cache models per instruction hash)
-                        temp_model = GenerativeModel(
-                            self.model_name, 
-                            safety_settings=self._native_model._safety_settings if hasattr(self._native_model, '_safety_settings') else None,
-                            system_instruction=system_instruction
-                        )
-                        return temp_model.generate_content(prompt, generation_config=generation_config)
-                    
-                    return self._native_model.generate_content(prompt, generation_config=generation_config)
-                except Exception as e:
-                    error_msg = str(e).lower()
-                    if "429" in error_msg or "resource exhausted" in error_msg:
-                        if retries < max_retries:
-                            wait_time = (2 ** retries) + random.uniform(0, 1)
-                            print(f"⚠️ Feedback 429 (Quota): Retrying in {wait_time:.2f}s...")
-                            time.sleep(wait_time)
-                            retries += 1
-                            continue
-                    raise e
-        elif self.provider == "anthropic":
-            # LiteLLM failover style for Feedback Worker parity
-            import litellm
-            # Ensure litellm doesn't throw if billing is weird
-            litellm.drop_params = True
-            
-            # Setup API Key (Prefer secret if available)
-            api_key = get_secret("anthropic-api-key")
-            if api_key:
-                os.environ["ANTHROPIC_API_KEY"] = api_key
-            
-            messages = []
-            if system_instruction:
-                messages.append({"role": "system", "content": str(system_instruction)})
-            messages.append({"role": "user", "content": prompt})
-            
-            response = litellm.completion(
-                model=self.model_name,
-                messages=messages,
-                temperature=generation_config.get("temperature", 0.7) if generation_config else 0.7
-            )
-            
-            content = response.choices[0].message.content
-            
-            class MockResponse:
-                def __init__(self, c): self.text = c
-            return MockResponse(content)
-        return None
-
-# --- Config ---
-PROJECT_ID = os.environ.get("PROJECT_ID")
-LOCATION = os.environ.get("LOCATION")
-MODEL_NAME = os.environ.get("MODEL_NAME")
-N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL") 
-
-# --- HELPER: Safe n8n Webhook Delivery ---
-def safe_n8n_delivery(payload, timeout=45):
-    """
-    Robust delivery to n8n with retries and SSL resilience.
-    Uses 'requests' with an HTTPAdapter for exponential backoff on transient errors.
-    """
-    if not N8N_PROPOSAL_WEBHOOK_URL:
-        print("⚠️ safe_n8n_delivery: No webhook URL configured.")
-        return False
-
-    session = requests.Session()
-    # Retry on specific status codes and connection errors
-    # backoff_factor 2 means waits 2, 4, 8 seconds
-    retries = Retry(
-        total=3, 
-        backoff_factor=2, 
-        status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["POST"]
-    )
-    session.mount('https://', HTTPAdapter(max_retries=retries))
-    
+# --- SECRET MANAGER ---
+secret_client = None
+def log_safety_event(event_name, data):
+    """Standardized safety event logger with payload clamping."""
+    global logging_v_client
     try:
-        print(f"DEBUG: Attempting safe_n8n_delivery [Session: {payload.get('session_id')}]")
-        response = session.post(
-            N8N_PROPOSAL_WEBHOOK_URL, 
-            json=payload, 
-            verify=certifi.where(), 
-            timeout=timeout
-        )
-        response.raise_for_status()
-        print(f"✅ safe_n8n_delivery: Success (200 OK)")
-        return True
-    except requests.exceptions.SSLError as e:
-        print(f"❌ safe_n8n_delivery: SSL Handshake Failed: {e}")
-        # Final emergency attempt without strict session pooling
-        try:
-            time.sleep(2)
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json=payload, verify=certifi.where(), timeout=timeout)
-            return True
-        except Exception as inner_e:
-            print(f"❌ safe_n8n_delivery: Emergency fallback also failed: {inner_e}")
-            return False
+        if logging_v_client is None:
+            logging_v_client = cloud_logging.Client()
+        logger = logging_v_client.logger("safety_audit_feedback")
+        
+        # CLAMPING: Stay under 256KB Cloud Logging limit
+        safe_data = {}
+        for k, v in data.items():
+            if isinstance(v, str) and len(v) > 50000:
+                safe_data[k] = f"{v[:50000]}... [TRUNCATED]"
+            else:
+                safe_data[k] = v
+
+        logger.log_struct({
+            "event": event_name,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            **safe_data
+        }, severity="WARNING")
     except Exception as e:
-        print(f"⚠️ safe_n8n_delivery: Payload delivery failed: {e}")
-        return False
+        print(f"Safety Event Logged (Local): {event_name} - {data} | Error: {e}")
 
 
+# --- Configuration ---
+PROJECT_ID = os.environ.get("PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")
+if not PROJECT_ID:
+    try:
+        import google.auth
+        _, project_id_auth = google.auth.default()
+        PROJECT_ID = project_id_auth
+    except Exception:
+        PROJECT_ID = None
+
+LOCATION = os.environ.get("LOCATION", "us-central1")
+MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.5-pro") 
+MODEL_PROVIDER = os.environ.get("MODEL_PROVIDER", "vertex_ai")
+FLASH_MODEL_NAME = os.environ.get("FLASH_MODEL_NAME", "gemini-2.5-flash-lite")
+ANTHROPIC_API_KEY = None
+def get_anthropic_api_key():
+    global ANTHROPIC_API_KEY
+    if not ANTHROPIC_API_KEY:
+        ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY") or get_secret("anthropic-api-key")
+    return ANTHROPIC_API_KEY
+
+OPENAI_API_KEY = None
+def get_openai_api_key():
+    global OPENAI_API_KEY
+    if not OPENAI_API_KEY:
+        OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or get_secret("openai-api-key")
+    return OPENAI_API_KEY
+N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL") 
+INGEST_KNOWLEDGE_URL = os.environ.get("INGEST_KNOWLEDGE_URL")
 STORY_WORKER_URL = os.environ.get("STORY_WORKER_URL") 
 QUEUE_NAME = "story-worker-queue"
 FUNCTION_IDENTITY_EMAIL = os.environ.get("FUNCTION_IDENTITY_EMAIL")
-INGEST_KNOWLEDGE_URL = os.environ.get("INGEST_KNOWLEDGE_URL")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY") # Shared via secret manager if needed
+
+
 
 unimodel = None
 specialist_model = None
@@ -179,6 +103,22 @@ db = None
 tasks_client = None
 secret_client = None
 logging_v_client = None
+
+def detect_audience_context(history):
+    """
+    Search conversation history for tone or audience instructions (e.g., "8th-grader").
+    Returns a string describing the target audience.
+    """
+    default = "Likely Senior Marketers, CTOs, and Founders, but you must value clarity and simplicity above all. Use plain English and avoid dense jargon even when discussing complex technical concepts."
+    if not history: return default
+    
+    hist_lower = str(history).lower()
+    if "8-grader" in hist_lower or "8th grade" in hist_lower or "explain like i'm 5" in hist_lower or "eli5" in hist_lower:
+         return "An 8th-grader. Use extremely simple words, short sentences, and clear analogies. Avoid jargon."
+    elif "non-technical" in hist_lower:
+         return "Non-technical business owners. Focus on value and 'what it does' rather than 'how it works'."
+    
+    return default
 
 # --- STYLE & SANITIZATION PROTOCOL (Modularized) ---
 PROTOCOL_GROUNDING_RAI = """
@@ -260,7 +200,7 @@ def get_system_instructions(intent: str, output_target: str) -> str:
         instructions += PROTOCOL_FORMAT_SLACK
         
     # Condition: High-Fidelity intents get the full Literary and Anti-Slob treatment.
-    high_fidelity_intents = ["DEEP_DIVE", "PSEO_ARTICLE", "PSEO_PAGE", "TECHNICAL_EXPLANATION", "REWRITE", "REFINE", "THEN_VS_NOW_PROPOSAL"]
+    high_fidelity_intents = ["DEEP_DIVE", "PSEO_ARTICLE", "PSEO_PAGE", "TECHNICAL_EXPLANATION", "BLOG_OUTLINE", "AUTHOR", "REWRITE", "REFINE", "THEN_VS_NOW_PROPOSAL"]
     if intent in high_fidelity_intents:
         instructions += PROTOCOL_LITERARY_CORE
         
@@ -516,84 +456,17 @@ def run_global_safety_check(text):
         return False
 
 
-def get_secret(secret_id):
-    """Unified secret retrieval with env fallback."""
-    try:
-        global secret_client
-        if secret_client is None:
-            secret_client = secretmanager.SecretManagerServiceClient()
-        name = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest"
-        response = secret_client.access_secret_version(request={"name": name})
-        return response.payload.data.decode("UTF-8")
-    except Exception as e:
-        print(f"Secret {secret_id} failed: {e}. Falling back to ENV.")
-        return os.environ.get(secret_id.upper().replace("-", "_"))
-
-def log_safety_event(event_name, data):
-    """Standardized safety event logger with payload clamping."""
-    global logging_v_client
-    try:
-        if logging_v_client is None:
-            logging_v_client = cloud_logging.Client()
-        logger = logging_v_client.logger("safety_audit_feedback")
-        
-        # CLAMPING: Stay under 256KB Cloud Logging limit
-        safe_data = {}
-        for k, v in data.items():
-            if isinstance(v, str) and len(v) > 50000:
-                safe_data[k] = f"{v[:50000]}... [TRUNCATED]"
-            else:
-                safe_data[k] = v
-
-        logger.log_struct({
-            "event": event_name,
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            **safe_data
-        }, severity="WARNING")
-    except Exception as e:
-        print(f"Safety Event Logged (Local): {event_name} - {data} | Error: {e}")
-
 def safe_generate_content(model, prompt, system_instruction=None, generation_config=None):
     """
-    Robust wrapper for ALL LLM calls.
-    Handles:
-    1. Exceptions (Vertex/SDK Errors)
-    2. Soft Refusals ("Error generating content" strings)
-    3. Failover to Specialist Model (Claude)
+    Convenience wrapper for UnifiedModel generation.
+    Failover is handled inside the UnifiedModel class.
     """
-    global specialist_model
     try:
         response = model.generate_content(prompt, system_instruction=system_instruction, generation_config=generation_config)
-        text_out = response.text.strip()
-        
-        # Detect soft refusal
-        if not text_out or any(fail_str in text_out.lower() for fail_str in ["error generating content", "i cannot fulfill", "internal error"]):
-            raise ValueError(f"Soft refusal detected: {text_out[:50]}...")
-            
-        return text_out
+        return response.text.strip()
     except Exception as e:
-        print(f"⚠️ Primary Model Failed: {e}. Attempting Specialist Failover...")
-        log_safety_event("llm_failover", {"error": str(e), "prompt_snippet": prompt[:500]})
-        
-        if specialist_model is None:
-            # Initialize Anthropic Specialist explicitly (User Config: 4.5)
-            specialist_model = UnifiedModel(provider="anthropic", model_name="claude-sonnet-4-5")
-
-        # ADK FIX: Add explicit delay for 429 mitigation (Parity with worker-story)
-        print(f"🔄 SafeGen FAILOVER: Cooling down for 2s before Anthropic call...")
-        time.sleep(2)
-        
-        # Retry with backup
-        fallback_resp = specialist_model.generate_content(prompt, system_instruction=system_instruction, generation_config=generation_config or {"temperature": 0.4})
-        return fallback_resp.content.strip() if hasattr(fallback_resp, 'content') else fallback_resp.text.strip()
-    except Exception as e2:
-        # Catch Anthropic 429 specifically
-        if "rate_limit_error" in str(e2).lower():
-            print("⚠️ Anthropic Rate Limit hit in Feedback. Ultimate fallback triggered.")
-            return "Cognitive overload (429). Triage/Approval request received but requires higher quota."
-            
-        print(f"❌ SafeGen Feedback Fallback Failed: {e2}")
-        return "The feedback system is currently maximizing its cognitive load. Please try again in 60 seconds."
+        print(f"❌ safe_generate_content critical failure: {e}")
+        return "The system is currently unavailable. Please try again later."
 
 
 def dispatch_task(payload, target_url):
@@ -626,6 +499,7 @@ def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None, sessio
         specialist_model = UnifiedModel(provider="anthropic", model_name="claude-sonnet-4-5")
         
     style_mentors = get_stylistic_mentors(session_id)
+    audience_context = detect_audience_context(interlinked_concepts) # Check proposal context for tone
     
     # ARCHITECTURAL FIX: Modular Instruction Assembly
     sys_instruction = get_system_instructions("THEN_VS_NOW_PROPOSAL", output_target)
@@ -643,6 +517,8 @@ def tell_then_and_now_story(interlinked_concepts, tool_confirmation=None, sessio
     
     prompt = f"""
     TASK: Tell a 'Then and Now' story using these concepts: {interlinked_concepts}
+    
+    AUDIENCE: {audience_context}
     
     {extract_labeled_sources(interlinked_concepts)}
     
@@ -721,79 +597,63 @@ def process_feedback_logic(request):
             "timestamp": datetime.datetime.now(datetime.timezone.utc)
         })
         
+        # Determine global operation type for all N8N payloads
+        ghost_post_id = session_data.get('ghost_post_id') if isinstance(session_data, dict) else None
+        global_operation_type = get_n8n_operation_type("SAFETY_BLOCK", session_data.get('topic', ''), user_feedback, ghost_post_id)
+        
         # Send refusal back to Slack/n8n
+        target = get_output_target(global_operation_type)
         safe_n8n_delivery({
             "session_id": session_id,
-            "type": "social",
-            "message": refusal_text
+            "type": global_operation_type,
+            "message": refusal_text,
+            "query": user_feedback,
+            "output_target": target,
+            "channel_id": slack_context.get('channel') or req.get('slack_context', {}).get('channel') or req.get('slack_context', {}).get('channel_id') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'),
+            "thread_ts": slack_context.get('ts') or req.get('slack_context', {}).get('ts') or req.get('slack_context', {}).get('thread_ts')
         })
         return jsonify({"msg": "Safety refusal sent"}), 200
     
     doc_ref = db.collection('agent_sessions').document(session_id)
-    session_doc = doc_ref.get()
+    
+    # NATIVE RESCUE: Try/Except wrap the synchronous read to catch TSI_DATA_CORRUPTED
+    try:
+        session_doc = _firestore_call_with_timeout(lambda: doc_ref.get())
+    except Exception as e:
+        print(f"⚠️ FIRESTORE READ ERROR ({e}). Attempting channel resuscitation...")
+        # Forcing a fresh client instantiation specifically for this container runtime
+        db = firestore.Client(project=PROJECT_ID)
+        doc_ref = db.collection('agent_sessions').document(session_id)
+        session_doc = _firestore_call_with_timeout(lambda: doc_ref.get())
+        print("✅ Channel resuscitation successful!")
+        
     session_data = {}
     if not session_doc.exists:
-        # PSEO RESILIENCE: Check if the 'events' subcollection has history (Shadow Session)
-        events_ref = doc_ref.collection('events')
-        # Get recent events to find metadata (Topic, Type, Slack Context)
-        history_stream = events_ref.order_by('timestamp', direction=firestore.Query.DESCENDING).limit(10).stream()
-        history_events = [d.to_dict() for d in history_stream]
-        
-        if history_events:
-            print(f"⚠️ SHADOW SESSION DETECTED: {session_id}. Attempting auto-heal...")
-            # Try to reconstruct from history
-            recovered_topic = "Recovered Session"
-            recovered_type = "general"
-            recovered_slack = {}
-            recovered_ghost_id = None
-            
-            for event in history_events:
-                # Look for topic, type, or slack context in both event root and nested payloads
-                event_topic = event.get('topic') or event.get('proposal_data', {}).get('topic')
-                if event_topic and recovered_topic == "Recovered Session":
-                    recovered_topic = event_topic
-                    
-                event_type = event.get('type') or event.get('proposal_type')
-                if event_type and recovered_type == "general":
-                    recovered_type = event_type
-                    
-                event_slack = event.get('slack_context')
-                if event_slack and not recovered_slack:
-                    recovered_slack = event_slack
-                
-                # ADK FIX: Recover Ghost Post ID if it exists in any proposal event
-                event_ghost_id = event.get('ghost_post_id') or event.get('proposal_data', {}).get('ghost_post_id')
-                if event_ghost_id and not recovered_ghost_id:
-                    recovered_ghost_id = event_ghost_id
-            
-            session_data = {
-                "status": "self_healing",
-                "topic": recovered_topic,
-                "type": recovered_type,
-                "slack_context": recovered_slack,
-                "ghost_post_id": recovered_ghost_id,
-                "last_updated": datetime.datetime.now(datetime.timezone.utc)
-            }
-            # Commit the healed root document to prevent repetitive recovery overhead
-            doc_ref.set(session_data, merge=True)
-        else:
-            return jsonify({"error": "Session not found"}), 404
+        return jsonify({"error": "Session not found"}), 404
     else:
         session_data = session_doc.to_dict()
     
-    # FIX: Robustly merge Slack Context from request and (potentially healed) session data
+    # NORMALIZE: Basic context mapping
+    req_slack = req.get('slack_context', {}).copy()
+    if not req_slack.get('channel'):
+        req_slack['channel'] = req.get('slack_channel') or req.get('channel')
+    if not req_slack.get('ts'):
+        req_slack['ts'] = req.get('ts') or req.get('slack_ts')
+
+    # LIGHT ARCHITECTURE: Context Inheritance (Dispatcher-Anchored)
+    # Hardened merge logic: Prevent nulls in trigger 'req' from overriding valid session data.
+    session_slack = session_data.get('slack_context', {})
     req_slack = req.get('slack_context', {})
-    # Use request context as baseline for identity/channel, then augment from database for thread history
-    slack_context = {**session_data.get('slack_context', {}), **req_slack}
-    
-    # Ensure turn-specific signals are correctly mapped (Fixes KeyError: 'channel')
-    if req.get('slack_ts'): slack_context['ts'] = req.get('slack_ts')
-    if req.get('slack_thread_ts'): slack_context['thread_ts'] = req.get('slack_thread_ts')
-    if req.get('channel_id') and not slack_context.get('channel'): slack_context['channel'] = req.get('channel_id')
-    
-    # Fallback for channel if still missing (Fixes 500 error in worker-story)
+    slack_context = session_slack.copy()
+    for k, v in req_slack.items():
+        if v is not None:
+            slack_context[k] = v
+            
+    # CRITICAL: If the trigger itself has channel/ts, they take precedence
     if not slack_context.get('channel'):
-        slack_context['channel'] = req.get('channel') or "UNKNOWN_CHANNEL"
+        slack_context['channel'] = req.get('slack_channel') or req.get('channel') or req.get('event', {}).get('channel')
+    if not slack_context.get('ts'):
+        slack_context['ts'] = req.get('slack_ts') or req.get('ts') or req.get('event', {}).get('ts')
 
     # --- SYSTEM FILTER: Prevent Infinite Loops & Redundant Ingestion ---
     # Case: The message is a confirmation notification (e.g., from N8N/Ghost)
@@ -809,10 +669,10 @@ def process_feedback_logic(request):
     # Always check for a URL first. It's the fastest and most reliable signal.
     if extract_url_from_text(user_feedback):
         print("URL detected in feedback. Delegating to research worker immediately.")
-        doc_ref.set({
+        _firestore_call_with_timeout(lambda: doc_ref.update({
             "status": "delegating_research",
             "last_updated": expire_time
-            }, merge=True)
+            }))
         # FIX: Persist the feedback into the events subcollection
         doc_ref.collection('events').add({
             "event_type": "user_feedback",
@@ -841,7 +701,7 @@ def process_feedback_logic(request):
 
 
     # 2. Stream and then REVERSE the list to get chronological order (Oldest -> Newest)
-    all_raw_events = [doc.to_dict() for doc in recent_events_query.stream()]
+    all_raw_events = _firestore_call_with_timeout(lambda: [doc.to_dict() for doc in recent_events_query.stream()], timeout_secs=20)
     # CLAMPING: Only take the last 10 events (5 turns) for feedback triage
     recent_events = all_raw_events[:10][::-1] if len(all_raw_events) > 10 else all_raw_events[::-1]
     
@@ -896,14 +756,18 @@ def process_feedback_logic(request):
     
     print(f"Feedback Triage classified intent as: {intent}")
     
+    # Update global operation type based on triage result
+    ghost_post_id = session_data.get('ghost_post_id')
+    global_operation_type = get_n8n_operation_type(intent, session_data.get('topic', ''), user_feedback, ghost_post_id)
+    
     # --- 3. STATE-AWARE ROUTING LOGIC ---
     if intent == "DELEGATE":
         # This now handles all factual questions, meta-questions, and simple chat.
         print("Intent requires new research or is conversational. Delegating to story worker...")
-        doc_ref.set({
+        _firestore_call_with_timeout(lambda: doc_ref.update({
             "status": "delegating_research",
             "last_updated": expire_time
-            }, merge=True)
+            }))
         # FIX: Persist the feedback into the events subcollection
         doc_ref.collection('events').add({
             "event_type": "user_feedback",
@@ -915,10 +779,8 @@ def process_feedback_logic(request):
         # No-Strip: Pass full payload forward, but preserve mission topic
         payload = req.copy()
         # FIX: Ensure we pass the CURRENT turn's context, not the stale session context
-        slack_context.update({
-            "ts": req.get('slack_ts'),
-            "thread_ts": req.get('slack_thread_ts')
-        })
+        if req.get('slack_ts'): slack_context['ts'] = req.get('slack_ts')
+        if req.get('slack_thread_ts'): slack_context['thread_ts'] = req.get('slack_thread_ts')
         payload.update({"topic": session_data.get('topic'), "feedback_text": user_feedback, "slack_context": slack_context, "code_files": req.get('code_files', [])})
         dispatch_task(payload, STORY_WORKER_URL)
         return jsonify({"msg": "Delegated to Research Worker"}), 200
@@ -931,7 +793,7 @@ def process_feedback_logic(request):
         user_event = {"event_type": "user_feedback", "text": user_feedback, "intent": "APPROVE", "timestamp": ts}
 
         # FIX: Fetch FULL history from subcollection to find the proposal
-        full_history = [doc.to_dict() for doc in events_ref.order_by('timestamp').stream()]
+        full_history = _firestore_call_with_timeout(lambda: [doc.to_dict() for doc in events_ref.order_by('timestamp').stream()], timeout_secs=20)
         # --- ROBUST ARTIFACT EXTRACTION (Avoids Old "Then-and-Now" Rants) ---
         target_content = None
         
@@ -1002,20 +864,24 @@ def process_feedback_logic(request):
                 dispatch_task({"session_id": session_id, "topic": session_data.get('topic'), "story": rag_content, "type": "knowledge"}, INGEST_KNOWLEDGE_URL)
         
         # FIX: Update parent status, but write events to subcollection
-        doc_ref.set({
+        _firestore_call_with_timeout(lambda: doc_ref.update({
             "status": "completed", 
             "final_story": target_content,
             "last_updated": expire_time
-        }, merge=True)
+        }))
         
-        events_ref.add(user_event)
-        events_ref.add({"event_type": "final_output", "content": target_content, "timestamp": datetime.datetime.now(datetime.timezone.utc)})
+        _firestore_call_with_timeout(lambda: events_ref.add(user_event))
+        _firestore_call_with_timeout(lambda: events_ref.add({"event_type": "final_output", "content": target_content, "timestamp": datetime.datetime.now(datetime.timezone.utc)}))
         
+        target = get_output_target(global_operation_type)
         safe_n8n_delivery({
             "session_id": session_id, 
+            "type": global_operation_type,
             "proposal": [{"link": convert_html_to_markdown(target_content)}], 
-            "thread_ts": slack_context.get('ts'), 
-            "channel_id": slack_context.get('channel'), 
+            "query": user_feedback,
+            "output_target": target,
+            "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'), 
+            "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
             "is_final_story": True, 
             "is_initial_post": False 
         })
@@ -1023,7 +889,7 @@ def process_feedback_logic(request):
 
     elif intent == "REFINE":
         # FIX: Fetch history from subcollection
-        full_history = [doc.to_dict() for doc in events_ref.order_by('timestamp').stream()]
+        full_history = _firestore_call_with_timeout(lambda: [doc.to_dict() for doc in events_ref.order_by('timestamp').stream()], timeout_secs=20)
         
         # --- ROBUST ARTIFACT EXTRACTION (Same as APPROVE path) ---
         last_prop_data = None
@@ -1059,18 +925,22 @@ def process_feedback_logic(request):
         
         # FIX: Write to subcollection
         ts = datetime.datetime.now(datetime.timezone.utc)
-        events_ref.add({"event_type": "user_feedback", "text": user_feedback, "intent": "REFINE", "timestamp": ts})
-        events_ref.add({"event_type": "agent_proposal", "proposal_data": new_prop, "timestamp": ts})
-        events_ref.add({"event_type": "adk_request_confirmation", "approval_id": new_id, "payload": new_prop['interlinked_concepts'], "timestamp": ts})
+        _firestore_call_with_timeout(lambda: events_ref.add({"event_type": "user_feedback", "text": user_feedback, "intent": "REFINE", "timestamp": ts}))
+        _firestore_call_with_timeout(lambda: events_ref.add({"event_type": "agent_proposal", "proposal_data": new_prop, "timestamp": ts}))
+        _firestore_call_with_timeout(lambda: events_ref.add({"event_type": "adk_request_confirmation", "approval_id": new_id, "payload": new_prop['interlinked_concepts'], "timestamp": ts}))
         
-        doc_ref.set({"last_updated": expire_time}, merge=True)
+        _firestore_call_with_timeout(lambda: doc_ref.update({"last_updated": expire_time}))
         
+        target = get_output_target(global_operation_type)
         safe_n8n_delivery({
             "session_id": session_id, 
+            "type": global_operation_type,
             "approval_id": new_id, 
             "proposal": [convert_html_to_markdown(c) if isinstance(c, str) else c for c in new_prop['interlinked_concepts']], 
-            "thread_ts": slack_context.get('ts'), 
-            "channel_id": slack_context.get('channel'),
+            "query": user_feedback,
+            "output_target": target,
+            "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'), 
+            "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'),
             "is_final_story": False,
             "is_initial_post": False
         })

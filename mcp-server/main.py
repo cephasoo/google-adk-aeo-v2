@@ -85,15 +85,16 @@ def initialize_secrets():
     BROWSERLESS_API_KEY = get_secret("browserless-api-key") or os.environ.get("BROWSERLESS_API_KEY")
 
 
-# --- Initialize Vertex AI ---
-vertexai.init(project=PROJECT_ID, location=LOCATION)
-
-@app.on_event("startup")
-async def startup_event():
-    """Initializes external services and secrets on startup."""
-    global ANTHROPIC_API_KEY
-    initialize_secrets()
-    ANTHROPIC_API_KEY = get_secret("anthropic-api-key") or os.environ.get("ANTHROPIC_API_KEY")
+_is_initialized = False
+def ensure_initialized():
+    global _is_initialized
+    if not _is_initialized:
+        # --- Initialize Vertex AI Lazily ---
+        vertexai.init(project=PROJECT_ID, location=LOCATION)
+        initialize_secrets()
+        global ANTHROPIC_API_KEY
+        ANTHROPIC_API_KEY = get_secret("anthropic-api-key") or os.environ.get("ANTHROPIC_API_KEY")
+        _is_initialized = True
 
 def get_flash_model():
     global flash_model
@@ -347,6 +348,7 @@ def handle_tool_call(name, arguments):
     Central dispatcher for all sensory tools.
     Logs every call for real-time debugging and enforces validation/scrubbing.
     """
+    ensure_initialized()
     print(f"TELEMETRY: MCP Hub: Calling Tool [{name}] | Args: {json.dumps(arguments)}")
     
     # Tool-Level Input Validation (Architectural Safety)
@@ -528,7 +530,7 @@ def handle_tool_call(name, arguments):
         try:
             # 1. PRIMARY SEARCH: Active Session (Isolated Knowledge)
             collection = db.collection('knowledge_base')
-            results = collection.where("source_session", "==", session_id).find_nearest(
+            results = collection.where(filter=FieldFilter("source_session", "==", session_id)).find_nearest(
                 vector_field="embedding",
                 query_vector=Vector(query_embedding),
                 distance_measure=DistanceMeasure.COSINE,
@@ -540,9 +542,9 @@ def handle_tool_call(name, arguments):
                 print(f"MCP Hub: Session {session_id} empty. Falling back to Type-Safe Global Grounding...")
                 # Use range query to simulate "starts_with" for the global mission prefix
                 mission_prefix = "pseo_grounding_mission"
-                results = collection.where("knowledge_type", "==", "grounding_data")\
-                                  .where("source_session", ">=", mission_prefix)\
-                                  .where("source_session", "<", mission_prefix + "\uf8ff")\
+                results = collection.where(filter=FieldFilter("knowledge_type", "==", "grounding_data"))\
+                                  .where(filter=FieldFilter("source_session", ">=", mission_prefix))\
+                                  .where(filter=FieldFilter("source_session", "<", mission_prefix + "\uf8ff"))\
                                   .find_nearest(
                     vector_field="embedding",
                     query_vector=Vector(query_embedding),
@@ -1095,6 +1097,5 @@ def health():
     return {"status": "ok"}
 
 if __name__ == "__main__":
-    initialize_secrets()
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)

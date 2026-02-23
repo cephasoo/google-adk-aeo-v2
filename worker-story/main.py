@@ -5,6 +5,17 @@ from flask import jsonify
 import vertexai
 import litellm
 from litellm import completion
+
+import sys
+import os
+from shared.utils import (
+    get_secret, 
+    _firestore_call_with_timeout, 
+    safe_n8n_delivery, 
+    UnifiedModel,
+    get_n8n_operation_type,
+    get_output_target
+)
 from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
 import google.cloud.logging
 import logging
@@ -29,38 +40,19 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # --- Logging Setup ---
-try:
-    logging_v_client = google.cloud.logging.Client()
-    logging_v_client.setup_logging()
-except Exception:
-    logging_v_client = None # Fallback to standard logging if local
+logging_v_client = None
+def get_logging_client():
+    global logging_v_client
+    if logging_v_client is None:
+        try:
+            logging_v_client = google.cloud.logging.Client()
+            logging_v_client.setup_logging()
+        except Exception:
+            pass # Fallback to standard logging
+    return logging_v_client
 
 # --- SECRET MANAGER ---
 secret_client = None
-def get_secret(secret_id):
-    """
-    Retrieves a secret from Google Cloud Secret Manager.
-    Includes an environment variable fallback for local development or manual overrides.
-    """
-    global secret_client
-    
-    # 1. Check environment variables first (High Speed / Local Dev)
-    env_key = secret_id.upper().replace("-", "_")
-    env_val = os.environ.get(env_key)
-    if env_val:
-        return env_val.strip()
-        
-    # 2. Fallback to Secret Manager
-    try:
-        if secret_client is None:
-            secret_client = secretmanager.SecretManagerServiceClient()
-        
-        name = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest"
-        response = secret_client.access_secret_version(request={"name": name})
-        return response.payload.data.decode("UTF-8").strip()
-    except Exception as e:
-        print(f"⚠️ Secret Manager error for {secret_id}: {e}")
-        return None
 
 # --- Configuration ---
 PROJECT_ID = os.environ.get("PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")
@@ -79,14 +71,19 @@ RESEARCH_MODEL_NAME = os.environ.get("RESEARCH_MODEL_NAME", "gemini-2.5-flash-li
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL") 
-INGESTION_API_KEY = os.environ.get("INGESTION_API_KEY")
-if not INGESTION_API_KEY:
-    INGESTION_API_KEY = get_secret("ingestion-api-key")
+INGESTION_API_KEY = None
+def get_ingestion_api_key():
+    global INGESTION_API_KEY
+    if not INGESTION_API_KEY:
+        INGESTION_API_KEY = os.environ.get("INGESTION_API_KEY") or get_secret("ingestion-api-key")
+    return INGESTION_API_KEY
 
-
-KNOWLEDGE_INGESTION_API_KEY = os.environ.get("KNOWLEDGE_INGESTION_API_KEY")
-if not KNOWLEDGE_INGESTION_API_KEY:
-    KNOWLEDGE_INGESTION_API_KEY = get_secret("knowledge-ingestion-api-key")
+KNOWLEDGE_INGESTION_API_KEY = None
+def get_knowledge_ingestion_key():
+    global KNOWLEDGE_INGESTION_API_KEY
+    if not KNOWLEDGE_INGESTION_API_KEY:
+        KNOWLEDGE_INGESTION_API_KEY = os.environ.get("KNOWLEDGE_INGESTION_API_KEY") or get_secret("knowledge-ingestion-api-key")
+    return KNOWLEDGE_INGESTION_API_KEY
 
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")  # Explicit fallback for code analysis
 MAX_LOOP_ITERATIONS = 2
@@ -96,57 +93,14 @@ MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8080")
 
 # --- Safety Configuration (ADK/RAI Compliant) ---
 safety_settings = {
-    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
-    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
-    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
-    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_LOW_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_ONLY_HIGH,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+    HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
 }
 
 # --- HELPER: Safe n8n Webhook Delivery ---
-def safe_n8n_delivery(payload, timeout=45):
-    """
-    Robust delivery to n8n with retries and SSL resilience.
-    Uses 'requests' with an HTTPAdapter for exponential backoff on transient errors.
-    """
-    if not N8N_PROPOSAL_WEBHOOK_URL:
-        print("⚠️ safe_n8n_delivery: No webhook URL configured.")
-        return False
-
-    session = requests.Session()
-    # Retry on specific status codes and connection errors
-    # backoff_factor 2 means waits 2, 4, 8 seconds
-    retries = Retry(
-        total=3, 
-        backoff_factor=2, 
-        status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["POST"]
-    )
-    session.mount('https://', HTTPAdapter(max_retries=retries))
-    
-    try:
-        print(f"DEBUG: Attempting safe_n8n_delivery [Session: {payload.get('session_id')}]")
-        response = session.post(
-            N8N_PROPOSAL_WEBHOOK_URL, 
-            json=payload, 
-            verify=certifi.where(), 
-            timeout=timeout
-        )
-        response.raise_for_status()
-        print(f"✅ safe_n8n_delivery: Success (200 OK)")
-        return True
-    except requests.exceptions.SSLError as e:
-        print(f"❌ safe_n8n_delivery: SSL Handshake Failed: {e}")
-        # Final emergency attempt without strict session pooling
-        try:
-            time.sleep(2)
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json=payload, verify=certifi.where(), timeout=timeout)
-            return True
-        except Exception as inner_e:
-            print(f"❌ safe_n8n_delivery: Emergency fallback also failed: {inner_e}")
-            return False
-    except Exception as e:
-        print(f"⚠️ safe_n8n_delivery: Payload delivery failed: {e}")
-        return False
 
 
 # --- Global Clients ---
@@ -157,6 +111,68 @@ specialist_model = None
 search_api_key = None
 db = None
 mcp_client = None
+
+
+# --- MODULAR SECTOR CLASSIFICATION ---
+def classify_topic_sector(topic: str) -> str:
+    """
+    Semantic Sector Classification (ADK-FLASH):
+    Classifies a topic into LIFESTYLE, HUMANITIES, or TECHNICAL sectors using 
+    Gemini Flash for semantic matching with a robust keyword fallback.
+    """
+    global flash_model
+    topic_str = str(topic).strip()
+    
+    # 1. Semantic Match (Specialized Flash Call)
+    # We use a strict prompt to ensure fast, deterministic response.
+    # We intimate that themes are non-exhaustive examples.
+    classification_prompt = f"""
+    Strictly classify the following TOPIC into one of three SECTORS based on its semantic nature. 
+    The themes listed below are non-exhaustive EXAMPLES:
+    
+    1. LIFESTYLE (Example Themes: Tourism, Food, Travel, Lifestyle, Hangouts, Entertainment, Recreation)
+    2. HUMANITIES (Example Themes: Politics, Sociology, Governance, Security, Law, Policy, History, Ethics)
+    3. TECHNICAL (Example Themes: Software, AI, Engineering, Infrastructure, Data Systems, Scientific Method)
+    
+    TOPIC: "{topic_str}"
+    
+    Return ONLY the sector name (e.g., "LIFESTYLE").
+    """
+    
+    try:
+        # Use Flash for low-latency semantic triage
+        raw_sector = safe_generate_content(flash_model, classification_prompt, generation_config={"temperature": 0.0, "max_output_tokens": 10})
+        sector = str(raw_sector).upper().strip()
+        
+        # Validation: Ensure it's one of the three
+        if any(s in sector for s in ["LIFESTYLE", "HUMANITIES", "TECHNICAL"]):
+            for s in ["LIFESTYLE", "HUMANITIES", "TECHNICAL"]:
+                if s in sector:
+                    print(f"  + Semantic Sector Classification: {s}")
+                    return s
+    except Exception as e:
+        print(f"⚠️ Semantic Triage Failed: {e}. Falling back to keywords.")
+    
+    # 2. Keyword Fallback (Hardened Static Match)
+    t = topic_str.lower()
+    lifestyle_keywords = [
+        "hangout", "places to", "travel", "food", "lifestyle", "tourism", "restaurant", 
+        "club", "bar", "visit", "shopping", "mall", "lake", "hotel", "cafe", "nightlife"
+    ]
+    if any(kw in t for kw in lifestyle_keywords):
+        print(f"  + Keyword Sector Classification: LIFESTYLE")
+        return "LIFESTYLE"
+        
+    humanities_keywords = [
+        "politics", "terrorism", "governance", "nigeria", "policy", "societal", 
+        "public", "international", "un ", "security", "human rights", "law", "ethics"
+    ]
+    if any(kw in t for kw in humanities_keywords):
+        print(f"  + Keyword Sector Classification: HUMANITIES")
+        return "HUMANITIES"
+        
+    print(f"  + Default Sector Classification: TECHNICAL")
+    return "TECHNICAL"
 
 
 # --- MODULAR STYLE & SANITIZATION PROTOCOL (Zero-Loss Fidelity) ---
@@ -238,31 +254,51 @@ PROTOCOL_PSEO_PAGE = """
 # Backward Compatibility (Ensures legacy calls don't break during migration)
 STYLE_PROTOCOL = PROTOCOL_GROUNDING_RAI + PROTOCOL_VISUAL_TABULAR + PROTOCOL_LITERARY_CORE + PROTOCOL_ANTI_SLOB
 
-def get_system_instructions(intent: str, output_target: str) -> str:
+def get_system_instructions(intent: str, output_target: str, topic_sector: str = "TECHNICAL") -> str:
     """
-    Architectural fix to assemble instructions modularly based on intent and target.
-    Prevents token waste while ensuring 100% rule fidelity for relevant tasks.
+    Architectural fix to assemble instructions modularly based on intent, target, and topic sector.
+    Prevents "Technical Over-Indexing" for non-technical subjects like Lifestyle or Politics.
     """
+    intent = intent.upper().strip()
     # 1. Start with Baseline Guardrails (Permanent)
     instructions = "You are a highly capable AI assistant. Adhere strictly to these protocols:\n"
     instructions += PROTOCOL_GROUNDING_RAI
-    instructions += PROTOCOL_VISUAL_TABULAR
     
-    # 2. Add Formatting (Modular)
+    # 2. Visual & Tabular (Sector Aware)
+    if topic_sector == "TECHNICAL":
+        instructions += PROTOCOL_VISUAL_TABULAR
+    else:
+        instructions += """
+- **VISUAL RESTRAINT**: For non-technical LIFESTYLE or HUMANITIES content, PROHIBIT Mermaid flowcharts, logic maps, and technical JSON-LD schema blocks in the article body unless explicitly requested by the user. Use descriptive narrative or simple Markdown tables (if needed for pricing/timing) instead.
+"""
+    
+    # 3. Add Formatting (Modular)
     if output_target == "CMS_DRAFT":
         instructions += PROTOCOL_FORMAT_CMS
     else:
         instructions += PROTOCOL_FORMAT_SLACK
         
-    # 3. Add High-Fidelity Tone (Conditional)
-    high_fidelity_intents = ["DEEP_DIVE", "PSEO_ARTICLE", "PSEO_PAGE", "TECHNICAL_EXPLANATION", "BLOG_OUTLINE"]
+    # Condition: High-Fidelity intents get the full Literary and Anti-Slob treatment.
+    high_fidelity_intents = [
+        "DEEP_DIVE", "PSEO_ARTICLE", "PSEO_PAGE", "TECHNICAL_EXPLANATION", 
+        "BLOG_OUTLINE", "AUTHOR", "REWRITE", "REFINE", "THEN_VS_NOW_PROPOSAL",
+        "DIRECT_ANSWER", "SIMPLE_QUESTION", "FORMAT_GENERAL", "OPERATIONAL_REFORMAT"
+    ]
     if intent in high_fidelity_intents:
         instructions += PROTOCOL_LITERARY_CORE
         
+        # Sector-Aware Anti-Slob
+        if topic_sector == "LIFESTYLE":
+            instructions += "\n- **LIFESTYLE PERSONA**: You are an Expert Travel & Lifestyle Journalist. Use warm, inviting, yet professional prose. Focus on sensory details, timing, and hospitality."
+        elif topic_sector == "HUMANITIES":
+             instructions += "\n- **HUMANITIES PERSONA**: You are a Sociopolitical Analyst and Researcher. Use objective, authoritative, and nuanced prose. Focus on systemic drivers and human impacts."
+        else:
+             instructions += "\n- **TECHNICAL PERSONA**: You are a Specialized Technical Writer. Use precise, efficient, and data-dense prose. Focus on architecture and implementation."
+
     if intent == "PSEO_PAGE":
         instructions += PROTOCOL_PSEO_PAGE
         
-    if intent in ["PSEO_ARTICLE", "DEEP_DIVE", "PSEO_PAGE"]:
+    if intent in ["PSEO_ARTICLE", "DEEP_DIVE", "PSEO_PAGE", "DIRECT_ANSWER"]:
         instructions += PROTOCOL_ANTI_SLOB
         
     return instructions.strip()
@@ -462,137 +498,6 @@ def sanitize_llm_html(raw_html):
     return sanitized
 
 # --- UNIFIED MODEL ADAPTER (The Brain Switch) ---
-class UnifiedModel:
-    """
-    Routes requests to Vertex AI, OpenAI, or Anthropic based on configuration.
-    """
-    def __init__(self, provider, model_name):
-        self.provider = provider
-        self.model_name = model_name
-        
-        # Native Vertex Initialization (Only if using Google)
-        if provider == "vertex_ai":
-            vertexai.init(project=PROJECT_ID, location=LOCATION)
-            self._native_model = GenerativeModel(model_name, safety_settings=safety_settings)
-            print(f"✅ Loaded Native Vertex Model: {model_name} (Safety Active)", flush=True)
-
-    def generate_content(self, prompt, generation_config=None, max_retries=3, system_instruction=None):
-        """
-        Universal generation function with safety catching and Exponential Backoff.
-        Supports 'system_instruction' to align with ADK architectural best practices.
-        """
-        import time
-        import random
-        
-        # PATH A: Native Vertex AI
-        if self.provider == "vertex_ai":
-            retries = 0
-            while retries <= max_retries:
-                try:
-                    # Ensure max_output_tokens is set for Vertex AI
-                    if generation_config is None: generation_config = {}
-                    if "max_output_tokens" not in generation_config: generation_config["max_output_tokens"] = 8192
-                    
-                    # ARCHITECTURAL FIX: Use system_instruction if provided
-                    # Note: We create a temporary model instance to apply system_instruction
-                    # this is lightweight and avoids state pollution on the primary instance.
-                    model = GenerativeModel(
-                        self.model_name, 
-                        safety_settings=safety_settings,
-                        system_instruction=system_instruction
-                    )
-                    response = model.generate_content(prompt, generation_config=generation_config)
-                    
-                    # Robust Safety Check: Some SDK versions throw exceptions, others return empty candidates
-                    if not response.candidates or response.candidates[0].finish_reason == 3: # 3 = SAFETY
-                         raise ValueError("Safety Block via FinishReason")
-                    
-                    return response
-                except Exception as e:
-                    error_msg = str(e).lower()
-                    # Check for Rate Limit / Quota errors (429)
-                    if "429" in error_msg or "resource exhausted" in error_msg:
-                        if retries < max_retries:
-                            wait_time = (2 ** retries) + random.uniform(0, 1)
-                            print(f"⚠️ Vertex 429 (Quota): Retrying in {wait_time:.2f}s... (Attempt {retries+1}/{max_retries})")
-                            time.sleep(wait_time)
-                            retries += 1
-                            continue
-                    
-                    # If it's a safety block or we've exhausted retries, log and return fallback
-                    print(f"⚠️ Vertex AI Safety/SDK Error: {e}")
-                    # log_safety_event("generation_error", {"prompt": prompt, "error": str(e)}) # Fallback logic
-                    
-                    # Return Mock for Fallback
-                    class MockResponse:
-                        def __init__(self, content): self.text = content
-                    return MockResponse("I encountered a safety limit or internal error. Could you rephrase?")
-
-        # PATH B: Universal Route (OpenAI / Anthropic via LiteLLM)
-        else:
-            print(f"🔄 Switching to {self.model_name} via LiteLLM ({self.provider})...", flush=True)
-            
-            # Inject Keys for LiteLLM
-            if self.provider == "anthropic" and ANTHROPIC_API_KEY:
-                os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
-            elif self.provider == "openai" and OPENAI_API_KEY:
-                os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-            
-            # Normalize Parameters
-            temp = generation_config.get('temperature', 0.7) if generation_config else 0.7
-            
-            try:
-                # ADK FIX: Inject Beta Header for 8k Output (Required for 20240620)
-                extra_headers = {}
-                if "claude-sonnet-4-5" in self.model_name or "claude-3-5-sonnet" in self.model_name:
-                    extra_headers = {"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"}
-
-                # LiteLLM Call: Map system_instruction to 'system' role
-                messages = []
-                if system_instruction:
-                    messages.append({"role": "system", "content": str(system_instruction)})
-                messages.append({"role": "user", "content": prompt})
-
-                response = completion(
-                    model=self.model_name, 
-                    messages=messages,
-                    temperature=temp,
-                    max_tokens=8192,
-                    extra_headers=extra_headers
-                )
-                
-                # Create a Mock Response Object to mimic Vertex AI's SDK
-                class MockResponse:
-                    def __init__(self, content):
-                        self.text = content
-                
-                content = response.choices[0].message.content
-                if not content:
-                    print(f"⚠️ LiteLLM Warning: Received EMPTY content from {self.model_name}")
-                    content = "The model was unable to generate a response."
-                
-                return MockResponse(content)
-                
-            except Exception as e:
-                print(f"❌ LiteLLM Error: {e}", flush=True)
-                class MockResponse:
-                    def __init__(self, content): self.text = content
-                return MockResponse("Error generating content.")
-
-    def analyze_citation(self, prompt_text, scrape_content):
-        """Calls the Sensory Tracker service to audit citations."""
-        try:
-            url = f"{TRACKER_SERVER_URL.rstrip('/')}/analyze"
-            response = requests.post(url, json={
-                "prompt": prompt_text,
-                "content": scrape_content
-            }, timeout=30, verify=certifi.where())
-            if response.status_code == 200:
-                return response.json()
-            return {"cited": False, "error": f"Tracker status {response.status_code}"}
-        except Exception as e:
-            print(f"⚠️ Sensory Tracker Error: {e}")
-            return {"cited": False, "error": str(e)}
 
 
 # --- Safety Utils ---
@@ -1757,15 +1662,6 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     return { "context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent_raw, "detected_geo": detected_geo }
 
 
-def get_output_target(intent: str) -> str:
-    """
-    Centralized mapping logic for target-aware formatting.
-    """
-    intent = intent.upper().strip()
-    if intent in ["PSEO_ARTICLE", "PSEO_PAGE"]:
-        return "CMS_DRAFT"
-    return "MODERATOR_VIEW"
-
 # #11. The Topic Cluster Generator
 def generate_topic_cluster(topic, context, history="", is_initial=True, session_id=None):
     global unimodel
@@ -1972,13 +1868,13 @@ def ensure_slack_compatibility(text):
 
 
 # 13a. The Natural Answer Generator (Conversational & Fluid)
-def generate_natural_answer(topic, context, history="", session_id=None, output_target="MODERATOR_VIEW"):
+def generate_natural_answer(topic, context, history="", session_id=None, output_target="MODERATOR_VIEW", intent_label="SIMPLE_QUESTION"):
     global unimodel, research_model
     style_mentors = get_stylistic_mentors(session_id)
+    topic_sector = classify_topic_sector(topic)
     
     # ARCHITECTURAL FIX: Modular Instruction Assembly
-    intent_label = "SIMPLE_QUESTION"
-    system_instruction = get_system_instructions(intent_label, output_target)
+    system_instruction = get_system_instructions(intent_label, output_target, topic_sector=topic_sector)
     system_instruction += f"\n\n{style_mentors}"
 
     print(f"DEBUG: generate_natural_answer (Native) starting... [Topic: {topic[:50]}]")
@@ -2028,7 +1924,7 @@ def generate_natural_answer(topic, context, history="", session_id=None, output_
     text = safe_generate_content(active_model, prompt, generation_config={"temperature": 0.4}, system_instruction=system_instruction)
     
     final_text = ensure_slack_compatibility(text.strip())
-    intent = "SIMPLE_QUESTION"
+    intent = intent_label
     if "```" in final_text: intent = "TECHNICAL_EXPLANATION"
     
     return {
@@ -2039,21 +1935,22 @@ def generate_natural_answer(topic, context, history="", session_id=None, output_
 
 
 # 13b. The Comprehensive Answer Generator (AEO-AWARE CONTENT STRATEGIST)
-def generate_comprehensive_answer(topic, context, history="", intent_metadata=None, context_topic="", session_id=None, output_target="MODERATOR_VIEW"):
+def generate_comprehensive_answer(topic, context, history="", intent_metadata=None, context_topic="", session_id=None, output_target="MODERATOR_VIEW", intent_label=None):
     global unimodel, research_model, specialist_model, flash_model
     style_mentors = get_stylistic_mentors(session_id)
     
     # 2. INTENT DETECTION (Early for instruction assembly)
     try:
         signal_data = json.loads(intent_metadata) if intent_metadata else {}
-        research_intent = signal_data.get("intent", "FORMAT_GENERAL")
+        research_intent = intent_label or signal_data.get("intent", "FORMAT_GENERAL")
         formatting_directive = signal_data.get("directive", "")
     except:
-        research_intent = "FORMAT_GENERAL"
+        research_intent = intent_label or "FORMAT_GENERAL"
         formatting_directive = ""
 
     # ARCHITECTURAL FIX: Modular Instruction Assembly
-    system_instruction = get_system_instructions(research_intent, output_target)
+    topic_sector = classify_topic_sector(topic)
+    system_instruction = get_system_instructions(research_intent, output_target, topic_sector=topic_sector)
     system_instruction += f"\n\n{style_mentors}"
 
     print(f"DEBUG: generate_comprehensive_answer starting... [Topic: {topic[:50]}]")
@@ -2073,12 +1970,23 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     
     # 1. PERSONA & AUDIENCE
     audience_context = detect_audience_context(history)
+    
+    if topic_sector == "LIFESTYLE":
+        persona_goal = "Generate a warm, descriptive lifestyle discovery or recommendation."
+        strategist_type = "Expert Travel & Lifestyle Journalist"
+    elif topic_sector == "HUMANITIES":
+        persona_goal = "Generate an objective sociopolitical research audit or overview."
+        strategist_type = "Sociopolitical Analyst"
+    else:
+        persona_goal = "Generate a high-density technical research audit or implementation guide."
+        strategist_type = "Senior Content Strategist"
+
     persona_instruction = f"""
-    You are a Senior Content Strategist. 
+    You are a {strategist_type}. 
     AUDIENCE: {audience_context}
     
     GOAL:
-    Generate a high-density, technical research audit that directly addresses the user's specific sub-topic or vertical. 
+    {persona_goal}
     Avoid "Sports Blindness" or generic global signals. Look for the nuance in the grounding data.
     """
 
@@ -2336,6 +2244,7 @@ def chunked_refactor_article(source_text, audience_context, specialist_model, st
 def generate_pseo_article(topic, context, history="", history_events=None, is_initial_post=True, session_id=None, output_target="CMS_DRAFT"):
     global unimodel
     style_mentors = get_stylistic_mentors(session_id)
+    topic_sector = classify_topic_sector(topic)
     
     # --- STRATEGIC CONTEXT SANITIZATION: Strip internal meta-talk from history ---
     if output_target == "CMS_DRAFT":
@@ -2474,9 +2383,17 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     # --- PATH B & C: EXPAND / AUTHOR (Creative Synthesis) ---
     elif start_mode == "EXPAND":
         # EXPANSION PROMPT: Use history as a skeleton.
-        print("  + Executing PATH B: EXPAND with Unimodel")
+        print(f"  + Executing PATH B: EXPAND ({topic_sector}) with Unimodel")
+        
+        if topic_sector == "LIFESTYLE":
+            persona = "Expert Travel & Lifestyle Journalist"
+        elif topic_sector == "HUMANITIES":
+            persona = "Sociopolitical Analyst and Researcher"
+        else:
+            persona = "Specialized Technical Writer"
+
         system_instruction = f"""
-        You are a Specialized Technical Writer.
+        You are an {persona}.
         TASK: Write a comprehensive pSEO article based on the provided OUTLINE/BLUEPRINT.
         
         RULES:
@@ -2487,20 +2404,32 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
         BLUEPRINT/OUTLINE:
         {history}
         """
-        tone_instruction = "Tone: High-authority, professional, and detailed. Match the depth implied by the blueprint."
+        tone_instruction = "Tone: High-authority, engaging, and detailed. Match the depth implied by the blueprint."
         context_block = f"Research Context:\n{context}"
         
     else: # AUTHOR MODE
-        print("  + Executing PATH C: AUTHOR with Unimodel")
-        if is_grounded:
-            system_instruction = "You are a Clear Technical Communicator. Base the article PRIMARILY on the provided 'Research Context'."
+        print(f"  + Executing PATH C: AUTHOR ({topic_sector}) with Unimodel")
+        
+        if topic_sector == "LIFESTYLE":
+            persona = "Expert Travel & Lifestyle Journalist"
+            goal = "Clear, warm, and inviting prose."
+        elif topic_sector == "HUMANITIES":
+            persona = "Sociopolitical Analyst and Researcher"
+            goal = "Objective, authoritative, and nuanced prose."
         else:
-            system_instruction = "You are a Clear Technical Communicator. Use the provided context to write a high-authority article."
-        tone_instruction = "Tone: Clear, engaging, professional English. Use analogies to explain complex ideas."
+            persona = "Specialized Technical Writer"
+            goal = "High-authority technical article."
+
+        if is_grounded:
+            system_instruction = f"You are an {persona}. Base the article PRIMARILY on the provided 'Research Context'."
+        else:
+            system_instruction = f"You are an {persona}. Use the provided context to write a {goal}"
+        
+        tone_instruction = f"Tone: {goal} Use analogies to explain complex ideas."
         context_block = f"Research Context:\n{context}\n\nConversation History:\n{history}"
 
     # ARCHITECTURAL FIX: Modular Instruction Assembly
-    sys_instruction = get_system_instructions("PSEO_ARTICLE", output_target)
+    sys_instruction = get_system_instructions("PSEO_ARTICLE", output_target, topic_sector=topic_sector)
     sys_instruction += f"\n\n{style_mentors}"
 
     # Shared Prompt for B & C (Creative Paths)
@@ -2516,18 +2445,18 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     {target_instruction}
     
     STRUCTURE REQUIREMENTS (Strict HTML):
-    1.  **<section class="intro">**: A compelling hook. **MEAT-FIRST**: Deliver core findings or high-density technical insights immediately in the first paragraph.
+    1.  **<section class="intro">**: A compelling hook. **MEAT-FIRST**: Deliver core findings or data-driven insights immediately in the first paragraph.
     2.  **<section class="body">**: Detailed analysis using <h2> and <h3> tags.
     3.  **NO NUMBERED HEADINGS**: Do NOT include numbers (e.g., "1. ", "2. ") in your <h2> or <h3> headers.
     4.  **Code Blocks**: Use semantic HTML: `<pre><code class="language-...">...</code></pre>`.
-    5.  **Mermaid Diagrams**: MUST be preserved. Wrap Mermaid code in a `<figure class="kg-card kg-image-card kg-width-wide">` block. Inside, include the `<pre><code class="language-mermaid">...</code></pre>` and a context-aware `<figcaption>...</figcaption>`.
+    5.  **Mermaid Diagrams**: MUST be preserved (ONLY for TECHNICAL sector). Wrap Mermaid code in a `<figure class="kg-card kg-image-card kg-width-wide">` block. 
     6.  **Lists**: Use semantic `<ul><li>` or `<ol><li>`.
-    7.  **<section class="methodology">**: A TECHNICAL TRANSPARENCY FOOTER. 
+    7.  **<section class="methodology">**: A { 'TECHNICAL TRANSPARENCY' if topic_sector == 'TECHNICAL' else 'REFERENCES & ACCOUNTABILITY' if topic_sector == 'HUMANITIES' else 'INSIGHTS & SOURCES' } FOOTER. 
     
     CRITICAL CONTENT RULES:
     - **Contextual Specificity**: Actively identify and expand on points of interest, debates, cultural markers, or specific real-world examples found in the research context.
-    - **Technical-External Mapping**: Identify relevant external frameworks (regulatory, structural, or conceptual) and explicitly link technical solutions to those specific anchors.
-    - **Technical Accuracy**: Ensure all technical claims are supported by the provided context.
+    - **Sector-Aware Mapping**: Identify relevant external frameworks (regulatory, structural, or conceptual for Technical; cultural or historical for Humanities) and explicitly link solutions/insights to those anchors.
+    - **Accuracy**: Ensure all claims are supported by the provided context.
     - **Acronym Protocol**: Define all acronyms in parentheses on the first use (e.g. "Electronic Data Interchange (EDI)").
     
     CRITICAL RULES:
@@ -2559,6 +2488,7 @@ def generate_pseo_page(topic, context, history="", history_events=None, is_initi
     """
     global unimodel, specialist_model
     
+    topic_sector = classify_topic_sector(topic)
     topic_lower = topic.lower()
     style_mentors = get_stylistic_mentors(session_id)
     audience_context = detect_audience_context(history)
@@ -2599,7 +2529,7 @@ def generate_pseo_page(topic, context, history="", history_events=None, is_initi
          print(f"  + Holistic Grounding: Using full thread history ({len(history)} chars) for refactor/update.")
 
     # 3. Instruction Assembly
-    sys_instruction = get_system_instructions("PSEO_PAGE", output_target)
+    sys_instruction = get_system_instructions("PSEO_PAGE", output_target, topic_sector=topic_sector)
     sys_instruction += f"\n\n{style_mentors}"
 
     # 4. Prompt Engineering
@@ -2668,6 +2598,7 @@ def generate_pseo_page(topic, context, history="", history_events=None, is_initi
 def generate_deep_dive_article(topic, context, history="", history_events=None, target_length=1500, target_geo="Global", session_id=None, output_target="MODERATOR_VIEW"):
     global unimodel
     style_mentors = get_stylistic_mentors(session_id)
+    topic_sector = classify_topic_sector(topic)
     
     target_instruction = ""
     if output_target == "MODERATOR_VIEW":
@@ -2683,7 +2614,7 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     audience_context = detect_audience_context(history)
     
     # ARCHITECTURAL FIX: Modular Instruction Assembly
-    blueprint_sys = get_system_instructions("BLOG_OUTLINE", output_target)
+    blueprint_sys = get_system_instructions("BLOG_OUTLINE", output_target, topic_sector=topic_sector)
     blueprint_sys += f"\n\n{style_mentors}"
 
     # PHASE 1: Generate the Blueprint & Title (The Architect)
@@ -2747,7 +2678,7 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     
     # Intro (Sequential - Sets the stage)
     # ARCHITECTURAL FIX: Modular Instruction Assembly
-    intro_sys = get_system_instructions("DEEP_DIVE", output_target)
+    intro_sys = get_system_instructions("DEEP_DIVE", output_target, topic_sector=topic_sector)
     intro_sys += f"\n\n{style_mentors}"
 
     intro_prompt = f"""
@@ -2788,7 +2719,7 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
             section_words = int(str(section_words).strip())
             
         # ARCHITECTURAL FIX: Modular Instruction Assembly
-        section_sys = get_system_instructions("DEEP_DIVE", output_target)
+        section_sys = get_system_instructions("DEEP_DIVE", output_target, topic_sector=topic_sector)
         section_sys += f"\n\n{style_mentors}"
 
         # NOTE: In parallel mode, we rely on the Blueprint logic rather than the literal previous text.
@@ -3047,6 +2978,15 @@ def process_sales_transcript(transcript_text, output_target="MODERATOR_VIEW"):
 # --- THE STATEFUL MAIN WORKER FUNCTION (FINAL V6 - SOCIAL AWARE) ---
 @functions_framework.http
 def process_story_logic(request):
+    try:
+        return _process_story_logic_inner(request)
+    except Exception as e:
+        print(f"❌ FATAL ERROR CAUGHT AT TOP LEVEL: {e}")
+        from flask import jsonify
+        return jsonify({"error": "Fatal process error", "details": str(e)}), 200
+
+@functions_framework.http
+def _process_story_logic_inner(request):
     global unimodel, flash_model, research_model, specialist_model, db, mcp_client
 
     # 0. ENTRY TELEMETRY (Observability)
@@ -3056,6 +2996,8 @@ def process_story_logic(request):
     # 0.5 CORE SERVICES (Pre-flight init)
     if any(m is None for m in [unimodel, flash_model, research_model, specialist_model]):
         vertexai.init(project=PROJECT_ID, location=LOCATION)
+    # Vertex AI gRPC Mitigations (Pool Reset)
+    vertexai.init(project=PROJECT_ID, location=LOCATION)
 
     if unimodel is None:
         unimodel = UnifiedModel(MODEL_PROVIDER, MODEL_NAME)
@@ -3094,13 +3036,30 @@ def process_story_logic(request):
     
     # --- IDEMPOTENCY CHECK (Prevent Double-Trigger) ---
     # Construct a unique event ID from the Slack Timestamp
-    slack_context = req.get('slack_context', {})
-    unique_event_id = slack_context.get('ts') or req.get('event_ts') or req.get('client_msg_id')
+    # NORMALIZE: Ensure Slack Context is usable
+    slack_context = req.get('slack_context', {}).copy()
+    if not slack_context.get('channel'):
+        slack_context['channel'] = req.get('slack_channel') or req.get('channel')
+    if not slack_context.get('ts'):
+        slack_context['ts'] = req.get('slack_ts') or req.get('ts')
+
+    unique_event_id = slack_context.get('ts') or req.get('client_msg_id')
     
     if unique_event_id:
         # Check if we've already seen this event ID in the last 30 minutes
         dedup_ref = db.collection('processed_events').document(str(unique_event_id))
-        doc = dedup_ref.get()
+        
+        # NATIVE RESCUE: Try/Except wrap the synchronous read to catch TSI_DATA_CORRUPTED
+        try:
+            doc = _firestore_call_with_timeout(lambda: dedup_ref.get())
+        except Exception as e:
+            print(f"⚠️ FIRESTORE READ ERROR ({e}). Attempting channel resuscitation...")
+            # Forcing a fresh client instantiation specifically for this container runtime
+            db = firestore.Client(project=PROJECT_ID)
+            dedup_ref = db.collection('processed_events').document(str(unique_event_id))
+            doc = _firestore_call_with_timeout(lambda: dedup_ref.get())
+            print("✅ Channel resuscitation successful!")
+            
         if doc.exists:
             # Check timestamp to allow re-runs after 5 minutes
             data = doc.to_dict()
@@ -3118,11 +3077,11 @@ def process_story_logic(request):
         
         # Mark as pending immediately
         try:
-            dedup_ref.set({
+            _firestore_call_with_timeout(lambda: dedup_ref.set({
                 'timestamp': datetime.datetime.now(datetime.timezone.utc),
                 'status': 'processing',
                 'session_id': req.get('session_id')
-            })
+            }))
         except Exception as e:
             print(f"⚠️ Warning: Failed to set idempotency lock: {e}")
             
@@ -3142,18 +3101,43 @@ def process_story_logic(request):
     
     # --- STEP 2: LOAD SHORT-TERM MEMORY ---
     doc_ref = db.collection('agent_sessions').document(session_id)
-    session_doc = doc_ref.get()
+    
+    # NATIVE RESCUE: Try/Except wrap the synchronous read to catch TSI_DATA_CORRUPTED
+    try:
+        session_doc = _firestore_call_with_timeout(lambda: doc_ref.get())
+    except Exception as e:
+        print(f"⚠️ FIRESTORE READ ERROR ({e}). Attempting channel resuscitation...")
+        # Forcing a fresh client instantiation specifically for this container runtime
+        db = firestore.Client(project=PROJECT_ID)
+        doc_ref = db.collection('agent_sessions').document(session_id)
+        session_doc = _firestore_call_with_timeout(lambda: doc_ref.get())
+        print("✅ Channel resuscitation successful!")
     
     session_data = {}
     if session_doc.exists:
         session_data = session_doc.to_dict()
-        # SAFETY NET: Recover Slack Context if stripped by n8n (Non-Destructive)
-        if session_data.get('slack_context'):
-            db_ctx = session_data['slack_context']
-            for key in ['channel', 'ts', 'thread_ts']:
-                if not slack_context.get(key) and db_ctx.get(key):
-                    print(f"INFO: Recovering missing {key} from Firestore...")
-                    slack_context[key] = db_ctx[key]
+        
+    # LIGHT ARCHITECTURE: Context Inheritance (Dispatcher-Anchored)
+    # Hardened merge logic: Prevent nulls in trigger 'req' from overriding valid session data.
+    session_slack = session_data.get('slack_context', {})
+    req_slack = req.get('slack_context', {})
+    slack_context = session_slack.copy()
+    for k, v in req_slack.items():
+        if v is not None:
+            slack_context[k] = v
+            
+    # CRITICAL: If the trigger itself has channel/ts, they take precedence
+    if not slack_context.get('channel'):
+        slack_context['channel'] = req.get('slack_channel') or req.get('channel') or req.get('event', {}).get('channel')
+    if not slack_context.get('ts'):
+        slack_context['ts'] = req.get('slack_ts') or req.get('ts') or req.get('event', {}).get('ts')
+
+    # --- ANCHOR SESSION (Early Initialization) ---
+    # We commit the root document immediately to prevent "headless" sessions 
+    # if a crash occurs during the research/generation phase.
+    if not session_doc.exists:
+        print(f"❌ SESSION NOT FOUND: {session_id}")
+        return jsonify({"error": "Session not found"}), 404
 
     history_events = []
     history_text = ""
@@ -3166,7 +3150,7 @@ def process_story_logic(request):
         
         # CLAMPING: Limit history to last 15 turns to prevent context bloat
         # 30 matches (15 turns of User/Agent pairs)
-        all_events = [doc.to_dict() for doc in query.stream()]
+        all_events = _firestore_call_with_timeout(lambda: [doc.to_dict() for doc in query.stream()], timeout_secs=20)
         history_events = all_events[-30:] if len(all_events) > 30 else all_events
 
 
@@ -3385,7 +3369,7 @@ def process_story_logic(request):
         print(f"TELEMETRY: Triage V6.0 -> Intent classified as: [{intent}] for command: '{sanitized_topic[:50]}...'")
 
         # Initialize variables for the response
-        new_events = [] 
+        new_events = [{"event_type": "user_request", "text": sanitized_topic, "slack_context": slack_context}]
         
         # Retroactive Event Logging for Code Analysis (since we ran it early)
         if code_files and code_analysis_snippets:
@@ -3401,6 +3385,10 @@ def process_story_logic(request):
                 })
 
         expire_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
+        
+        # Determine global operation type for all N8N payloads
+        ghost_post_id = session_data.get('ghost_post_id') if isinstance(session_data, dict) else None
+        global_operation_type = get_n8n_operation_type(intent, original_topic, sanitized_topic, ghost_post_id)
         
         # --- STEP 4: ROUTING & EXECUTION ---
 
@@ -3429,19 +3417,22 @@ def process_story_logic(request):
             # 1. Write Events
             for event in new_events:
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                events_ref.add(event)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
 
             # 2. Update Parent Metadata (Preserving Context)
-            session_ref.update({
+            _firestore_call_with_timeout(lambda: session_ref.update({
                 "status": "completed",
                 "type": "social",
                 "last_updated": expire_time
-            })
+            }))
+            target = get_output_target(intent)
             safe_n8n_delivery({
                 "session_id": session_id, 
-                "type": "social", 
-                "message": reply_text, 
-                "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
+                "type": global_operation_type, 
+                "message": reply_text,
+                "query": sanitized_topic,
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or slack_context.get('channel_id') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
                 "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'), 
                 "is_initial_post": is_initial_post
             })
@@ -3459,7 +3450,7 @@ def process_story_logic(request):
                 target = get_output_target(intent)
                 
                 # RESTORED: Use simpler natural answer generator to avoid persona-induced bloat
-                answer_data = generate_natural_answer(sanitized_topic, "COMPLETE_CONTEXT_IN_HISTORY", history=history_text, session_id=session_id, output_target=target)
+                answer_data = generate_natural_answer(sanitized_topic, "COMPLETE_CONTEXT_IN_HISTORY", history=history_text, session_id=session_id, output_target=target, intent_label=intent)
                 answer_text = answer_data['text']
                 research_intent = answer_data.get('intent', "OPERATIONAL_REFORMAT")
                 
@@ -3470,21 +3461,23 @@ def process_story_logic(request):
                 events_ref = session_ref.collection('events')
                 for event in new_events:
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                    events_ref.add(event)
+                    _firestore_call_with_timeout(lambda: events_ref.add(event))
 
-                session_ref.set({
+                _firestore_call_with_timeout(lambda: session_ref.update({
                     "status": "completed",
                     "type": "operational_answer",
                     "last_updated": expire_time
-                }, merge=True)
+                }))
                 
                 safe_n8n_delivery({
                     "session_id": session_id, 
-                    "type": "social", 
+                    "type": global_operation_type, 
                     "message": answer_text, 
+                    "query": sanitized_topic,
                     "intent": "OPERATIONAL_REFORMAT",
-                    "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
-                    "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'),
+                    "output_target": target,
+                    "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
+                    "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                     "is_initial_post": is_initial_post
                 })
                 return jsonify({"msg": "Operational reformat sent"}), 200
@@ -3500,7 +3493,7 @@ def process_story_logic(request):
             target = get_output_target(intent)
             
             # Use Comprehensive Content Strategist for outlines
-            answer_data = generate_comprehensive_answer(sanitized_topic, "BLOG_OUTLINE_MODE", history=history_text, context_topic=original_topic, session_id=session_id, output_target=target)
+            answer_data = generate_comprehensive_answer(sanitized_topic, "BLOG_OUTLINE_MODE", history=history_text, context_topic=original_topic, session_id=session_id, output_target=target, intent_label=intent)
             answer_text = answer_data['text']
             
             new_events.append({"event_type": "agent_answer", "text": answer_text, "intent": "BLOG_OUTLINE"})
@@ -3509,21 +3502,23 @@ def process_story_logic(request):
             events_ref = session_ref.collection('events')
             for event in new_events:
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                events_ref.add(event)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
 
-            session_ref.update({
+            _firestore_call_with_timeout(lambda: session_ref.update({
                 "status": "completed",
                 "type": "work_answer",
                 "last_updated": expire_time
-            })
+            }))
             
             safe_n8n_delivery({
                 "session_id": session_id, 
-                "type": "social", 
+                "type": global_operation_type, 
                 "message": answer_text, 
+                "query": sanitized_topic,
                 "intent": "BLOG_OUTLINE",
-                "channel_id": slack_context['channel'], 
-                "thread_ts": slack_context['ts'],
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
+                "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })
             return jsonify({"msg": "Blog outline sent"}), 200
@@ -3554,23 +3549,25 @@ def process_story_logic(request):
             events_ref = session_ref.collection('events')
             for event in new_events:
                 if 'timestamp' not in event: event['timestamp'] = ts
-                events_ref.add(event)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
 
             # Update session status
-            session_ref.set({
+            _firestore_call_with_timeout(lambda: session_ref.update({
                 "status": "awaiting_feedback",
                 "type": "solution_brief",
                 "last_updated": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
-            }, merge=True)
+            }))
 
             # Send to N8N for distribution
             safe_n8n_delivery({
                 "session_id": session_id,
-                "type": "solution_brief",
+                "type": global_operation_type,
+                "query": sanitized_topic,
                 "objections": result['objections'],
                 "brief": result['brief'],
-                "channel_id": slack_context.get('channel'),
-                "thread_ts": slack_context.get('ts'),
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'),
+                "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })
             
@@ -3710,21 +3707,24 @@ def process_story_logic(request):
             events_ref = session_ref.collection('events')
             for event in new_events:
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                events_ref.add(event)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
 
-            session_ref.set({
+            _firestore_call_with_timeout(lambda: session_ref.update({
                 "status": "blocked",
                 "type": "safety_violation",
                 "detected_geo": final_geo,
                 "intent": final_intent_key,
                 "last_updated": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
-            }, merge=True)
+            }))
+            target = get_output_target(intent)
             safe_n8n_delivery({
                 "session_id": session_id, 
-                "type": "social", 
+                "type": global_operation_type, 
                 "message": reply_text, 
-                "channel_id": slack_context['channel'], 
-                "thread_ts": slack_context['ts']
+                "query": sanitized_topic,
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
+                "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts')
             })
             return jsonify({"msg": "Safety block applied"}), 200
 
@@ -3744,7 +3744,7 @@ def process_story_logic(request):
             target = get_output_target(intent)
             
             # HIGH-FIDELITY ROUTING: Use Comprehensive Content Strategist for Audits/Formats
-            answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, session_id=session_id, output_target=target)
+            answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, session_id=session_id, output_target=target, intent_label=intent)
             answer_text = answer_data['text']
             research_intent = answer_data.get('intent', intent)
             
@@ -3756,27 +3756,28 @@ def process_story_logic(request):
 
             for event in new_events:
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                events_ref.add(event)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
 
-            # UPDATE METADATA
             update_data = {
                 "status": "awaiting_feedback", 
                 "type": "work_answer", 
                 "slack_context": slack_context,
                 "detected_geo": final_geo,
-                "intent": final_intent_key,
+                "intent": research_intent,
                 "last_updated": expire_time
             }
             if is_initial_post: update_data["topic"] = clean_topic
-            session_ref.set(update_data, merge=True)
+            _firestore_call_with_timeout(lambda: session_ref.update(update_data))
 
             safe_n8n_delivery({
                 "session_id": session_id, 
-                "type": "social", 
+                "type": global_operation_type, 
                 "message": convert_html_to_markdown(answer_text), 
+                "query": sanitized_topic,
                 "intent": research_intent,
-                "channel_id": slack_context['channel'], 
-                "thread_ts": slack_context['ts'],
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
+                "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })
             return jsonify({"msg": "High-fidelity answer sent"}), 200
@@ -3785,7 +3786,7 @@ def process_story_logic(request):
             # Determined Output Target
             target = get_output_target(intent)
             # LIGHTWEIGHT ROUTING: Use Natural Answer Engine
-            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text, session_id=session_id, output_target=target)
+            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text, session_id=session_id, output_target=target, intent_label=intent)
             answer_text = answer_data['text']
             research_intent = answer_data.get('intent', intent)
             formatting_directive = answer_data.get('directive', "")
@@ -3796,27 +3797,29 @@ def process_story_logic(request):
             events_ref = session_ref.collection('events')
             for event in new_events:
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                events_ref.add(event)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
 
             update_data = {
                 "status": "awaiting_feedback", 
                 "type": "work_answer", 
                 "slack_context": slack_context,
                 "detected_geo": final_geo,
-                "intent": final_intent_key,
+                "intent": research_intent,
                 "last_updated": expire_time
             }
             if is_initial_post: update_data["topic"] = clean_topic
-            session_ref.set(update_data, merge=True)
+            _firestore_call_with_timeout(lambda: session_ref.update(update_data))
 
             safe_n8n_delivery({
                 "session_id": session_id, 
-                "type": "social", 
+                "type": global_operation_type, 
                 "message": convert_html_to_markdown(answer_text), 
+                "query": sanitized_topic,
                 "intent": research_intent,
                 "directive": formatting_directive,
-                "channel_id": slack_context['channel'], 
-                "thread_ts": slack_context['ts'],
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
+                "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })
             return jsonify({"msg": "Natural answer sent"}), 200
@@ -3844,25 +3847,26 @@ def process_story_logic(request):
             events_ref = session_ref.collection('events')
             for event in new_events:
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                events_ref.add(event)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
 
             update_data = {
                 "status": "awaiting_feedback", 
-                "type": "work_proposal", 
+                "type": "work_answer", 
                 "slack_context": slack_context,
                 "detected_geo": final_geo,
-                "intent": final_intent_key,
+                "intent": "DEEP_DIVE",
                 "last_updated": expire_time
             }
-            if is_initial_post: update_data["topic"] = seo_data.get('title', clean_topic)
-            session_ref.set(update_data, merge=True)
+            _firestore_call_with_timeout(lambda: session_ref.update(update_data))
 
             safe_n8n_delivery({
                 "session_id": session_id, 
-                "type": "social", 
+                "type": global_operation_type, 
                 "message": convert_html_to_markdown(article_html), 
-                "channel_id": slack_context['channel'], 
-                "thread_ts": slack_context['ts'],
+                "query": sanitized_topic,
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
+                "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })
             return jsonify({"msg": "Deep-Dive article sent"}), 200
@@ -3883,7 +3887,7 @@ def process_story_logic(request):
                 events_ref = session_ref.collection('events')
                 for event in new_events:
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                    events_ref.add(event)
+                    _firestore_call_with_timeout(lambda: events_ref.add(event))
 
                 update_data = {
                     "status": "awaiting_feedback", 
@@ -3894,17 +3898,17 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.set(update_data, merge=True)
+                _firestore_call_with_timeout(lambda: session_ref.update(update_data))
                 
                 # Align with N8N Parser: Wrap JSON in markdown for regex extraction
                 cluster_msg = f"```json\n{json.dumps(cluster_data, indent=2)}\n```"
                 safe_n8n_delivery({
                     "session_id": session_id, 
-                    "type": "answer", 
+                    "type": global_operation_type, 
                     "message": cluster_msg,
                     "intent": "TOPIC_CLUSTER_PROPOSAL",
-                    "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
-                    "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'),
+                    "channel_id": slack_context.get('channel'), 
+                    "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                     "is_initial_post": is_initial_post
                 })
                 return jsonify({"msg": "Topic cluster sent"}), 200
@@ -3912,7 +3916,7 @@ def process_story_logic(request):
             except Exception as e:
                 print(f"TELEMETRY: ⚠️ TOPIC_CLUSTER Fallback: {e}")
                 target = get_output_target(intent)
-                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, output_target=target)
+                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, output_target=target, intent_label=intent)
                 answer_text = answer_data['text']
                 research_intent = answer_data.get('intent', intent)
                 
@@ -3922,7 +3926,7 @@ def process_story_logic(request):
                 events_ref = session_ref.collection('events')
                 for event in new_events:
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                    events_ref.add(event)
+                    _firestore_call_with_timeout(lambda: events_ref.add(event))
 
                 update_data = {
                     "status": "awaiting_feedback", 
@@ -3933,8 +3937,8 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.set(update_data, merge=True)
-                safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
+                _firestore_call_with_timeout(lambda: session_ref.update(update_data))
+                safe_n8n_delivery({"session_id": session_id, "type": global_operation_type, "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
                 return jsonify({"msg": "Cluster Fallback Answer sent"}), 200
         elif intent == "THEN_VS_NOW_PROPOSAL":
             try:
@@ -3966,7 +3970,7 @@ def process_story_logic(request):
                 events_ref = session_ref.collection('events')
                 for event in new_events:
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                    events_ref.add(event)
+                    _firestore_call_with_timeout(lambda: events_ref.add(event))
 
                 update_data = {
                     "status": "awaiting_feedback", 
@@ -3977,15 +3981,15 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.set(update_data, merge=True)
+                _firestore_call_with_timeout(lambda: session_ref.update(update_data))
 
                 safe_n8n_delivery({
                     "session_id": session_id, 
                     "type": "answer_proposal", 
                     "proposal": current_proposal['interlinked_concepts'], 
                     "approval_id": approval_id, 
-                    "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
-                    "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'),
+                    "channel_id": slack_context.get('channel'), 
+                    "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                     "is_initial_post": is_initial_post
                 })
                 return jsonify({"msg": "Then-vs-Now proposal sent"}), 200
@@ -3993,7 +3997,7 @@ def process_story_logic(request):
             except ValueError as e:
                 # Fallback
                 target = get_output_target(intent)
-                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, output_target=target)
+                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, output_target=target, intent_label=intent)
                 answer_text = answer_data['text']
                 research_intent = answer_data.get('intent', intent)
                 
@@ -4004,7 +4008,7 @@ def process_story_logic(request):
 
                 for event in new_events:
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                    events_ref.add(event)
+                    _firestore_call_with_timeout(lambda: events_ref.add(event))
 
                 update_data = {
                     "status": "awaiting_feedback", 
@@ -4015,8 +4019,8 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.set(update_data, merge=True)
-                safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
+                _firestore_call_with_timeout(lambda: session_ref.update(update_data))
+                safe_n8n_delivery({"session_id": session_id, "type": global_operation_type, "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
                 return jsonify({"msg": "Fallback answer sent"}), 200
 
         # === PATH C: PSEO ARTICLE GENERATION (Dual-Agent Path) ===
@@ -4045,11 +4049,6 @@ def process_story_logic(request):
                 
                 # 5. Determine operation type (ADK Interoperability: Support Pages of Posts)
                 is_page_target = (intent == "PSEO_PAGE") or any(kw in original_topic.lower() or kw in sanitized_topic.lower() for kw in ["pseo page", "collection page", "page template", "ghost page", "page slug"])
-                
-                if is_page_target:
-                    operation_type = "pseo_page_update" if ghost_post_id else "pseo_page_create"
-                else:
-                    operation_type = "pseo_update" if ghost_post_id else "pseo_draft"
                 
                 # 6. Build Payload (Schema-Aware for Ghost or Next.js)
                 delivery_payload = {
@@ -4106,27 +4105,28 @@ def process_story_logic(request):
                 events_ref = session_ref.collection('events')
                 for event in new_events:
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                    events_ref.add(event)
+                    _firestore_call_with_timeout(lambda: events_ref.add(event))
 
-                # 9. UPDATE METADATA: Preserve Mission Topic
                 update_data = {
                     "status": "awaiting_feedback", 
-                    "type": "work_proposal", 
+                    "type": "work_article", 
                     "slack_context": slack_context,
                     "detected_geo": final_geo,
-                    "intent": final_intent_key,
+                    "intent": intent,
                     "last_updated": expire_time
                 }
-                if is_initial_post: update_data["topic"] = seo_data.get('title', clean_topic)
-                session_ref.set(update_data, merge=True)
+                if is_initial_post: update_data["topic"] = clean_topic
+                _firestore_call_with_timeout(lambda: session_ref.update(update_data))
                 
                 # 9. Send STRUCTURED DATA to N8N (Restored Wrapper for GhostNode Harmony)
                 safe_n8n_delivery({
                     "session_id": session_id, 
-                    "type": operation_type,  # "pseo_draft", "pseo_update", "pseo_page_create", or "pseo_page_update"
+                    "type": global_operation_type,
                     "payload": delivery_payload,
-                    "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
-                    "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'),
+                    "query": sanitized_topic,
+                    "output_target": target,
+                    "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
+                    "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                     "is_initial_post": is_initial_post
                 })
                 
@@ -4141,7 +4141,7 @@ def process_story_logic(request):
             except Exception as e:
                 print(f"⚠️ PSEO_ARTICLE Fallback: {e}")
                 target = get_output_target(intent)
-                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, output_target=target)
+                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, output_target=target, intent_label=intent)
                 answer_text = answer_data['text']
                 research_intent = answer_data.get('intent', intent)
                 
@@ -4151,33 +4151,45 @@ def process_story_logic(request):
                 events_ref = session_ref.collection('events')
                 for event in new_events:
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                    events_ref.add(event)
+                    _firestore_call_with_timeout(lambda: events_ref.add(event))
 
                 update_data = {
                     "status": "awaiting_feedback", 
                     "type": "work_answer", 
                     "slack_context": slack_context,
                     "detected_geo": final_geo,
-                    "intent": final_intent_key,
+                    "intent": research_intent,
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.set(update_data, merge=True)
+                _firestore_call_with_timeout(lambda: session_ref.update(update_data))
                 if intent == "PSEO_ARTICLE":
                     safe_n8n_delivery({
                         "session_id": session_id, 
-                        "type": "pseo_draft", 
+                        "type": global_operation_type, 
+                        "query": sanitized_topic,
                         "payload": {
                             "title": clean_topic,
                             "html": answer_text,
                             "status": "draft_fallback"
                         },
-                        "channel_id": slack_context['channel'], 
-                        "thread_ts": slack_context['ts'],
+                        "output_target": target,
+                        "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
+                        "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                         "is_initial_post": is_initial_post
                     })
                 else:
-                    safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
+                    safe_n8n_delivery({
+                        "session_id": session_id, 
+                        "type": global_operation_type, 
+                        "message": answer_text, 
+                        "query": sanitized_topic,
+                        "intent": research_intent, 
+                        "output_target": target,
+                        "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
+                        "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'), 
+                        "is_initial_post": is_initial_post
+                    })
                 return jsonify({"msg": "pSEO Fallback Answer sent"}), 200
 
 
@@ -4185,7 +4197,7 @@ def process_story_logic(request):
             # ROBUST FALLBACK: If intent is unknown, default to a natural answer rather than crashing with 500
             print(f"TELEMETRY: ⚠️ Unknown Intent Detected: '{intent}'. Defaulting to Natural Answer fallback.")
             target = get_output_target("FALLBACK") # Defaults to MODERATOR_VIEW
-            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text, output_target=target)
+            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text, output_target=target, intent_label=intent)
             answer_text = answer_data['text']
             research_intent = answer_data['intent']
             formatting_directive = answer_data['directive']
@@ -4196,28 +4208,29 @@ def process_story_logic(request):
             events_ref = session_ref.collection('events')
             for event in new_events:
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                events_ref.add(event)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
 
-            # UPDATE METADATA (Fallback Persistence)
             update_data = {
                 "status": "awaiting_feedback", 
                 "type": "work_answer", 
                 "slack_context": slack_context,
                 "detected_geo": final_geo,
-                "intent": final_intent_key,
+                "intent": research_intent,
                 "last_updated": expire_time
             }
             if is_initial_post: update_data["topic"] = clean_topic
-            session_ref.set(update_data, merge=True)
+            _firestore_call_with_timeout(lambda: session_ref.update(update_data))
 
             safe_n8n_delivery({
                 "session_id": session_id, 
-                "type": "social", 
+                "type": global_operation_type, 
                 "message": answer_text, 
                 "intent": research_intent,
                 "directive": formatting_directive,
-                "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
-                "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'),
+                "query": sanitized_topic,
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or slack_context.get('channel_id') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
+                "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })
             
