@@ -42,9 +42,9 @@ def handle_feedback_workflow(request):
     # NORMALIZE: Ensure worker-compatible context exists
     if 'slack_context' not in req:
         req['slack_context'] = {
-            "ts": req.get('slack_ts') or req.get('ts'),
-            "thread_ts": req.get('slack_thread_ts') or req.get('thread_ts'),
-            "channel": req.get('slack_channel') or req.get('channel')
+            "ts": req.get('slack_ts') or req.get('ts') or req.get('event', {}).get('ts'),
+            "thread_ts": req.get('slack_thread_ts') or req.get('thread_ts') or req.get('event', {}).get('thread_ts'),
+            "channel": req.get('slack_channel') or req.get('channel') or req.get('event', {}).get('channel')
         }
         
     dispatch_task(req, FEEDBACK_WORKER_URL)

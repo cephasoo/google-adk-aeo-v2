@@ -5,6 +5,17 @@ import vertexai
 from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold, FinishReason, SafetySetting
 import os
 import json
+
+import sys
+import os
+from shared.utils import (
+    get_secret, 
+    _firestore_call_with_timeout, 
+    safe_n8n_delivery, 
+    UnifiedModel,
+    get_n8n_operation_type,
+    get_output_target
+)
 import re
 import uuid
 import datetime
@@ -26,31 +37,6 @@ safety_settings = {
 
 # --- SECRET MANAGER ---
 secret_client = None
-def get_secret(secret_id):
-    """
-    Retrieves a secret from Google Cloud Secret Manager.
-    Includes an environment variable fallback for local development or manual overrides.
-    """
-    global secret_client
-    
-    # 1. Check environment variables first (High Speed / Local Dev)
-    env_key = secret_id.upper().replace("-", "_")
-    env_val = os.environ.get(env_key)
-    if env_val:
-        return env_val.strip()
-        
-    # 2. Fallback to Secret Manager
-    try:
-        if secret_client is None:
-            secret_client = secretmanager.SecretManagerServiceClient()
-        
-        name = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest"
-        response = secret_client.access_secret_version(request={"name": name})
-        return response.payload.data.decode("UTF-8").strip()
-    except Exception as e:
-        print(f"⚠️ Secret Manager error for {secret_id}: {e}")
-        return None
-
 def log_safety_event(event_name, data):
     """Standardized safety event logger with payload clamping."""
     global logging_v_client
@@ -75,86 +61,6 @@ def log_safety_event(event_name, data):
     except Exception as e:
         print(f"Safety Event Logged (Local): {event_name} - {data} | Error: {e}")
 
-# --- UNIFIED MODEL ADAPTER (The Brain Switch) ---
-class UnifiedModel:
-    def __init__(self, provider, model_name):
-        self.provider = provider
-        self.model_name = model_name
-        if provider == "vertex_ai":
-            vertexai.init(project=PROJECT_ID, location=LOCATION)
-            self._native_model = GenerativeModel(model_name, safety_settings=safety_settings)
-            print(f"✅ Loaded Unified Vertex Model: {model_name} (Safety Active)")
-
-    def generate_content(self, prompt, system_instruction=None, generation_config=None, max_retries=3):
-        """
-        Universal generation function with safety catching and Exponential Backoff.
-        Failover is handled inside this class to Anthropic Claude 4.5.
-        """
-        retries = 0
-        while retries <= max_retries:
-            try:
-                if self.provider == "vertex_ai":
-                    model = GenerativeModel(
-                        self.model_name, 
-                        safety_settings=safety_settings,
-                        system_instruction=system_instruction
-                    )
-                    response = model.generate_content(prompt, generation_config=generation_config)
-                    
-                    if not response.candidates or response.candidates[0].finish_reason == 3: # 3 = SAFETY
-                         raise ValueError("Safety Block via FinishReason")
-                    return response
-
-                elif self.provider == "anthropic":
-                    from litellm import completion
-                    import litellm
-                    litellm.drop_params = True
-                    os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
-                    
-                    messages = []
-                    if system_instruction:
-                        messages.append({"role": "system", "content": str(system_instruction)})
-                    messages.append({"role": "user", "content": prompt})
-                    
-                    # ADK FIX: Inject Beta Header for 8k Output (Required for 20240620)
-                    extra_headers = {}
-                    if "claude-sonnet-4-5" in self.model_name or "claude-3-5-sonnet" in self.model_name:
-                        extra_headers = {"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"}
-
-                    response = completion(
-                        model=self.model_name,
-                        messages=messages,
-                        temperature=generation_config.get("temperature", 0.7) if generation_config else 0.7,
-                        max_tokens=8192,
-                        extra_headers=extra_headers
-                    )
-                    
-                    class MockResponse:
-                        def __init__(self, c): self.text = c
-                    return MockResponse(response.choices[0].message.content)
-                return None
-
-            except Exception as e:
-                error_msg = str(e).lower()
-                if "429" in error_msg or "resource exhausted" in error_msg:
-                    if retries < max_retries:
-                        wait_time = (2 ** retries) + random.uniform(0, 1)
-                        print(f"⚠️ Feedback 429 (Quota): Retrying in {wait_time:.2f}s...")
-                        time.sleep(wait_time)
-                        retries += 1
-                        continue
-                
-                # FAILOVER: If Vertex fails, switch to Specialist Specialist (Claude)
-                if self.provider == "vertex_ai":
-                    print(f"⚠️ Primary Vertex Model Failed: {e}. Attempting Specialist Failover to Claude 4.5...")
-                    failover_model = UnifiedModel("anthropic", "claude-sonnet-4-5")
-                    return failover_model.generate_content(prompt, system_instruction=system_instruction, generation_config=generation_config)
-                
-                print(f"❌ UnifiedModel Generation Critical Failure: {e}")
-                class MockResponse:
-                    def __init__(self, c): self.text = c
-                return MockResponse("The system is currently unavailable. Please try again later.")
-        return None
 
 # --- Configuration ---
 PROJECT_ID = os.environ.get("PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")
@@ -170,59 +76,25 @@ LOCATION = os.environ.get("LOCATION", "us-central1")
 MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.5-pro") 
 MODEL_PROVIDER = os.environ.get("MODEL_PROVIDER", "vertex_ai")
 FLASH_MODEL_NAME = os.environ.get("FLASH_MODEL_NAME", "gemini-2.5-flash-lite")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY") or get_secret("anthropic-api-key")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or get_secret("openai-api-key")
+ANTHROPIC_API_KEY = None
+def get_anthropic_api_key():
+    global ANTHROPIC_API_KEY
+    if not ANTHROPIC_API_KEY:
+        ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY") or get_secret("anthropic-api-key")
+    return ANTHROPIC_API_KEY
+
+OPENAI_API_KEY = None
+def get_openai_api_key():
+    global OPENAI_API_KEY
+    if not OPENAI_API_KEY:
+        OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY") or get_secret("openai-api-key")
+    return OPENAI_API_KEY
 N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL") 
 INGEST_KNOWLEDGE_URL = os.environ.get("INGEST_KNOWLEDGE_URL")
 STORY_WORKER_URL = os.environ.get("STORY_WORKER_URL") 
 QUEUE_NAME = "story-worker-queue"
 FUNCTION_IDENTITY_EMAIL = os.environ.get("FUNCTION_IDENTITY_EMAIL")
 
-# --- HELPER: Safe n8n Webhook Delivery ---
-def safe_n8n_delivery(payload, timeout=45):
-    """
-    Robust delivery to n8n with retries and SSL resilience.
-    Uses 'requests' with an HTTPAdapter for exponential backoff on transient errors.
-    """
-    if not N8N_PROPOSAL_WEBHOOK_URL:
-        print("⚠️ safe_n8n_delivery: No webhook URL configured.")
-        return False
-
-    session = requests.Session()
-    # Retry on specific status codes and connection errors
-    # backoff_factor 2 means waits 2, 4, 8 seconds
-    retries = Retry(
-        total=3, 
-        backoff_factor=2, 
-        status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["POST"]
-    )
-    session.mount('https://', HTTPAdapter(max_retries=retries))
-    
-    try:
-        print(f"DEBUG: Attempting safe_n8n_delivery [Session: {payload.get('session_id')}]")
-        response = session.post(
-            N8N_PROPOSAL_WEBHOOK_URL, 
-            json=payload, 
-            verify=certifi.where(), 
-            timeout=timeout
-        )
-        response.raise_for_status()
-        print(f"✅ safe_n8n_delivery: Success (200 OK)")
-        return True
-    except requests.exceptions.SSLError as e:
-        print(f"❌ safe_n8n_delivery: SSL Handshake Failed: {e}")
-        # Final emergency attempt without strict session pooling
-        try:
-            time.sleep(2)
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json=payload, verify=certifi.where(), timeout=timeout)
-            return True
-        except Exception as inner_e:
-            print(f"❌ safe_n8n_delivery: Emergency fallback also failed: {inner_e}")
-            return False
-    except Exception as e:
-        print(f"⚠️ safe_n8n_delivery: Payload delivery failed: {e}")
-        return False
 
 
 unimodel = None
@@ -725,16 +597,36 @@ def process_feedback_logic(request):
             "timestamp": datetime.datetime.now(datetime.timezone.utc)
         })
         
+        # Determine global operation type for all N8N payloads
+        ghost_post_id = session_data.get('ghost_post_id') if isinstance(session_data, dict) else None
+        global_operation_type = get_n8n_operation_type("SAFETY_BLOCK", session_data.get('topic', ''), user_feedback, ghost_post_id)
+        
         # Send refusal back to Slack/n8n
+        target = get_output_target(global_operation_type)
         safe_n8n_delivery({
             "session_id": session_id,
-            "type": "social",
-            "message": refusal_text
+            "type": global_operation_type,
+            "message": refusal_text,
+            "query": user_feedback,
+            "output_target": target,
+            "channel_id": slack_context.get('channel') or req.get('slack_context', {}).get('channel') or req.get('slack_context', {}).get('channel_id') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'),
+            "thread_ts": slack_context.get('ts') or req.get('slack_context', {}).get('ts') or req.get('slack_context', {}).get('thread_ts')
         })
         return jsonify({"msg": "Safety refusal sent"}), 200
     
     doc_ref = db.collection('agent_sessions').document(session_id)
-    session_doc = doc_ref.get()
+    
+    # NATIVE RESCUE: Try/Except wrap the synchronous read to catch TSI_DATA_CORRUPTED
+    try:
+        session_doc = _firestore_call_with_timeout(lambda: doc_ref.get())
+    except Exception as e:
+        print(f"⚠️ FIRESTORE READ ERROR ({e}). Attempting channel resuscitation...")
+        # Forcing a fresh client instantiation specifically for this container runtime
+        db = firestore.Client(project=PROJECT_ID)
+        doc_ref = db.collection('agent_sessions').document(session_id)
+        session_doc = _firestore_call_with_timeout(lambda: doc_ref.get())
+        print("✅ Channel resuscitation successful!")
+        
     session_data = {}
     if not session_doc.exists:
         return jsonify({"error": "Session not found"}), 404
@@ -749,7 +641,19 @@ def process_feedback_logic(request):
         req_slack['ts'] = req.get('ts') or req.get('slack_ts')
 
     # LIGHT ARCHITECTURE: Context Inheritance (Dispatcher-Anchored)
-    slack_context = {**session_data.get('slack_context', {}), **req.get('slack_context', {})}
+    # Hardened merge logic: Prevent nulls in trigger 'req' from overriding valid session data.
+    session_slack = session_data.get('slack_context', {})
+    req_slack = req.get('slack_context', {})
+    slack_context = session_slack.copy()
+    for k, v in req_slack.items():
+        if v is not None:
+            slack_context[k] = v
+            
+    # CRITICAL: If the trigger itself has channel/ts, they take precedence
+    if not slack_context.get('channel'):
+        slack_context['channel'] = req.get('slack_channel') or req.get('channel') or req.get('event', {}).get('channel')
+    if not slack_context.get('ts'):
+        slack_context['ts'] = req.get('slack_ts') or req.get('ts') or req.get('event', {}).get('ts')
 
     # --- SYSTEM FILTER: Prevent Infinite Loops & Redundant Ingestion ---
     # Case: The message is a confirmation notification (e.g., from N8N/Ghost)
@@ -765,10 +669,10 @@ def process_feedback_logic(request):
     # Always check for a URL first. It's the fastest and most reliable signal.
     if extract_url_from_text(user_feedback):
         print("URL detected in feedback. Delegating to research worker immediately.")
-        doc_ref.update({
+        _firestore_call_with_timeout(lambda: doc_ref.update({
             "status": "delegating_research",
             "last_updated": expire_time
-            })
+            }))
         # FIX: Persist the feedback into the events subcollection
         doc_ref.collection('events').add({
             "event_type": "user_feedback",
@@ -797,7 +701,7 @@ def process_feedback_logic(request):
 
 
     # 2. Stream and then REVERSE the list to get chronological order (Oldest -> Newest)
-    all_raw_events = [doc.to_dict() for doc in recent_events_query.stream()]
+    all_raw_events = _firestore_call_with_timeout(lambda: [doc.to_dict() for doc in recent_events_query.stream()], timeout_secs=20)
     # CLAMPING: Only take the last 10 events (5 turns) for feedback triage
     recent_events = all_raw_events[:10][::-1] if len(all_raw_events) > 10 else all_raw_events[::-1]
     
@@ -852,14 +756,18 @@ def process_feedback_logic(request):
     
     print(f"Feedback Triage classified intent as: {intent}")
     
+    # Update global operation type based on triage result
+    ghost_post_id = session_data.get('ghost_post_id')
+    global_operation_type = get_n8n_operation_type(intent, session_data.get('topic', ''), user_feedback, ghost_post_id)
+    
     # --- 3. STATE-AWARE ROUTING LOGIC ---
     if intent == "DELEGATE":
         # This now handles all factual questions, meta-questions, and simple chat.
         print("Intent requires new research or is conversational. Delegating to story worker...")
-        doc_ref.update({
+        _firestore_call_with_timeout(lambda: doc_ref.update({
             "status": "delegating_research",
             "last_updated": expire_time
-            })
+            }))
         # FIX: Persist the feedback into the events subcollection
         doc_ref.collection('events').add({
             "event_type": "user_feedback",
@@ -885,7 +793,7 @@ def process_feedback_logic(request):
         user_event = {"event_type": "user_feedback", "text": user_feedback, "intent": "APPROVE", "timestamp": ts}
 
         # FIX: Fetch FULL history from subcollection to find the proposal
-        full_history = [doc.to_dict() for doc in events_ref.order_by('timestamp').stream()]
+        full_history = _firestore_call_with_timeout(lambda: [doc.to_dict() for doc in events_ref.order_by('timestamp').stream()], timeout_secs=20)
         # --- ROBUST ARTIFACT EXTRACTION (Avoids Old "Then-and-Now" Rants) ---
         target_content = None
         
@@ -956,20 +864,24 @@ def process_feedback_logic(request):
                 dispatch_task({"session_id": session_id, "topic": session_data.get('topic'), "story": rag_content, "type": "knowledge"}, INGEST_KNOWLEDGE_URL)
         
         # FIX: Update parent status, but write events to subcollection
-        doc_ref.update({
+        _firestore_call_with_timeout(lambda: doc_ref.update({
             "status": "completed", 
             "final_story": target_content,
             "last_updated": expire_time
-        })
+        }))
         
-        events_ref.add(user_event)
-        events_ref.add({"event_type": "final_output", "content": target_content, "timestamp": datetime.datetime.now(datetime.timezone.utc)})
+        _firestore_call_with_timeout(lambda: events_ref.add(user_event))
+        _firestore_call_with_timeout(lambda: events_ref.add({"event_type": "final_output", "content": target_content, "timestamp": datetime.datetime.now(datetime.timezone.utc)}))
         
+        target = get_output_target(global_operation_type)
         safe_n8n_delivery({
             "session_id": session_id, 
+            "type": global_operation_type,
             "proposal": [{"link": convert_html_to_markdown(target_content)}], 
-            "thread_ts": slack_context.get('ts'), 
-            "channel_id": slack_context.get('channel'), 
+            "query": user_feedback,
+            "output_target": target,
+            "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'), 
+            "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
             "is_final_story": True, 
             "is_initial_post": False 
         })
@@ -977,7 +889,7 @@ def process_feedback_logic(request):
 
     elif intent == "REFINE":
         # FIX: Fetch history from subcollection
-        full_history = [doc.to_dict() for doc in events_ref.order_by('timestamp').stream()]
+        full_history = _firestore_call_with_timeout(lambda: [doc.to_dict() for doc in events_ref.order_by('timestamp').stream()], timeout_secs=20)
         
         # --- ROBUST ARTIFACT EXTRACTION (Same as APPROVE path) ---
         last_prop_data = None
@@ -1013,18 +925,22 @@ def process_feedback_logic(request):
         
         # FIX: Write to subcollection
         ts = datetime.datetime.now(datetime.timezone.utc)
-        events_ref.add({"event_type": "user_feedback", "text": user_feedback, "intent": "REFINE", "timestamp": ts})
-        events_ref.add({"event_type": "agent_proposal", "proposal_data": new_prop, "timestamp": ts})
-        events_ref.add({"event_type": "adk_request_confirmation", "approval_id": new_id, "payload": new_prop['interlinked_concepts'], "timestamp": ts})
+        _firestore_call_with_timeout(lambda: events_ref.add({"event_type": "user_feedback", "text": user_feedback, "intent": "REFINE", "timestamp": ts}))
+        _firestore_call_with_timeout(lambda: events_ref.add({"event_type": "agent_proposal", "proposal_data": new_prop, "timestamp": ts}))
+        _firestore_call_with_timeout(lambda: events_ref.add({"event_type": "adk_request_confirmation", "approval_id": new_id, "payload": new_prop['interlinked_concepts'], "timestamp": ts}))
         
-        doc_ref.update({"last_updated": expire_time})
+        _firestore_call_with_timeout(lambda: doc_ref.update({"last_updated": expire_time}))
         
+        target = get_output_target(global_operation_type)
         safe_n8n_delivery({
             "session_id": session_id, 
+            "type": global_operation_type,
             "approval_id": new_id, 
             "proposal": [convert_html_to_markdown(c) if isinstance(c, str) else c for c in new_prop['interlinked_concepts']], 
-            "thread_ts": slack_context.get('ts'), 
-            "channel_id": slack_context.get('channel'),
+            "query": user_feedback,
+            "output_target": target,
+            "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'), 
+            "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'),
             "is_final_story": False,
             "is_initial_post": False
         })

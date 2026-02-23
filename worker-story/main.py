@@ -5,6 +5,17 @@ from flask import jsonify
 import vertexai
 import litellm
 from litellm import completion
+
+import sys
+import os
+from shared.utils import (
+    get_secret, 
+    _firestore_call_with_timeout, 
+    safe_n8n_delivery, 
+    UnifiedModel,
+    get_n8n_operation_type,
+    get_output_target
+)
 from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
 import google.cloud.logging
 import logging
@@ -29,38 +40,19 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # --- Logging Setup ---
-try:
-    logging_v_client = google.cloud.logging.Client()
-    logging_v_client.setup_logging()
-except Exception:
-    logging_v_client = None # Fallback to standard logging if local
+logging_v_client = None
+def get_logging_client():
+    global logging_v_client
+    if logging_v_client is None:
+        try:
+            logging_v_client = google.cloud.logging.Client()
+            logging_v_client.setup_logging()
+        except Exception:
+            pass # Fallback to standard logging
+    return logging_v_client
 
 # --- SECRET MANAGER ---
 secret_client = None
-def get_secret(secret_id):
-    """
-    Retrieves a secret from Google Cloud Secret Manager.
-    Includes an environment variable fallback for local development or manual overrides.
-    """
-    global secret_client
-    
-    # 1. Check environment variables first (High Speed / Local Dev)
-    env_key = secret_id.upper().replace("-", "_")
-    env_val = os.environ.get(env_key)
-    if env_val:
-        return env_val.strip()
-        
-    # 2. Fallback to Secret Manager
-    try:
-        if secret_client is None:
-            secret_client = secretmanager.SecretManagerServiceClient()
-        
-        name = f"projects/{PROJECT_ID}/secrets/{secret_id}/versions/latest"
-        response = secret_client.access_secret_version(request={"name": name})
-        return response.payload.data.decode("UTF-8").strip()
-    except Exception as e:
-        print(f"⚠️ Secret Manager error for {secret_id}: {e}")
-        return None
 
 # --- Configuration ---
 PROJECT_ID = os.environ.get("PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT")
@@ -79,14 +71,19 @@ RESEARCH_MODEL_NAME = os.environ.get("RESEARCH_MODEL_NAME", "gemini-2.5-flash-li
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL") 
-INGESTION_API_KEY = os.environ.get("INGESTION_API_KEY")
-if not INGESTION_API_KEY:
-    INGESTION_API_KEY = get_secret("ingestion-api-key")
+INGESTION_API_KEY = None
+def get_ingestion_api_key():
+    global INGESTION_API_KEY
+    if not INGESTION_API_KEY:
+        INGESTION_API_KEY = os.environ.get("INGESTION_API_KEY") or get_secret("ingestion-api-key")
+    return INGESTION_API_KEY
 
-
-KNOWLEDGE_INGESTION_API_KEY = os.environ.get("KNOWLEDGE_INGESTION_API_KEY")
-if not KNOWLEDGE_INGESTION_API_KEY:
-    KNOWLEDGE_INGESTION_API_KEY = get_secret("knowledge-ingestion-api-key")
+KNOWLEDGE_INGESTION_API_KEY = None
+def get_knowledge_ingestion_key():
+    global KNOWLEDGE_INGESTION_API_KEY
+    if not KNOWLEDGE_INGESTION_API_KEY:
+        KNOWLEDGE_INGESTION_API_KEY = os.environ.get("KNOWLEDGE_INGESTION_API_KEY") or get_secret("knowledge-ingestion-api-key")
+    return KNOWLEDGE_INGESTION_API_KEY
 
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")  # Explicit fallback for code analysis
 MAX_LOOP_ITERATIONS = 2
@@ -104,50 +101,6 @@ safety_settings = {
 }
 
 # --- HELPER: Safe n8n Webhook Delivery ---
-def safe_n8n_delivery(payload, timeout=45):
-    """
-    Robust delivery to n8n with retries and SSL resilience.
-    Uses 'requests' with an HTTPAdapter for exponential backoff on transient errors.
-    """
-    if not N8N_PROPOSAL_WEBHOOK_URL:
-        print("⚠️ safe_n8n_delivery: No webhook URL configured.")
-        return False
-
-    session = requests.Session()
-    # Retry on specific status codes and connection errors
-    # backoff_factor 2 means waits 2, 4, 8 seconds
-    retries = Retry(
-        total=3, 
-        backoff_factor=2, 
-        status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["POST"]
-    )
-    session.mount('https://', HTTPAdapter(max_retries=retries))
-    
-    try:
-        print(f"DEBUG: Attempting safe_n8n_delivery [Session: {payload.get('session_id')}]")
-        response = session.post(
-            N8N_PROPOSAL_WEBHOOK_URL, 
-            json=payload, 
-            verify=certifi.where(), 
-            timeout=timeout
-        )
-        response.raise_for_status()
-        print(f"✅ safe_n8n_delivery: Success (200 OK)")
-        return True
-    except requests.exceptions.SSLError as e:
-        print(f"❌ safe_n8n_delivery: SSL Handshake Failed: {e}")
-        # Final emergency attempt without strict session pooling
-        try:
-            time.sleep(2)
-            requests.post(N8N_PROPOSAL_WEBHOOK_URL, json=payload, verify=certifi.where(), timeout=timeout)
-            return True
-        except Exception as inner_e:
-            print(f"❌ safe_n8n_delivery: Emergency fallback also failed: {inner_e}")
-            return False
-    except Exception as e:
-        print(f"⚠️ safe_n8n_delivery: Payload delivery failed: {e}")
-        return False
 
 
 # --- Global Clients ---
@@ -464,135 +417,6 @@ def sanitize_llm_html(raw_html):
     return sanitized
 
 # --- UNIFIED MODEL ADAPTER (The Brain Switch) ---
-class UnifiedModel:
-    """
-    Routes requests to Vertex AI, OpenAI, or Anthropic based on configuration.
-    """
-    def __init__(self, provider, model_name):
-        self.provider = provider
-        self.model_name = model_name
-        
-        # Native Vertex Initialization (Only if using Google)
-        if provider == "vertex_ai":
-            vertexai.init(project=PROJECT_ID, location=LOCATION)
-            self._native_model = GenerativeModel(model_name, safety_settings=safety_settings)
-            print(f"✅ Loaded Native Vertex Model: {model_name} (Safety Active)", flush=True)
-
-    def generate_content(self, prompt, generation_config=None, max_retries=3, system_instruction=None):
-        """
-        Universal generation function with safety catching and Exponential Backoff.
-        Supports 'system_instruction' to align with ADK architectural best practices.
-        """
-        import time
-        import random
-        
-        # PATH A: Native Vertex AI
-        if self.provider == "vertex_ai":
-            retries = 0
-            while retries <= max_retries:
-                try:
-                    # Ensure max_output_tokens is set for Vertex AI
-                    if generation_config is None: generation_config = {}
-                    if "max_output_tokens" not in generation_config: generation_config["max_output_tokens"] = 8192
-                    
-                    # ARCHITECTURAL FIX: Use system_instruction if provided
-                    # Note: We create a temporary model instance to apply system_instruction
-                    # this is lightweight and avoids state pollution on the primary instance.
-                    model = GenerativeModel(
-                        self.model_name, 
-                        safety_settings=safety_settings,
-                        system_instruction=system_instruction
-                    )
-                    response = model.generate_content(prompt, generation_config=generation_config)
-                    
-                    # Robust Safety Check: Some SDK versions throw exceptions, others return empty candidates
-                    if not response.candidates or response.candidates[0].finish_reason == 3: # 3 = SAFETY
-                         raise ValueError("Safety Block via FinishReason")
-                    
-                    return response
-                except Exception as e:
-                    error_msg = str(e).lower()
-                    # Check for Rate Limit / Quota errors (429)
-                    if "429" in error_msg or "resource exhausted" in error_msg:
-                        if retries < max_retries:
-                            wait_time = (2 ** retries) + random.uniform(0, 1)
-                            print(f"⚠️ Vertex 429 (Quota): Retrying in {wait_time:.2f}s... (Attempt {retries+1}/{max_retries})")
-                            time.sleep(wait_time)
-                            retries += 1
-                            continue
-                    
-                    # If it's a safety block or we've exhausted retries, log and return fallback
-                print(f"⚠️ Vertex AI Safety/SDK Error: {e}. Attempting Specialist Failover to Claude 4.5...")
-                
-                # ADK FIX: Automatic Failover to Specialist Model (Claude 4.5)
-                failover_model = UnifiedModel(provider="anthropic", model_name="claude-sonnet-4-5")
-                return failover_model.generate_content(prompt, system_instruction=system_instruction, generation_config=generation_config)
-
-        # PATH B: Universal Route (OpenAI / Anthropic via LiteLLM)
-        else:
-            print(f"🔄 Switching to {self.model_name} via LiteLLM ({self.provider})...", flush=True)
-            
-            # Inject Keys for LiteLLM
-            if self.provider == "anthropic" and ANTHROPIC_API_KEY:
-                os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
-            elif self.provider == "openai" and OPENAI_API_KEY:
-                os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
-            
-            # Normalize Parameters
-            temp = generation_config.get('temperature', 0.7) if generation_config else 0.7
-            
-            try:
-                # ADK FIX: Inject Beta Header for 8k Output (Required for 20240620)
-                extra_headers = {}
-                if "claude-sonnet-4-5" in self.model_name or "claude-3-5-sonnet" in self.model_name:
-                    extra_headers = {"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"}
-
-                # LiteLLM Call: Map system_instruction to 'system' role
-                messages = []
-                if system_instruction:
-                    messages.append({"role": "system", "content": str(system_instruction)})
-                messages.append({"role": "user", "content": prompt})
-
-                response = completion(
-                    model=self.model_name, 
-                    messages=messages,
-                    temperature=temp,
-                    max_tokens=8192,
-                    extra_headers=extra_headers
-                )
-                
-                # Create a Mock Response Object to mimic Vertex AI's SDK
-                class MockResponse:
-                    def __init__(self, content):
-                        self.text = content
-                
-                content = response.choices[0].message.content
-                if not content:
-                    print(f"⚠️ LiteLLM Warning: Received EMPTY content from {self.model_name}")
-                    content = "The model was unable to generate a response."
-                
-                return MockResponse(content)
-                
-            except Exception as e:
-                print(f"❌ LiteLLM Error: {e}", flush=True)
-                class MockResponse:
-                    def __init__(self, content): self.text = content
-                return MockResponse("Error generating content.")
-
-    def analyze_citation(self, prompt_text, scrape_content):
-        """Calls the Sensory Tracker service to audit citations."""
-        try:
-            url = f"{TRACKER_SERVER_URL.rstrip('/')}/analyze"
-            response = requests.post(url, json={
-                "prompt": prompt_text,
-                "content": scrape_content
-            }, timeout=30, verify=certifi.where())
-            if response.status_code == 200:
-                return response.json()
-            return {"cited": False, "error": f"Tracker status {response.status_code}"}
-        except Exception as e:
-            print(f"⚠️ Sensory Tracker Error: {e}")
-            return {"cited": False, "error": str(e)}
 
 
 # --- Safety Utils ---
@@ -1756,15 +1580,6 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
 
     return { "context": context_snippets, "tool_logs": tool_logs, "research_intent": research_intent_raw, "detected_geo": detected_geo }
 
-
-def get_output_target(intent: str) -> str:
-    """
-    Centralized mapping logic for target-aware formatting.
-    """
-    intent = intent.upper().strip()
-    if intent in ["PSEO_ARTICLE", "PSEO_PAGE"]:
-        return "CMS_DRAFT"
-    return "MODERATOR_VIEW"
 
 # #11. The Topic Cluster Generator
 def generate_topic_cluster(topic, context, history="", is_initial=True, session_id=None):
@@ -3047,6 +2862,15 @@ def process_sales_transcript(transcript_text, output_target="MODERATOR_VIEW"):
 # --- THE STATEFUL MAIN WORKER FUNCTION (FINAL V6 - SOCIAL AWARE) ---
 @functions_framework.http
 def process_story_logic(request):
+    try:
+        return _process_story_logic_inner(request)
+    except Exception as e:
+        print(f"❌ FATAL ERROR CAUGHT AT TOP LEVEL: {e}")
+        from flask import jsonify
+        return jsonify({"error": "Fatal process error", "details": str(e)}), 200
+
+@functions_framework.http
+def _process_story_logic_inner(request):
     global unimodel, flash_model, research_model, specialist_model, db, mcp_client
 
     # 0. ENTRY TELEMETRY (Observability)
@@ -3056,6 +2880,8 @@ def process_story_logic(request):
     # 0.5 CORE SERVICES (Pre-flight init)
     if any(m is None for m in [unimodel, flash_model, research_model, specialist_model]):
         vertexai.init(project=PROJECT_ID, location=LOCATION)
+    # Vertex AI gRPC Mitigations (Pool Reset)
+    vertexai.init(project=PROJECT_ID, location=LOCATION)
 
     if unimodel is None:
         unimodel = UnifiedModel(MODEL_PROVIDER, MODEL_NAME)
@@ -3106,7 +2932,18 @@ def process_story_logic(request):
     if unique_event_id:
         # Check if we've already seen this event ID in the last 30 minutes
         dedup_ref = db.collection('processed_events').document(str(unique_event_id))
-        doc = dedup_ref.get()
+        
+        # NATIVE RESCUE: Try/Except wrap the synchronous read to catch TSI_DATA_CORRUPTED
+        try:
+            doc = _firestore_call_with_timeout(lambda: dedup_ref.get())
+        except Exception as e:
+            print(f"⚠️ FIRESTORE READ ERROR ({e}). Attempting channel resuscitation...")
+            # Forcing a fresh client instantiation specifically for this container runtime
+            db = firestore.Client(project=PROJECT_ID)
+            dedup_ref = db.collection('processed_events').document(str(unique_event_id))
+            doc = _firestore_call_with_timeout(lambda: dedup_ref.get())
+            print("✅ Channel resuscitation successful!")
+            
         if doc.exists:
             # Check timestamp to allow re-runs after 5 minutes
             data = doc.to_dict()
@@ -3124,11 +2961,11 @@ def process_story_logic(request):
         
         # Mark as pending immediately
         try:
-            dedup_ref.set({
+            _firestore_call_with_timeout(lambda: dedup_ref.set({
                 'timestamp': datetime.datetime.now(datetime.timezone.utc),
                 'status': 'processing',
                 'session_id': req.get('session_id')
-            })
+            }))
         except Exception as e:
             print(f"⚠️ Warning: Failed to set idempotency lock: {e}")
             
@@ -3148,14 +2985,36 @@ def process_story_logic(request):
     
     # --- STEP 2: LOAD SHORT-TERM MEMORY ---
     doc_ref = db.collection('agent_sessions').document(session_id)
-    session_doc = doc_ref.get()
+    
+    # NATIVE RESCUE: Try/Except wrap the synchronous read to catch TSI_DATA_CORRUPTED
+    try:
+        session_doc = _firestore_call_with_timeout(lambda: doc_ref.get())
+    except Exception as e:
+        print(f"⚠️ FIRESTORE READ ERROR ({e}). Attempting channel resuscitation...")
+        # Forcing a fresh client instantiation specifically for this container runtime
+        db = firestore.Client(project=PROJECT_ID)
+        doc_ref = db.collection('agent_sessions').document(session_id)
+        session_doc = _firestore_call_with_timeout(lambda: doc_ref.get())
+        print("✅ Channel resuscitation successful!")
     
     session_data = {}
     if session_doc.exists:
         session_data = session_doc.to_dict()
         
     # LIGHT ARCHITECTURE: Context Inheritance (Dispatcher-Anchored)
-    slack_context = {**session_data.get('slack_context', {}), **req.get('slack_context', {})}
+    # Hardened merge logic: Prevent nulls in trigger 'req' from overriding valid session data.
+    session_slack = session_data.get('slack_context', {})
+    req_slack = req.get('slack_context', {})
+    slack_context = session_slack.copy()
+    for k, v in req_slack.items():
+        if v is not None:
+            slack_context[k] = v
+            
+    # CRITICAL: If the trigger itself has channel/ts, they take precedence
+    if not slack_context.get('channel'):
+        slack_context['channel'] = req.get('slack_channel') or req.get('channel') or req.get('event', {}).get('channel')
+    if not slack_context.get('ts'):
+        slack_context['ts'] = req.get('slack_ts') or req.get('ts') or req.get('event', {}).get('ts')
 
     # --- ANCHOR SESSION (Early Initialization) ---
     # We commit the root document immediately to prevent "headless" sessions 
@@ -3175,7 +3034,7 @@ def process_story_logic(request):
         
         # CLAMPING: Limit history to last 15 turns to prevent context bloat
         # 30 matches (15 turns of User/Agent pairs)
-        all_events = [doc.to_dict() for doc in query.stream()]
+        all_events = _firestore_call_with_timeout(lambda: [doc.to_dict() for doc in query.stream()], timeout_secs=20)
         history_events = all_events[-30:] if len(all_events) > 30 else all_events
 
 
@@ -3411,6 +3270,10 @@ def process_story_logic(request):
 
         expire_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
         
+        # Determine global operation type for all N8N payloads
+        ghost_post_id = session_data.get('ghost_post_id') if isinstance(session_data, dict) else None
+        global_operation_type = get_n8n_operation_type(intent, original_topic, sanitized_topic, ghost_post_id)
+        
         # --- STEP 4: ROUTING & EXECUTION ---
 
         # === PATH A: SOCIAL (Fast Exit) ===
@@ -3438,19 +3301,22 @@ def process_story_logic(request):
             # 1. Write Events
             for event in new_events:
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                events_ref.add(event)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
 
             # 2. Update Parent Metadata (Preserving Context)
-            session_ref.update({
+            _firestore_call_with_timeout(lambda: session_ref.update({
                 "status": "completed",
                 "type": "social",
                 "last_updated": expire_time
-            })
+            }))
+            target = get_output_target(intent)
             safe_n8n_delivery({
                 "session_id": session_id, 
-                "type": "social", 
-                "message": reply_text, 
-                "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
+                "type": global_operation_type, 
+                "message": reply_text,
+                "query": sanitized_topic,
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or slack_context.get('channel_id') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
                 "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'), 
                 "is_initial_post": is_initial_post
             })
@@ -3479,21 +3345,23 @@ def process_story_logic(request):
                 events_ref = session_ref.collection('events')
                 for event in new_events:
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                    events_ref.add(event)
+                    _firestore_call_with_timeout(lambda: events_ref.add(event))
 
-                session_ref.update({
+                _firestore_call_with_timeout(lambda: session_ref.update({
                     "status": "completed",
                     "type": "operational_answer",
                     "last_updated": expire_time
-                })
+                }))
                 
                 safe_n8n_delivery({
                     "session_id": session_id, 
-                    "type": "social", 
+                    "type": global_operation_type, 
                     "message": answer_text, 
+                    "query": sanitized_topic,
                     "intent": "OPERATIONAL_REFORMAT",
-                    "channel_id": slack_context.get('channel') or slack_context.get('channel_id'), 
-                    "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'),
+                    "output_target": target,
+                    "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
+                    "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                     "is_initial_post": is_initial_post
                 })
                 return jsonify({"msg": "Operational reformat sent"}), 200
@@ -3518,20 +3386,22 @@ def process_story_logic(request):
             events_ref = session_ref.collection('events')
             for event in new_events:
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                events_ref.add(event)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
 
-            session_ref.update({
+            _firestore_call_with_timeout(lambda: session_ref.update({
                 "status": "completed",
                 "type": "work_answer",
                 "last_updated": expire_time
-            })
+            }))
             
             safe_n8n_delivery({
                 "session_id": session_id, 
-                "type": "social", 
+                "type": global_operation_type, 
                 "message": answer_text, 
+                "query": sanitized_topic,
                 "intent": "BLOG_OUTLINE",
-                "channel_id": slack_context.get('channel'), 
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
                 "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })
@@ -3563,22 +3433,24 @@ def process_story_logic(request):
             events_ref = session_ref.collection('events')
             for event in new_events:
                 if 'timestamp' not in event: event['timestamp'] = ts
-                events_ref.add(event)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
 
             # Update session status
-            session_ref.update({
+            _firestore_call_with_timeout(lambda: session_ref.update({
                 "status": "awaiting_feedback",
                 "type": "solution_brief",
                 "last_updated": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
-            })
+            }))
 
             # Send to N8N for distribution
             safe_n8n_delivery({
                 "session_id": session_id,
-                "type": "social", # Changed from solution_brief to social for Slack visibility
+                "type": global_operation_type,
+                "query": sanitized_topic,
                 "objections": result['objections'],
                 "brief": result['brief'],
-                "channel_id": slack_context.get('channel'),
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'),
                 "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })
@@ -3719,20 +3591,23 @@ def process_story_logic(request):
             events_ref = session_ref.collection('events')
             for event in new_events:
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                events_ref.add(event)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
 
-            session_ref.update({
+            _firestore_call_with_timeout(lambda: session_ref.update({
                 "status": "blocked",
                 "type": "safety_violation",
                 "detected_geo": final_geo,
                 "intent": final_intent_key,
                 "last_updated": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
-            })
+            }))
+            target = get_output_target(intent)
             safe_n8n_delivery({
                 "session_id": session_id, 
-                "type": "social", 
+                "type": global_operation_type, 
                 "message": reply_text, 
-                "channel_id": slack_context.get('channel'), 
+                "query": sanitized_topic,
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
                 "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts')
             })
             return jsonify({"msg": "Safety block applied"}), 200
@@ -3765,7 +3640,7 @@ def process_story_logic(request):
 
             for event in new_events:
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                events_ref.add(event)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
 
             update_data = {
                 "status": "awaiting_feedback", 
@@ -3776,14 +3651,16 @@ def process_story_logic(request):
                 "last_updated": expire_time
             }
             if is_initial_post: update_data["topic"] = clean_topic
-            session_ref.update(update_data)
+            _firestore_call_with_timeout(lambda: session_ref.update(update_data))
 
             safe_n8n_delivery({
                 "session_id": session_id, 
-                "type": "social", 
+                "type": global_operation_type, 
                 "message": convert_html_to_markdown(answer_text), 
+                "query": sanitized_topic,
                 "intent": research_intent,
-                "channel_id": slack_context.get('channel'), 
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
                 "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })
@@ -3804,7 +3681,7 @@ def process_story_logic(request):
             events_ref = session_ref.collection('events')
             for event in new_events:
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                events_ref.add(event)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
 
             update_data = {
                 "status": "awaiting_feedback", 
@@ -3815,15 +3692,17 @@ def process_story_logic(request):
                 "last_updated": expire_time
             }
             if is_initial_post: update_data["topic"] = clean_topic
-            session_ref.update(update_data)
+            _firestore_call_with_timeout(lambda: session_ref.update(update_data))
 
             safe_n8n_delivery({
                 "session_id": session_id, 
-                "type": "social", 
+                "type": global_operation_type, 
                 "message": convert_html_to_markdown(answer_text), 
+                "query": sanitized_topic,
                 "intent": research_intent,
                 "directive": formatting_directive,
-                "channel_id": slack_context.get('channel'), 
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
                 "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })
@@ -3852,7 +3731,7 @@ def process_story_logic(request):
             events_ref = session_ref.collection('events')
             for event in new_events:
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                events_ref.add(event)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
 
             update_data = {
                 "status": "awaiting_feedback", 
@@ -3862,13 +3741,15 @@ def process_story_logic(request):
                 "intent": "DEEP_DIVE",
                 "last_updated": expire_time
             }
-            session_ref.update(update_data)
+            _firestore_call_with_timeout(lambda: session_ref.update(update_data))
 
             safe_n8n_delivery({
                 "session_id": session_id, 
-                "type": "social", 
+                "type": global_operation_type, 
                 "message": convert_html_to_markdown(article_html), 
-                "channel_id": slack_context.get('channel'), 
+                "query": sanitized_topic,
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
                 "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })
@@ -3890,7 +3771,7 @@ def process_story_logic(request):
                 events_ref = session_ref.collection('events')
                 for event in new_events:
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                    events_ref.add(event)
+                    _firestore_call_with_timeout(lambda: events_ref.add(event))
 
                 update_data = {
                     "status": "awaiting_feedback", 
@@ -3901,13 +3782,13 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.update(update_data)
+                _firestore_call_with_timeout(lambda: session_ref.update(update_data))
                 
                 # Align with N8N Parser: Wrap JSON in markdown for regex extraction
                 cluster_msg = f"```json\n{json.dumps(cluster_data, indent=2)}\n```"
                 safe_n8n_delivery({
                     "session_id": session_id, 
-                    "type": "answer", 
+                    "type": global_operation_type, 
                     "message": cluster_msg,
                     "intent": "TOPIC_CLUSTER_PROPOSAL",
                     "channel_id": slack_context.get('channel'), 
@@ -3929,7 +3810,7 @@ def process_story_logic(request):
                 events_ref = session_ref.collection('events')
                 for event in new_events:
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                    events_ref.add(event)
+                    _firestore_call_with_timeout(lambda: events_ref.add(event))
 
                 update_data = {
                     "status": "awaiting_feedback", 
@@ -3940,8 +3821,8 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.update(update_data)
-                safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
+                _firestore_call_with_timeout(lambda: session_ref.update(update_data))
+                safe_n8n_delivery({"session_id": session_id, "type": global_operation_type, "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
                 return jsonify({"msg": "Cluster Fallback Answer sent"}), 200
         elif intent == "THEN_VS_NOW_PROPOSAL":
             try:
@@ -3973,7 +3854,7 @@ def process_story_logic(request):
                 events_ref = session_ref.collection('events')
                 for event in new_events:
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                    events_ref.add(event)
+                    _firestore_call_with_timeout(lambda: events_ref.add(event))
 
                 update_data = {
                     "status": "awaiting_feedback", 
@@ -3984,7 +3865,7 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.update(update_data)
+                _firestore_call_with_timeout(lambda: session_ref.update(update_data))
 
                 safe_n8n_delivery({
                     "session_id": session_id, 
@@ -4011,7 +3892,7 @@ def process_story_logic(request):
 
                 for event in new_events:
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                    events_ref.add(event)
+                    _firestore_call_with_timeout(lambda: events_ref.add(event))
 
                 update_data = {
                     "status": "awaiting_feedback", 
@@ -4022,8 +3903,8 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.update(update_data)
-                safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
+                _firestore_call_with_timeout(lambda: session_ref.update(update_data))
+                safe_n8n_delivery({"session_id": session_id, "type": global_operation_type, "message": answer_text, "intent": research_intent, "channel_id": slack_context['channel'], "thread_ts": slack_context['ts'], "is_initial_post": is_initial_post})
                 return jsonify({"msg": "Fallback answer sent"}), 200
 
         # === PATH C: PSEO ARTICLE GENERATION (Dual-Agent Path) ===
@@ -4052,11 +3933,6 @@ def process_story_logic(request):
                 
                 # 5. Determine operation type (ADK Interoperability: Support Pages of Posts)
                 is_page_target = (intent == "PSEO_PAGE") or any(kw in original_topic.lower() or kw in sanitized_topic.lower() for kw in ["pseo page", "collection page", "page template", "ghost page", "page slug"])
-                
-                if is_page_target:
-                    operation_type = "pseo_page_update" if ghost_post_id else "pseo_page_create"
-                else:
-                    operation_type = "pseo_update" if ghost_post_id else "pseo_draft"
                 
                 # 6. Build Payload (Schema-Aware for Ghost or Next.js)
                 delivery_payload = {
@@ -4113,7 +3989,7 @@ def process_story_logic(request):
                 events_ref = session_ref.collection('events')
                 for event in new_events:
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                    events_ref.add(event)
+                    _firestore_call_with_timeout(lambda: events_ref.add(event))
 
                 update_data = {
                     "status": "awaiting_feedback", 
@@ -4124,14 +4000,16 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.update(update_data)
+                _firestore_call_with_timeout(lambda: session_ref.update(update_data))
                 
                 # 9. Send STRUCTURED DATA to N8N (Restored Wrapper for GhostNode Harmony)
                 safe_n8n_delivery({
                     "session_id": session_id, 
-                    "type": operation_type,  # "pseo_draft", "pseo_update", "pseo_page_create", or "pseo_page_update"
+                    "type": global_operation_type,
                     "payload": delivery_payload,
-                    "channel_id": slack_context.get('channel'), 
+                    "query": sanitized_topic,
+                    "output_target": target,
+                    "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
                     "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                     "is_initial_post": is_initial_post
                 })
@@ -4157,7 +4035,7 @@ def process_story_logic(request):
                 events_ref = session_ref.collection('events')
                 for event in new_events:
                     if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                    events_ref.add(event)
+                    _firestore_call_with_timeout(lambda: events_ref.add(event))
 
                 update_data = {
                     "status": "awaiting_feedback", 
@@ -4168,22 +4046,34 @@ def process_story_logic(request):
                     "last_updated": expire_time
                 }
                 if is_initial_post: update_data["topic"] = clean_topic
-                session_ref.update(update_data)
+                _firestore_call_with_timeout(lambda: session_ref.update(update_data))
                 if intent == "PSEO_ARTICLE":
                     safe_n8n_delivery({
                         "session_id": session_id, 
-                        "type": "pseo_draft", 
+                        "type": global_operation_type, 
+                        "query": sanitized_topic,
                         "payload": {
                             "title": clean_topic,
                             "html": answer_text,
                             "status": "draft_fallback"
                         },
-                        "channel_id": slack_context.get('channel'), 
+                        "output_target": target,
+                        "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
                         "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                         "is_initial_post": is_initial_post
                     })
                 else:
-                    safe_n8n_delivery({"session_id": session_id, "type": "social", "message": answer_text, "intent": research_intent, "channel_id": slack_context.get('channel'), "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'), "is_initial_post": is_initial_post})
+                    safe_n8n_delivery({
+                        "session_id": session_id, 
+                        "type": global_operation_type, 
+                        "message": answer_text, 
+                        "query": sanitized_topic,
+                        "intent": research_intent, 
+                        "output_target": target,
+                        "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
+                        "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'), 
+                        "is_initial_post": is_initial_post
+                    })
                 return jsonify({"msg": "pSEO Fallback Answer sent"}), 200
 
 
@@ -4202,7 +4092,7 @@ def process_story_logic(request):
             events_ref = session_ref.collection('events')
             for event in new_events:
                 if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
-                events_ref.add(event)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
 
             update_data = {
                 "status": "awaiting_feedback", 
@@ -4213,15 +4103,17 @@ def process_story_logic(request):
                 "last_updated": expire_time
             }
             if is_initial_post: update_data["topic"] = clean_topic
-            session_ref.update(update_data)
+            _firestore_call_with_timeout(lambda: session_ref.update(update_data))
 
             safe_n8n_delivery({
                 "session_id": session_id, 
-                "type": "social", 
+                "type": global_operation_type, 
                 "message": answer_text, 
                 "intent": research_intent,
                 "directive": formatting_directive,
-                "channel_id": slack_context.get('channel'), 
+                "query": sanitized_topic,
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or slack_context.get('channel_id') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
                 "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             })

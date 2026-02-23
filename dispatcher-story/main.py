@@ -55,9 +55,9 @@ def start_story_workflow(request):
     images = request_json.get('images', [])
     # NORMALIZE: Ensure Slack Context is passed
     slack_context = { 
-        "ts": request_json.get('slack_ts') or request_json.get('ts'), 
-        "thread_ts": request_json.get('slack_thread_ts') or request_json.get('thread_ts'), 
-        "channel": request_json.get('slack_channel') or request_json.get('channel')
+        "ts": request_json.get('slack_ts') or request_json.get('ts') or request_json.get('event', {}).get('ts'), 
+        "thread_ts": request_json.get('slack_thread_ts') or request_json.get('thread_ts') or request_json.get('event', {}).get('thread_ts'), 
+        "channel": request_json.get('slack_channel') or request_json.get('channel') or request_json.get('event', {}).get('channel')
     }
 
     if not text_input and not images: 
