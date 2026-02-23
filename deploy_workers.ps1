@@ -16,14 +16,16 @@ Write-Host "[1/4] Syncing shared utility modules into worker directories..."
 Write-Host "Cleaning existing shared directories in workers..."
 if (Test-Path ".\worker-story\shared") { Remove-Item ".\worker-story\shared" -Recurse -Force }
 if (Test-Path ".\worker-feedback\shared") { Remove-Item ".\worker-feedback\shared" -Recurse -Force }
+if (Test-Path ".\worker-tracker\shared") { Remove-Item ".\worker-tracker\shared" -Recurse -Force }
 
 Write-Host "Copying fresh shared libraries..."
 Copy-Item -Path ".\shared" -Destination ".\worker-story" -Recurse -Force
 Copy-Item -Path ".\shared" -Destination ".\worker-feedback" -Recurse -Force
+Copy-Item -Path ".\shared" -Destination ".\worker-tracker" -Recurse -Force
 
 Write-Host "✅ Modules synchronized."
 Write-Host ""
-Write-Host "[2/4] Deploying worker-feedback (Dockerized via Cloud Run)..."
+Write-Host "[2/6] Deploying worker-feedback (Dockerized via Cloud Run)..."
 
 Set-Location .\worker-feedback
 try {
@@ -38,7 +40,7 @@ finally {
 }
 
 Write-Host ""
-Write-Host "[3/4] Deploying worker-story (Dockerized via Cloud Run)..."
+Write-Host "[3/6] Deploying worker-story (Dockerized via Cloud Run)..."
 
 Set-Location .\worker-story
 try {
@@ -52,7 +54,21 @@ finally {
 }
 
 Write-Host ""
-Write-Host "[4/4] Deploying mcp-sensory-server (Dockerized via Cloud Run)..."
+Write-Host "[4/6] Deploying worker-tracker (Dockerized via Cloud Run)..."
+
+Set-Location .\worker-tracker
+try {
+    $region = $env:LOCATION
+    if (-not $region) { $region = "us-central1" }
+    
+    gcloud run deploy process-tracker-logic --source . --region=$region --clear-base-image
+}
+finally {
+    Set-Location ..
+}
+
+Write-Host ""
+Write-Host "[5/6] Deploying mcp-sensory-server (Dockerized via Cloud Run)..."
 
 Set-Location .\mcp-server
 try {
@@ -66,7 +82,7 @@ finally {
 }
 
 Write-Host ""
-Write-Host "[5/5] Deploying dispatchers (Dockerized via Cloud Run)..."
+Write-Host "[6/6] Deploying dispatchers (Dockerized via Cloud Run)..."
 
 Set-Location .\dispatcher-story
 try {
@@ -93,4 +109,4 @@ finally {
 }
 
 Write-Host ""
-Write-Host "✅ Deployment Pipeline Complete! All 5 services have been Dockerized to completely bypass Serverless gRPC bugs."
+Write-Host "✅ Deployment Pipeline Complete! All 6 services have been Dockerized to completely bypass Serverless gRPC bugs."
