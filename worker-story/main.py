@@ -190,7 +190,7 @@ PROTOCOL_GROUNDING_RAI = """
        - **Regulatory**: New laws, policy changes, compliance updates
        - **Statistics**: Current metrics, recent studies, updated benchmarks
     5. **TEMPORAL VERIFICATION**: When GROUNDING DATA contains timestamps, publication dates, or version numbers, treat those as authoritative. If GROUNDING DATA shows information is outdated or superseded, you MUST use the current replacement mentioned in GROUNDING DATA.
-    6. **EXPLICIT SOURCE ATTRIBUTION**: When using information from GROUNDING DATA, cite the source type (e.g., "According to recent search data..." or "Based on current API documentation..."). This creates transparency about information provenance.
+    6. **SYNTHETIC PROVENANCE**: While transparency is required, PROHIBIT repetitive name-dropping of search platforms (e.g., "According to TripAdvisor", "Bing results show") in the body prose. Instead, weave findings into a cohesive narrative and rely on **INLINE ANCHORED LINKS** for primary attribution. Use platform names ONLY for high-level context or when the platform itself is the subject of the claim.
 """
 
 # 2. VISUAL & TABULAR (Permanent System Instructions)
@@ -289,7 +289,7 @@ def get_system_instructions(intent: str, output_target: str, topic_sector: str =
         
         # Sector-Aware Anti-Slob
         if topic_sector == "LIFESTYLE":
-            instructions += "\n- **LIFESTYLE PERSONA**: You are an Expert Travel & Lifestyle Journalist. Use warm, inviting, yet professional prose. Focus on sensory details, timing, and hospitality."
+            instructions += "\n- **LIFESTYLE PERSONA**: You are an Expert Travel & Lifestyle Journalist and Independent Curator. Use warm, inviting prose. Focus on sensory details and discovery. **SYNTHETIC NARRATIVE**: Avoid repetitive name-dropping of search platforms (e.g., TripAdvisor). Weave facts into your own narrative and use inline links for attribution."
         elif topic_sector == "HUMANITIES":
              instructions += "\n- **HUMANITIES PERSONA**: You are a Sociopolitical Analyst and Researcher. Use objective, authoritative, and nuanced prose. Focus on systemic drivers and human impacts."
         else:
@@ -1972,10 +1972,10 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     audience_context = detect_audience_context(history)
     
     if topic_sector == "LIFESTYLE":
-        persona_goal = "Generate a warm, descriptive lifestyle discovery or recommendation."
+        persona_goal = "Generate a warm, descriptive lifestyle discovery or recommendation. Use a first-person curator voice. Avoid repetitive source name-dropping (e.g. TripAdvisor); weave facts into your own narrative."
         strategist_type = "Expert Travel & Lifestyle Journalist"
     elif topic_sector == "HUMANITIES":
-        persona_goal = "Generate an objective sociopolitical research audit or overview."
+        persona_goal = "Generate an objective sociopolitical research audit or overview. Use an authoritative analyst voice. Weave provenance into the narrative rather than repeating 'According to Bing/Search'."
         strategist_type = "Sociopolitical Analyst"
     else:
         persona_goal = "Generate a high-density technical research audit or implementation guide."
@@ -2031,7 +2031,7 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     3. **Temporal Awareness Protocol**: When GROUNDING DATA contains timestamps or version information:
        - Check if information is current or outdated.
        - If information is superseded in GROUNDING DATA, use the replacement.
-       - Explicitly note temporal context (e.g., "As of February 2026..." or "According to recent data...")
+       - Natural Integration: Weave temporal context naturally (e.g., "In early 2026," or "Current shifts show...") to avoid repetitive 'According to...' phrasing.
     4. **Implementation Protocol** (for technical content):
        - First, check GROUNDING DATA for current versions and deprecation status.
        - Explicitly state which version you are using in comments or documentation.
