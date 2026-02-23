@@ -43,3 +43,5 @@ ops/
 
 
 n8n-key.json
+func.json
+*.patch
