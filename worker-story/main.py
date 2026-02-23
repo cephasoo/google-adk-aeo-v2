@@ -113,6 +113,68 @@ db = None
 mcp_client = None
 
 
+# --- MODULAR SECTOR CLASSIFICATION ---
+def classify_topic_sector(topic: str) -> str:
+    """
+    Semantic Sector Classification (ADK-FLASH):
+    Classifies a topic into LIFESTYLE, HUMANITIES, or TECHNICAL sectors using 
+    Gemini Flash for semantic matching with a robust keyword fallback.
+    """
+    global flash_model
+    topic_str = str(topic).strip()
+    
+    # 1. Semantic Match (Specialized Flash Call)
+    # We use a strict prompt to ensure fast, deterministic response.
+    # We intimate that themes are non-exhaustive examples.
+    classification_prompt = f"""
+    Strictly classify the following TOPIC into one of three SECTORS based on its semantic nature. 
+    The themes listed below are non-exhaustive EXAMPLES:
+    
+    1. LIFESTYLE (Example Themes: Tourism, Food, Travel, Lifestyle, Hangouts, Entertainment, Recreation)
+    2. HUMANITIES (Example Themes: Politics, Sociology, Governance, Security, Law, Policy, History, Ethics)
+    3. TECHNICAL (Example Themes: Software, AI, Engineering, Infrastructure, Data Systems, Scientific Method)
+    
+    TOPIC: "{topic_str}"
+    
+    Return ONLY the sector name (e.g., "LIFESTYLE").
+    """
+    
+    try:
+        # Use Flash for low-latency semantic triage
+        raw_sector = safe_generate_content(flash_model, classification_prompt, generation_config={"temperature": 0.0, "max_output_tokens": 10})
+        sector = str(raw_sector).upper().strip()
+        
+        # Validation: Ensure it's one of the three
+        if any(s in sector for s in ["LIFESTYLE", "HUMANITIES", "TECHNICAL"]):
+            for s in ["LIFESTYLE", "HUMANITIES", "TECHNICAL"]:
+                if s in sector:
+                    print(f"  + Semantic Sector Classification: {s}")
+                    return s
+    except Exception as e:
+        print(f"⚠️ Semantic Triage Failed: {e}. Falling back to keywords.")
+    
+    # 2. Keyword Fallback (Hardened Static Match)
+    t = topic_str.lower()
+    lifestyle_keywords = [
+        "hangout", "places to", "travel", "food", "lifestyle", "tourism", "restaurant", 
+        "club", "bar", "visit", "shopping", "mall", "lake", "hotel", "cafe", "nightlife"
+    ]
+    if any(kw in t for kw in lifestyle_keywords):
+        print(f"  + Keyword Sector Classification: LIFESTYLE")
+        return "LIFESTYLE"
+        
+    humanities_keywords = [
+        "politics", "terrorism", "governance", "nigeria", "policy", "societal", 
+        "public", "international", "un ", "security", "human rights", "law", "ethics"
+    ]
+    if any(kw in t for kw in humanities_keywords):
+        print(f"  + Keyword Sector Classification: HUMANITIES")
+        return "HUMANITIES"
+        
+    print(f"  + Default Sector Classification: TECHNICAL")
+    return "TECHNICAL"
+
+
 # --- MODULAR STYLE & SANITIZATION PROTOCOL (Zero-Loss Fidelity) ---
 
 # 1. BASELINE: Grounding & RAI (Permanent System Instructions)
@@ -192,32 +254,51 @@ PROTOCOL_PSEO_PAGE = """
 # Backward Compatibility (Ensures legacy calls don't break during migration)
 STYLE_PROTOCOL = PROTOCOL_GROUNDING_RAI + PROTOCOL_VISUAL_TABULAR + PROTOCOL_LITERARY_CORE + PROTOCOL_ANTI_SLOB
 
-def get_system_instructions(intent: str, output_target: str) -> str:
+def get_system_instructions(intent: str, output_target: str, topic_sector: str = "TECHNICAL") -> str:
     """
-    Architectural fix to assemble instructions modularly based on intent and target.
-    Prevents token waste while ensuring 100% rule fidelity for relevant tasks.
+    Architectural fix to assemble instructions modularly based on intent, target, and topic sector.
+    Prevents "Technical Over-Indexing" for non-technical subjects like Lifestyle or Politics.
     """
     intent = intent.upper().strip()
     # 1. Start with Baseline Guardrails (Permanent)
     instructions = "You are a highly capable AI assistant. Adhere strictly to these protocols:\n"
     instructions += PROTOCOL_GROUNDING_RAI
-    instructions += PROTOCOL_VISUAL_TABULAR
     
-    # 2. Add Formatting (Modular)
+    # 2. Visual & Tabular (Sector Aware)
+    if topic_sector == "TECHNICAL":
+        instructions += PROTOCOL_VISUAL_TABULAR
+    else:
+        instructions += """
+- **VISUAL RESTRAINT**: For non-technical LIFESTYLE or HUMANITIES content, PROHIBIT Mermaid flowcharts, logic maps, and technical JSON-LD schema blocks in the article body unless explicitly requested by the user. Use descriptive narrative or simple Markdown tables (if needed for pricing/timing) instead.
+"""
+    
+    # 3. Add Formatting (Modular)
     if output_target == "CMS_DRAFT":
         instructions += PROTOCOL_FORMAT_CMS
     else:
         instructions += PROTOCOL_FORMAT_SLACK
         
     # Condition: High-Fidelity intents get the full Literary and Anti-Slob treatment.
-    high_fidelity_intents = ["DEEP_DIVE", "PSEO_ARTICLE", "PSEO_PAGE", "TECHNICAL_EXPLANATION", "BLOG_OUTLINE", "AUTHOR", "REWRITE", "REFINE", "THEN_VS_NOW_PROPOSAL"]
+    high_fidelity_intents = [
+        "DEEP_DIVE", "PSEO_ARTICLE", "PSEO_PAGE", "TECHNICAL_EXPLANATION", 
+        "BLOG_OUTLINE", "AUTHOR", "REWRITE", "REFINE", "THEN_VS_NOW_PROPOSAL",
+        "DIRECT_ANSWER", "SIMPLE_QUESTION", "FORMAT_GENERAL", "OPERATIONAL_REFORMAT"
+    ]
     if intent in high_fidelity_intents:
         instructions += PROTOCOL_LITERARY_CORE
         
+        # Sector-Aware Anti-Slob
+        if topic_sector == "LIFESTYLE":
+            instructions += "\n- **LIFESTYLE PERSONA**: You are an Expert Travel & Lifestyle Journalist. Use warm, inviting, yet professional prose. Focus on sensory details, timing, and hospitality."
+        elif topic_sector == "HUMANITIES":
+             instructions += "\n- **HUMANITIES PERSONA**: You are a Sociopolitical Analyst and Researcher. Use objective, authoritative, and nuanced prose. Focus on systemic drivers and human impacts."
+        else:
+             instructions += "\n- **TECHNICAL PERSONA**: You are a Specialized Technical Writer. Use precise, efficient, and data-dense prose. Focus on architecture and implementation."
+
     if intent == "PSEO_PAGE":
         instructions += PROTOCOL_PSEO_PAGE
         
-    if intent in ["PSEO_ARTICLE", "DEEP_DIVE", "PSEO_PAGE"]:
+    if intent in ["PSEO_ARTICLE", "DEEP_DIVE", "PSEO_PAGE", "DIRECT_ANSWER"]:
         instructions += PROTOCOL_ANTI_SLOB
         
     return instructions.strip()
@@ -1787,13 +1868,13 @@ def ensure_slack_compatibility(text):
 
 
 # 13a. The Natural Answer Generator (Conversational & Fluid)
-def generate_natural_answer(topic, context, history="", session_id=None, output_target="MODERATOR_VIEW"):
+def generate_natural_answer(topic, context, history="", session_id=None, output_target="MODERATOR_VIEW", intent_label="SIMPLE_QUESTION"):
     global unimodel, research_model
     style_mentors = get_stylistic_mentors(session_id)
+    topic_sector = classify_topic_sector(topic)
     
     # ARCHITECTURAL FIX: Modular Instruction Assembly
-    intent_label = "SIMPLE_QUESTION"
-    system_instruction = get_system_instructions(intent_label, output_target)
+    system_instruction = get_system_instructions(intent_label, output_target, topic_sector=topic_sector)
     system_instruction += f"\n\n{style_mentors}"
 
     print(f"DEBUG: generate_natural_answer (Native) starting... [Topic: {topic[:50]}]")
@@ -1843,7 +1924,7 @@ def generate_natural_answer(topic, context, history="", session_id=None, output_
     text = safe_generate_content(active_model, prompt, generation_config={"temperature": 0.4}, system_instruction=system_instruction)
     
     final_text = ensure_slack_compatibility(text.strip())
-    intent = "SIMPLE_QUESTION"
+    intent = intent_label
     if "```" in final_text: intent = "TECHNICAL_EXPLANATION"
     
     return {
@@ -1854,21 +1935,22 @@ def generate_natural_answer(topic, context, history="", session_id=None, output_
 
 
 # 13b. The Comprehensive Answer Generator (AEO-AWARE CONTENT STRATEGIST)
-def generate_comprehensive_answer(topic, context, history="", intent_metadata=None, context_topic="", session_id=None, output_target="MODERATOR_VIEW"):
+def generate_comprehensive_answer(topic, context, history="", intent_metadata=None, context_topic="", session_id=None, output_target="MODERATOR_VIEW", intent_label=None):
     global unimodel, research_model, specialist_model, flash_model
     style_mentors = get_stylistic_mentors(session_id)
     
     # 2. INTENT DETECTION (Early for instruction assembly)
     try:
         signal_data = json.loads(intent_metadata) if intent_metadata else {}
-        research_intent = signal_data.get("intent", "FORMAT_GENERAL")
+        research_intent = intent_label or signal_data.get("intent", "FORMAT_GENERAL")
         formatting_directive = signal_data.get("directive", "")
     except:
-        research_intent = "FORMAT_GENERAL"
+        research_intent = intent_label or "FORMAT_GENERAL"
         formatting_directive = ""
 
     # ARCHITECTURAL FIX: Modular Instruction Assembly
-    system_instruction = get_system_instructions(research_intent, output_target)
+    topic_sector = classify_topic_sector(topic)
+    system_instruction = get_system_instructions(research_intent, output_target, topic_sector=topic_sector)
     system_instruction += f"\n\n{style_mentors}"
 
     print(f"DEBUG: generate_comprehensive_answer starting... [Topic: {topic[:50]}]")
@@ -1888,12 +1970,23 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     
     # 1. PERSONA & AUDIENCE
     audience_context = detect_audience_context(history)
+    
+    if topic_sector == "LIFESTYLE":
+        persona_goal = "Generate a warm, descriptive lifestyle discovery or recommendation."
+        strategist_type = "Expert Travel & Lifestyle Journalist"
+    elif topic_sector == "HUMANITIES":
+        persona_goal = "Generate an objective sociopolitical research audit or overview."
+        strategist_type = "Sociopolitical Analyst"
+    else:
+        persona_goal = "Generate a high-density technical research audit or implementation guide."
+        strategist_type = "Senior Content Strategist"
+
     persona_instruction = f"""
-    You are a Senior Content Strategist. 
+    You are a {strategist_type}. 
     AUDIENCE: {audience_context}
     
     GOAL:
-    Generate a high-density, technical research audit that directly addresses the user's specific sub-topic or vertical. 
+    {persona_goal}
     Avoid "Sports Blindness" or generic global signals. Look for the nuance in the grounding data.
     """
 
@@ -2151,6 +2244,7 @@ def chunked_refactor_article(source_text, audience_context, specialist_model, st
 def generate_pseo_article(topic, context, history="", history_events=None, is_initial_post=True, session_id=None, output_target="CMS_DRAFT"):
     global unimodel
     style_mentors = get_stylistic_mentors(session_id)
+    topic_sector = classify_topic_sector(topic)
     
     # --- STRATEGIC CONTEXT SANITIZATION: Strip internal meta-talk from history ---
     if output_target == "CMS_DRAFT":
@@ -2289,9 +2383,17 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     # --- PATH B & C: EXPAND / AUTHOR (Creative Synthesis) ---
     elif start_mode == "EXPAND":
         # EXPANSION PROMPT: Use history as a skeleton.
-        print("  + Executing PATH B: EXPAND with Unimodel")
+        print(f"  + Executing PATH B: EXPAND ({topic_sector}) with Unimodel")
+        
+        if topic_sector == "LIFESTYLE":
+            persona = "Expert Travel & Lifestyle Journalist"
+        elif topic_sector == "HUMANITIES":
+            persona = "Sociopolitical Analyst and Researcher"
+        else:
+            persona = "Specialized Technical Writer"
+
         system_instruction = f"""
-        You are a Specialized Technical Writer.
+        You are an {persona}.
         TASK: Write a comprehensive pSEO article based on the provided OUTLINE/BLUEPRINT.
         
         RULES:
@@ -2302,20 +2404,32 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
         BLUEPRINT/OUTLINE:
         {history}
         """
-        tone_instruction = "Tone: High-authority, professional, and detailed. Match the depth implied by the blueprint."
+        tone_instruction = "Tone: High-authority, engaging, and detailed. Match the depth implied by the blueprint."
         context_block = f"Research Context:\n{context}"
         
     else: # AUTHOR MODE
-        print("  + Executing PATH C: AUTHOR with Unimodel")
-        if is_grounded:
-            system_instruction = "You are a Clear Technical Communicator. Base the article PRIMARILY on the provided 'Research Context'."
+        print(f"  + Executing PATH C: AUTHOR ({topic_sector}) with Unimodel")
+        
+        if topic_sector == "LIFESTYLE":
+            persona = "Expert Travel & Lifestyle Journalist"
+            goal = "Clear, warm, and inviting prose."
+        elif topic_sector == "HUMANITIES":
+            persona = "Sociopolitical Analyst and Researcher"
+            goal = "Objective, authoritative, and nuanced prose."
         else:
-            system_instruction = "You are a Clear Technical Communicator. Use the provided context to write a high-authority article."
-        tone_instruction = "Tone: Clear, engaging, professional English. Use analogies to explain complex ideas."
+            persona = "Specialized Technical Writer"
+            goal = "High-authority technical article."
+
+        if is_grounded:
+            system_instruction = f"You are an {persona}. Base the article PRIMARILY on the provided 'Research Context'."
+        else:
+            system_instruction = f"You are an {persona}. Use the provided context to write a {goal}"
+        
+        tone_instruction = f"Tone: {goal} Use analogies to explain complex ideas."
         context_block = f"Research Context:\n{context}\n\nConversation History:\n{history}"
 
     # ARCHITECTURAL FIX: Modular Instruction Assembly
-    sys_instruction = get_system_instructions("PSEO_ARTICLE", output_target)
+    sys_instruction = get_system_instructions("PSEO_ARTICLE", output_target, topic_sector=topic_sector)
     sys_instruction += f"\n\n{style_mentors}"
 
     # Shared Prompt for B & C (Creative Paths)
@@ -2331,18 +2445,18 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     {target_instruction}
     
     STRUCTURE REQUIREMENTS (Strict HTML):
-    1.  **<section class="intro">**: A compelling hook. **MEAT-FIRST**: Deliver core findings or high-density technical insights immediately in the first paragraph.
+    1.  **<section class="intro">**: A compelling hook. **MEAT-FIRST**: Deliver core findings or data-driven insights immediately in the first paragraph.
     2.  **<section class="body">**: Detailed analysis using <h2> and <h3> tags.
     3.  **NO NUMBERED HEADINGS**: Do NOT include numbers (e.g., "1. ", "2. ") in your <h2> or <h3> headers.
     4.  **Code Blocks**: Use semantic HTML: `<pre><code class="language-...">...</code></pre>`.
-    5.  **Mermaid Diagrams**: MUST be preserved. Wrap Mermaid code in a `<figure class="kg-card kg-image-card kg-width-wide">` block. Inside, include the `<pre><code class="language-mermaid">...</code></pre>` and a context-aware `<figcaption>...</figcaption>`.
+    5.  **Mermaid Diagrams**: MUST be preserved (ONLY for TECHNICAL sector). Wrap Mermaid code in a `<figure class="kg-card kg-image-card kg-width-wide">` block. 
     6.  **Lists**: Use semantic `<ul><li>` or `<ol><li>`.
-    7.  **<section class="methodology">**: A TECHNICAL TRANSPARENCY FOOTER. 
+    7.  **<section class="methodology">**: A { 'TECHNICAL TRANSPARENCY' if topic_sector == 'TECHNICAL' else 'REFERENCES & ACCOUNTABILITY' if topic_sector == 'HUMANITIES' else 'INSIGHTS & SOURCES' } FOOTER. 
     
     CRITICAL CONTENT RULES:
     - **Contextual Specificity**: Actively identify and expand on points of interest, debates, cultural markers, or specific real-world examples found in the research context.
-    - **Technical-External Mapping**: Identify relevant external frameworks (regulatory, structural, or conceptual) and explicitly link technical solutions to those specific anchors.
-    - **Technical Accuracy**: Ensure all technical claims are supported by the provided context.
+    - **Sector-Aware Mapping**: Identify relevant external frameworks (regulatory, structural, or conceptual for Technical; cultural or historical for Humanities) and explicitly link solutions/insights to those anchors.
+    - **Accuracy**: Ensure all claims are supported by the provided context.
     - **Acronym Protocol**: Define all acronyms in parentheses on the first use (e.g. "Electronic Data Interchange (EDI)").
     
     CRITICAL RULES:
@@ -2374,6 +2488,7 @@ def generate_pseo_page(topic, context, history="", history_events=None, is_initi
     """
     global unimodel, specialist_model
     
+    topic_sector = classify_topic_sector(topic)
     topic_lower = topic.lower()
     style_mentors = get_stylistic_mentors(session_id)
     audience_context = detect_audience_context(history)
@@ -2414,7 +2529,7 @@ def generate_pseo_page(topic, context, history="", history_events=None, is_initi
          print(f"  + Holistic Grounding: Using full thread history ({len(history)} chars) for refactor/update.")
 
     # 3. Instruction Assembly
-    sys_instruction = get_system_instructions("PSEO_PAGE", output_target)
+    sys_instruction = get_system_instructions("PSEO_PAGE", output_target, topic_sector=topic_sector)
     sys_instruction += f"\n\n{style_mentors}"
 
     # 4. Prompt Engineering
@@ -2483,6 +2598,7 @@ def generate_pseo_page(topic, context, history="", history_events=None, is_initi
 def generate_deep_dive_article(topic, context, history="", history_events=None, target_length=1500, target_geo="Global", session_id=None, output_target="MODERATOR_VIEW"):
     global unimodel
     style_mentors = get_stylistic_mentors(session_id)
+    topic_sector = classify_topic_sector(topic)
     
     target_instruction = ""
     if output_target == "MODERATOR_VIEW":
@@ -2498,7 +2614,7 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     audience_context = detect_audience_context(history)
     
     # ARCHITECTURAL FIX: Modular Instruction Assembly
-    blueprint_sys = get_system_instructions("BLOG_OUTLINE", output_target)
+    blueprint_sys = get_system_instructions("BLOG_OUTLINE", output_target, topic_sector=topic_sector)
     blueprint_sys += f"\n\n{style_mentors}"
 
     # PHASE 1: Generate the Blueprint & Title (The Architect)
@@ -2562,7 +2678,7 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     
     # Intro (Sequential - Sets the stage)
     # ARCHITECTURAL FIX: Modular Instruction Assembly
-    intro_sys = get_system_instructions("DEEP_DIVE", output_target)
+    intro_sys = get_system_instructions("DEEP_DIVE", output_target, topic_sector=topic_sector)
     intro_sys += f"\n\n{style_mentors}"
 
     intro_prompt = f"""
@@ -2603,7 +2719,7 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
             section_words = int(str(section_words).strip())
             
         # ARCHITECTURAL FIX: Modular Instruction Assembly
-        section_sys = get_system_instructions("DEEP_DIVE", output_target)
+        section_sys = get_system_instructions("DEEP_DIVE", output_target, topic_sector=topic_sector)
         section_sys += f"\n\n{style_mentors}"
 
         # NOTE: In parallel mode, we rely on the Blueprint logic rather than the literal previous text.
@@ -3334,7 +3450,7 @@ def _process_story_logic_inner(request):
                 target = get_output_target(intent)
                 
                 # RESTORED: Use simpler natural answer generator to avoid persona-induced bloat
-                answer_data = generate_natural_answer(sanitized_topic, "COMPLETE_CONTEXT_IN_HISTORY", history=history_text, session_id=session_id, output_target=target)
+                answer_data = generate_natural_answer(sanitized_topic, "COMPLETE_CONTEXT_IN_HISTORY", history=history_text, session_id=session_id, output_target=target, intent_label=intent)
                 answer_text = answer_data['text']
                 research_intent = answer_data.get('intent', "OPERATIONAL_REFORMAT")
                 
@@ -3377,7 +3493,7 @@ def _process_story_logic_inner(request):
             target = get_output_target(intent)
             
             # Use Comprehensive Content Strategist for outlines
-            answer_data = generate_comprehensive_answer(sanitized_topic, "BLOG_OUTLINE_MODE", history=history_text, context_topic=original_topic, session_id=session_id, output_target=target)
+            answer_data = generate_comprehensive_answer(sanitized_topic, "BLOG_OUTLINE_MODE", history=history_text, context_topic=original_topic, session_id=session_id, output_target=target, intent_label=intent)
             answer_text = answer_data['text']
             
             new_events.append({"event_type": "agent_answer", "text": answer_text, "intent": "BLOG_OUTLINE"})
@@ -3628,7 +3744,7 @@ def _process_story_logic_inner(request):
             target = get_output_target(intent)
             
             # HIGH-FIDELITY ROUTING: Use Comprehensive Content Strategist for Audits/Formats
-            answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, session_id=session_id, output_target=target)
+            answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, session_id=session_id, output_target=target, intent_label=intent)
             answer_text = answer_data['text']
             research_intent = answer_data.get('intent', intent)
             
@@ -3670,7 +3786,7 @@ def _process_story_logic_inner(request):
             # Determined Output Target
             target = get_output_target(intent)
             # LIGHTWEIGHT ROUTING: Use Natural Answer Engine
-            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text, session_id=session_id, output_target=target)
+            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text, session_id=session_id, output_target=target, intent_label=intent)
             answer_text = answer_data['text']
             research_intent = answer_data.get('intent', intent)
             formatting_directive = answer_data.get('directive', "")
@@ -3800,7 +3916,7 @@ def _process_story_logic_inner(request):
             except Exception as e:
                 print(f"TELEMETRY: ⚠️ TOPIC_CLUSTER Fallback: {e}")
                 target = get_output_target(intent)
-                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, output_target=target)
+                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, output_target=target, intent_label=intent)
                 answer_text = answer_data['text']
                 research_intent = answer_data.get('intent', intent)
                 
@@ -3881,7 +3997,7 @@ def _process_story_logic_inner(request):
             except ValueError as e:
                 # Fallback
                 target = get_output_target(intent)
-                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, output_target=target)
+                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, output_target=target, intent_label=intent)
                 answer_text = answer_data['text']
                 research_intent = answer_data.get('intent', intent)
                 
@@ -4025,7 +4141,7 @@ def _process_story_logic_inner(request):
             except Exception as e:
                 print(f"⚠️ PSEO_ARTICLE Fallback: {e}")
                 target = get_output_target(intent)
-                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, output_target=target)
+                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, output_target=target, intent_label=intent)
                 answer_text = answer_data['text']
                 research_intent = answer_data.get('intent', intent)
                 
@@ -4081,7 +4197,7 @@ def _process_story_logic_inner(request):
             # ROBUST FALLBACK: If intent is unknown, default to a natural answer rather than crashing with 500
             print(f"TELEMETRY: ⚠️ Unknown Intent Detected: '{intent}'. Defaulting to Natural Answer fallback.")
             target = get_output_target("FALLBACK") # Defaults to MODERATOR_VIEW
-            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text, output_target=target)
+            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text, output_target=target, intent_label=intent)
             answer_text = answer_data['text']
             research_intent = answer_data['intent']
             formatting_directive = answer_data['directive']
