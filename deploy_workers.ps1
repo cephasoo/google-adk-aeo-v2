@@ -61,7 +61,7 @@ try {
     $region = $env:LOCATION
     if (-not $region) { $region = "us-central1" }
     
-    gcloud run deploy process-tracker-logic --source . --region=$region --clear-base-image
+    gcloud run deploy worker-tracker --source . --region=$region --clear-base-image --memory 1Gi
 }
 finally {
     Set-Location ..
