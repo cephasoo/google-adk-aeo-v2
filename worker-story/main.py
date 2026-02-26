@@ -14,12 +14,20 @@ from shared.utils import (
     safe_n8n_delivery, 
     UnifiedModel,
     get_n8n_operation_type,
-    get_output_target
+    get_output_target,
+    extract_json,
+    detect_audience_context,
+    safe_generate_content,
+    convert_html_to_markdown,
+    get_mcp_client,
+    get_system_instructions,
+    extract_labeled_sources,
+    get_stylistic_mentors,
+    classify_topic_sector
 )
-from vertexai.generative_models import GenerativeModel, HarmCategory, HarmBlockThreshold
+from vertexai.generative_models import HarmCategory, HarmBlockThreshold
 import google.cloud.logging
-import logging
-import base64
+
 
 litellm.drop_params = True  # CRITICAL: Handle unsupported params for new models (like gpt-5)
 from vertexai.language_models import TextEmbeddingModel
@@ -32,12 +40,9 @@ import requests
 import certifi # Explicitly kept to avert legacy SSL issues
 import google.auth
 import google.auth.transport.requests
-from google.oauth2 import id_token
-from google.cloud import firestore, secretmanager
+from google.cloud import firestore
 from google.cloud.firestore_v1.vector import Vector
 import concurrent.futures
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 # --- Logging Setup ---
 logging_v_client = None
@@ -64,10 +69,10 @@ if not PROJECT_ID:
         PROJECT_ID = None
 
 LOCATION = os.environ.get("LOCATION")
-MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.5-pro") 
+MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.0-flash-001") 
 MODEL_PROVIDER = os.environ.get("MODEL_PROVIDER", "vertex_ai")
-FLASH_MODEL_NAME = os.environ.get("FLASH_MODEL_NAME", "gemini-2.5-flash-lite")
-RESEARCH_MODEL_NAME = os.environ.get("RESEARCH_MODEL_NAME", "gemini-2.5-flash-lite") # NEW: For High Context
+FLASH_MODEL_NAME = os.environ.get("FLASH_MODEL_NAME", "gemini-2.0-flash-lite")
+RESEARCH_MODEL_NAME = os.environ.get("RESEARCH_MODEL_NAME", "gemini-2.0-flash") # NEW: For High Context
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL") 
@@ -89,7 +94,7 @@ SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")  # Explicit fallback for cod
 MAX_LOOP_ITERATIONS = 2
 DEFAULT_GEO = os.environ.get("DEFAULT_GEO", "Global")
 TRACKER_SERVER_URL = os.environ.get("TRACKER_SERVER_URL", "http://localhost:8081")
-MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8080")
+# (MCP_SERVER_URL removed, now centralized in shared.utils)
 
 # --- Safety Configuration (ADK/RAI Compliant) ---
 safety_settings = {
@@ -110,349 +115,27 @@ research_model = None # NEW: The High-Context Specialist
 specialist_model = None
 search_api_key = None
 db = None
-mcp_client = None
 
 
 # --- MODULAR SECTOR CLASSIFICATION ---
-def classify_topic_sector(topic: str) -> str:
-    """
-    Semantic Sector Classification (ADK-FLASH):
-    Classifies a topic into LIFESTYLE, HUMANITIES, or TECHNICAL sectors using 
-    Gemini Flash for semantic matching with a robust keyword fallback.
-    """
-    global flash_model
-    topic_str = str(topic).strip()
-    
-    # 1. Semantic Match (Specialized Flash Call)
-    # We use a strict prompt to ensure fast, deterministic response.
-    # We intimate that themes are non-exhaustive examples.
-    classification_prompt = f"""
-    Strictly classify the following TOPIC into one of three SECTORS based on its semantic nature. 
-    The themes listed below are non-exhaustive EXAMPLES:
-    
-    1. LIFESTYLE (Example Themes: Tourism, Food, Travel, Lifestyle, Hangouts, Entertainment, Recreation)
-    2. HUMANITIES (Example Themes: Politics, Sociology, Governance, Security, Law, Policy, History, Ethics)
-    3. TECHNICAL (Example Themes: Software, AI, Engineering, Infrastructure, Data Systems, Scientific Method)
-    
-    TOPIC: "{topic_str}"
-    
-    Return ONLY the sector name (e.g., "LIFESTYLE").
-    """
-    
-    try:
-        # Use Flash for low-latency semantic triage
-        raw_sector = safe_generate_content(flash_model, classification_prompt, generation_config={"temperature": 0.0, "max_output_tokens": 10})
-        sector = str(raw_sector).upper().strip()
-        
-        # Validation: Ensure it's one of the three
-        if any(s in sector for s in ["LIFESTYLE", "HUMANITIES", "TECHNICAL"]):
-            for s in ["LIFESTYLE", "HUMANITIES", "TECHNICAL"]:
-                if s in sector:
-                    print(f"  + Semantic Sector Classification: {s}")
-                    return s
-    except Exception as e:
-        print(f"⚠️ Semantic Triage Failed: {e}. Falling back to keywords.")
-    
-    # 2. Keyword Fallback (Hardened Static Match)
-    t = topic_str.lower()
-    lifestyle_keywords = [
-        "hangout", "places to", "travel", "food", "lifestyle", "tourism", "restaurant", 
-        "club", "bar", "visit", "shopping", "mall", "lake", "hotel", "cafe", "nightlife"
-    ]
-    if any(kw in t for kw in lifestyle_keywords):
-        print(f"  + Keyword Sector Classification: LIFESTYLE")
-        return "LIFESTYLE"
-        
-    humanities_keywords = [
-        "politics", "terrorism", "governance", "nigeria", "policy", "societal", 
-        "public", "international", "un ", "security", "human rights", "law", "ethics"
-    ]
-    if any(kw in t for kw in humanities_keywords):
-        print(f"  + Keyword Sector Classification: HUMANITIES")
-        return "HUMANITIES"
-        
-    print(f"  + Default Sector Classification: TECHNICAL")
-    return "TECHNICAL"
 
+# --- MODULAR SECTOR CLASSIFICATION (Consolidated in shared.utils) ---
+# (classify_topic_sector removed, now imported from shared.utils)
 
-# --- MODULAR STYLE & SANITIZATION PROTOCOL (Zero-Loss Fidelity) ---
+# --- MODULAR STYLE & SANITIZATION PROTOCOL (Consolidated in shared.utils) ---
+# (PROTOCOL_* constants and get_system_instructions removed, now imported from shared.utils)
 
-# 1. BASELINE: Grounding & RAI (Permanent System Instructions)
-PROTOCOL_GROUNDING_RAI = """
-- **CONTEXTUAL INTEGRITY (ZERO-INVENTION)**:
-    1. **DATA FIDELITY**: You are FORBIDDEN from generating any specific statistic (%), project count (e.g., "120 projects"), or implementation claim that is not explicitly in the USER PROMPT, PROVIDED FILES, or VERIFIED SEARCH RESULTS. Use qualitative descriptions if data is absent.
-    2. **LINK VERIFICATION**: Only generate URLs that have been explicitly provided or verified in the current turn's context. Never "guess" a logical URL path.
-    3. **ARCHITECTURAL ANCHORING**: Claims must align with the provided context (e.g., architectural or contextual specs). If a claim contradicts the Primary Anchor (Prompt/Files), the anchor takes precedence.
-    4. **GROUNDING DATA SUPREMACY (Universal)**: When GROUNDING DATA contains current information on ANY topic (APIs, news events, trend data, regulatory changes, market statistics, etc.), you MUST prioritize that information over your training data. Your training data has a knowledge cutoff; GROUNDING DATA represents real-time, verified information. Specific applications:
-       - **Technical**: API versions, library deprecations, framework updates
-       - **News/Events**: Current events, breaking news, recent announcements
-       - **Trends**: Search volume data, market shifts, emerging patterns
-       - **Regulatory**: New laws, policy changes, compliance updates
-       - **Statistics**: Current metrics, recent studies, updated benchmarks
-    5. **TEMPORAL VERIFICATION**: When GROUNDING DATA contains timestamps, publication dates, or version numbers, treat those as authoritative. If GROUNDING DATA shows information is outdated or superseded, you MUST use the current replacement mentioned in GROUNDING DATA.
-    6. **SYNTHETIC PROVENANCE**: While transparency is required, PROHIBIT repetitive name-dropping of search platforms (e.g., "According to TripAdvisor", "Bing results show") in the body prose. Instead, weave findings into a cohesive narrative and rely on **INLINE ANCHORED LINKS** for primary attribution. Use platform names ONLY for high-level context or when the platform itself is the subject of the claim.
-"""
-
-# 2. VISUAL & TABULAR (Permanent System Instructions)
-PROTOCOL_VISUAL_TABULAR = """
-- **MERMAID MANDATE**: You are strictly PROHIBITED from generating ASCII-based diagrams or logic maps (e.g., using arrows like `-->` or pipes `|` for flow). For any architectural maps, sequence flows, or visual logic, you MUST use `mermaid` code blocks. This ensures high-fidelity rendering via the MCP gateway.
-- **MERMAID MODULARITY**: For complex architectures, FAVOR multiple modular diagrams (e.g., Phase 1 vs Phase 2) over a single dense block. This ensures high-fidelity readability and prevents transport failures (Slack 3k URL limit).
-- **TABLE COMPACTION**: PROHIBIT blank lines within Markdown tables. All rows (header, separator, and data) MUST be contiguous for parser integrity.
-"""
-
-# 3. LITERARY CORE: Persona & Tone (High-Fidelity Turns Only)
-PROTOCOL_LITERARY_CORE = """
-- **MEAT-FIRST NARRATIVE**: BAN robotic framing like "Short answer:", "Bottom line:", or "The takeaway is:". Start with direct data.
-- **HUMAN FINGERPRINT**: Vary sentence length. Mix punchy sentences (5-10 words) with fluid reflections (20-35 words).
-- **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) or parentheses ( ).
-- **NARRATIVE COLON BAN**: PROHIBIT colons in prose to connect claims to details. Use a period and a new sentence, or descriptive transitions. 
-- **COLON PROTOCOL (LISTS ONLY)**: Colons are for vertical bulleted lists ONLY. 
-- **MANDATORY CAPITALIZATION**: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED. Absolutely PROHIBIT "Label: lowercase" patterns.
-- **LEXICAL VARIETY (ANTI-CLUMPING)**: MANDATE categorical rotation. PROHIBIT repeating the same key noun/verb in adjacent sentences.
-- **ACTIVE VERB PRIORITY**: PRIORITIZE descriptive, context-aware actions. Use the provided Dynamic Palette as mentors.
-- **ZERO-PASSIVE VOICE**: PRIORITIZE active voice to drive narrative momentum.
-- **ANTI-WATERMARK**: BAN robotic buzzwords: 'delve', 'tapestry', 'landscape', 'unlock', 'embark', 'comprehensive', 'robust'. 
-- **NO COLON CLUMPING**: Do not use "Label: Definition" structures. Use active, descriptive narrative flow.
-- **TACTICAL TRANSITIONS**: BAN robotic connectors like "Furthermore" or "Moreover." Use the provided Dynamic Palette to maintain narrative "drag."
-"""
-
-# 4. FORMATTING TARGETS (Modular)
-PROTOCOL_FORMAT_CMS = """
-- **OUTPUT TARGET: CMS_DRAFT**: If the target is a blog draft (Ghost), use ONLY semantic HTML. PROHIBIT all Markdown. Tables MUST use `<table>` tags. Headers MUST use `<h2>` or `<h3>` (PROHIBIT `#`). Wrap all paragraphs in `<p>`.
-"""
-
-PROTOCOL_FORMAT_SLACK = """
-- **OUTPUT TARGET: MODERATOR_VIEW**: If the target is a Slack brief or research discovery, use Markdown exclusively for tables (pipes: `|`), headers (`#`, `##`), and code blocks. PROHIBIT all HTML tags (no `<p>`, `<h2>`, etc.). Use blank lines for paragraph separation.
-"""
-
-# 5. ANTI-SLOB: Context Sovereignty (High-Fidelity Turns Only)
-PROTOCOL_ANTI_SLOB = """
-- **STRATEGIC CONTEXT SANITIZATION (ANTI-META-TALK)**:
-    - **UNIVERSAL PROHIBITION**: You are strictly PROHIBITED from mentioning internal strategic decision-making, competitive audits, or benchmarking scores when the user's latest message PRIMARY GOAL (intent) is classified as DEEP_DIVE or PSEO_ARTICLE.
-    - **BANNED CATEGORIES**:
-        1. **SEO/Metrics**: "competitor gap," "audit scores," "ranking analysis," "search volume," "AEO strategy," "moat factor," "technical density score."
-        2. **Process/Turns**: "turn-based analysis," "Turn 1/2/3/4," "internal blueprint," "iterative refinement," "previous response," "vetted prompt."
-        3. **Implementation Meta**: "strategic decision primitives," "policy enforcement point (PEP) architecture," "architectural logic implementation."
-        4. **Comparative Bias**: "technical vacuum," "marketing hype," "marketing fluff," "displace leaders."
-    - **DEFINITION SHIELD**: PROHIBIT "Define [Abbreviation] as [Full Name]" sentence structures. Integrate definitions naturally (e.g., "The Policy Enforcement Point (PEP)...") or assume professional context.
-    - **TONE REPLACEMENT**: Instead of saying "Other guides score 2/10," simply present the authoritative technical finding with 10/10 technical depth. The "moat" is felt through your technical precision, not stated in prose.
-"""
-
-# 6. PSEO_PAGE: Specialized Data Weaver (Non-Narrative)
-PROTOCOL_PSEO_PAGE = """
-- **ROLE: Specialized pSEO Data Weaver**: You create specific, data-rich pages for unique entity/location combinations.
-- **CRITICAL "NO META-TALK" PROTOCOL**:
-    1. **ABSOLUTELY NO "Guides"**: Do NOT write "Here is how you would write this page..." or "This page structure is designed to...".
-    2. **DIRECT OUTPUT**: Start immediately with the Page Title (<h1> or #) or the first content section.
-    3. **NO APOLOGIES**: If data is missing or masked, using the approved placeholder format without apologizing to the reader.
-    4. **AUTHORITATIVE VOICE**: You are the definitive source. Do not use phrases like "based on the provided context."
-- **DATA DENSITY**: Prioritize tables and lists over long paragraphs.
-- **[PHONE_MASKED] HANDLING**: If you see masked data, leave it as is or use a placeholder like "Contact for details". Do NOT write a disclaimer about it.
-"""
-
-
-# Backward Compatibility (Ensures legacy calls don't break during migration)
-STYLE_PROTOCOL = PROTOCOL_GROUNDING_RAI + PROTOCOL_VISUAL_TABULAR + PROTOCOL_LITERARY_CORE + PROTOCOL_ANTI_SLOB
-
-def get_system_instructions(intent: str, output_target: str, topic_sector: str = "TECHNICAL") -> str:
-    """
-    Architectural fix to assemble instructions modularly based on intent, target, and topic sector.
-    Prevents "Technical Over-Indexing" for non-technical subjects like Lifestyle or Politics.
-    """
-    intent = intent.upper().strip()
-    # 1. Start with Baseline Guardrails (Permanent)
-    instructions = "You are a highly capable AI assistant. Adhere strictly to these protocols:\n"
-    instructions += PROTOCOL_GROUNDING_RAI
-    
-    # 2. Visual & Tabular (Sector Aware)
-    if topic_sector == "TECHNICAL":
-        instructions += PROTOCOL_VISUAL_TABULAR
-    else:
-        instructions += """
-- **VISUAL RESTRAINT**: For non-technical LIFESTYLE or HUMANITIES content, PROHIBIT Mermaid flowcharts, logic maps, and technical JSON-LD schema blocks in the article body unless explicitly requested by the user. Use descriptive narrative or simple Markdown tables (if needed for pricing/timing) instead.
-"""
-    
-    # 3. Add Formatting (Modular)
-    if output_target == "CMS_DRAFT":
-        instructions += PROTOCOL_FORMAT_CMS
-    else:
-        instructions += PROTOCOL_FORMAT_SLACK
-        
-    # Condition: High-Fidelity intents get the full Literary and Anti-Slob treatment.
-    high_fidelity_intents = [
-        "DEEP_DIVE", "PSEO_ARTICLE", "PSEO_PAGE", "TECHNICAL_EXPLANATION", 
-        "BLOG_OUTLINE", "AUTHOR", "REWRITE", "REFINE", "THEN_VS_NOW_PROPOSAL",
-        "DIRECT_ANSWER", "SIMPLE_QUESTION", "FORMAT_GENERAL", "OPERATIONAL_REFORMAT"
-    ]
-    if intent in high_fidelity_intents:
-        instructions += PROTOCOL_LITERARY_CORE
-        
-        # Sector-Aware Anti-Slob
-        if topic_sector == "LIFESTYLE":
-            instructions += "\n- **LIFESTYLE PERSONA**: You are an Expert Travel & Lifestyle Journalist and Independent Curator. Use warm, inviting prose. Focus on sensory details and discovery. **SYNTHETIC NARRATIVE**: Avoid repetitive name-dropping of search platforms (e.g., TripAdvisor). Weave facts into your own narrative and use inline links for attribution."
-        elif topic_sector == "HUMANITIES":
-             instructions += "\n- **HUMANITIES PERSONA**: You are a Sociopolitical Analyst and Researcher. Use objective, authoritative, and nuanced prose. Focus on systemic drivers and human impacts."
-        else:
-             instructions += "\n- **TECHNICAL PERSONA**: You are a Specialized Technical Writer. Use precise, efficient, and data-dense prose. Focus on architecture and implementation."
-
-    if intent == "PSEO_PAGE":
-        instructions += PROTOCOL_PSEO_PAGE
-        
-    if intent in ["PSEO_ARTICLE", "DEEP_DIVE", "PSEO_PAGE", "DIRECT_ANSWER"]:
-        instructions += PROTOCOL_ANTI_SLOB
-        
-    return instructions.strip()
+# --- MODULAR STYLE & SANITIZATION PROTOCOL (Consolidated in shared.utils) ---
+# (Remaining PROTOCOL_* constants and get_system_instructions removed, now imported from shared.utils)
 
 # --- HELPER: Dynamic Linguistic Palette ---
-def get_stylistic_mentors(session_id=None):
-    """
-    Dynamically retrieves randomized stylistic mentors from the shared linguistic palette.
-    Seeded by session_id to ensure consistency per-thread while maintaining cross-thread variety.
-    """
-    import hashlib
-    import random
-    
-    # Try multiple common relative paths for the shared JSON
-    paths_to_try = [
-        os.path.join(os.path.dirname(__file__), "..", "shared", "linguistic_palette.json"),
-        os.path.join(os.path.dirname(__file__), "shared", "linguistic_palette.json"),
-        os.path.join(os.path.dirname(__file__), "linguistic_palette.json")
-    ]
-    
-    palette_path = next((p for p in paths_to_try if os.path.exists(p)), None)
-    
-    try:
-        if not palette_path:
-            return ""
-            
-        with open(palette_path, 'r') as f:
-            palette = json.load(f)
-            
-        # Seed for stable variety within a session
-        if session_id:
-            seed_val = int(hashlib.md5(session_id.encode()).hexdigest(), 16) % (10**8)
-            rng = random.Random(seed_val)
-        else:
-            rng = random.Random()
-            
-        mentors = []
-        
-        # Pick 3 transitions from each core category
-        categories = palette.get("transitions", {})
-        # Focus on the most common variety injectors
-        key_categories = [
-            "opposition_limitation_contradiction", 
-            "cause_condition_purpose", 
-            "examples_support_emphasis",
-            "agreement_addition_similarity"
-        ]
-        
-        for cat in key_categories:
-            words = categories.get(cat, [])
-            if words:
-                sample = rng.sample(words, min(3, len(words)))
-                mentors.append(f"- {cat.replace('_', ' ').title()}: {', '.join(sample)}")
-            
-        # Pick 6 active verbs
-        verbs = palette.get("verbs", {}).get("active_mentors", [])
-        if verbs:
-            sample_verbs = rng.sample(verbs, min(6, len(verbs)))
-            mentors.append(f"- Active Verb Mentors: {', '.join(sample_verbs)}")
-            
-        return "\n### DYNAMIC STYLE PALETTE (TURN MENTORS):\nREQUIRED: Use at least two (2) words from the mentors below to maintain linguistic texture.\n" + "\n".join(mentors)
-    except Exception as e:
-        print(f"⚠️ get_stylistic_mentors error: {e}")
-        return ""
+# (get_stylistic_mentors removed, now imported from shared.utils)
 
 # --- HELPER: Citation Engine (Inline Anchors) ---
-def extract_labeled_sources(context_str):
-    """
-    Extracts URLs from context and returns a labeled list for the LLM.
-    """
-    if not context_str: return ""
-    # Extract unique URLs
-    found_urls = list(dict.fromkeys(re.findall(r'https?://[^\s<>"]+', str(context_str))))
-    # Filter noisy dev/system URLs
-    clean_urls = [u for u in found_urls if not any(x in u for x in ["ghost-api", "image", "google-adk", "localhost", "mcp-sensory-server", "favicon", "google.com/search"])]
-    if not clean_urls: return ""
-    
-    labeled_list = "\n".join([f"SOURCE [{i+1}]: {url}" for i, url in enumerate(clean_urls[:8])])
-    return f"\nADK_CITATION_GROUNDING_RESOURCES:\n{labeled_list}\n"
+# (extract_labeled_sources removed, now imported from shared.utils)
 
 
-# --- MCP CLIENT ---
-class RemoteTools:
-    """
-    Acts as a bridge to the MCP Sensory Tools Server.
-    """
-    def __init__(self, server_url="http://localhost:8080"):
-        self.server_url = server_url.rstrip("/")
-        # Automatically detect if we need authentication (Cloud Run or Cloud Functions)
-        self.is_gcp = "run.app" in server_url or "cloudfunctions.net" in server_url
-
-    def _get_id_token(self):
-        """Fetches an OIDC ID token from the metadata server (only works on GCP)."""
-        try:
-            auth_req = google.auth.transport.requests.Request()
-            # The audience must be the service URL
-            return id_token.fetch_id_token(auth_req, self.server_url)
-        except Exception as e:
-            print(f"Auth Hint: If local, ensure you are authenticated. Error: {e}")
-            return None
-
-    def call_tool(self, tool_name, arguments):
-        """Standard MCP call interface."""
-        print(f"MCP: Calling remote tool '{tool_name}' with args {arguments}")
-        
-        headers = {}
-        if self.is_gcp:
-            token = self._get_id_token()
-            if token:
-                headers["Authorization"] = f"Bearer {token}"
-
-        try:
-            # We use a simple POST to our FastAPI MCP wrapper
-            response = requests.post(
-                f"{self.server_url}/messages", 
-                json={
-                    "method": "tools/call",
-                    "params": {
-                        "name": tool_name,
-                        "arguments": arguments
-                    }
-                },
-                headers=headers,
-                timeout=300,
-                verify=certifi.where()
-            )
-            if response.status_code != 200:
-                logging.error(f"MCP Server Error {response.status_code}: {response.text}")
-                return f"Error: MCP Server returned {response.status_code}"
-            
-            data = response.json()
-            # Extract text from MCP response format
-            content = data.get("result", {}).get("content", [])
-            if content:
-                text_out = content[0].get("text", "No text returned.")
-                logging.info(f"MCP Tool Success: {tool_name} (Length: {len(text_out)})")
-                print(f"  -> MCP OUT [{tool_name}]: {text_out[:150].replace(chr(10), ' ')}...")
-                return text_out
-            logging.warning(f"MCP Tool '{tool_name}' returned empty content.")
-            return "Empty response from tool."
-        except Exception as e:
-            return f"MCP Error: {str(e)}"
-
-    def call(self, tool_name, arguments):
-        """Backward compatibility for legacy calls in the codebase."""
-        return self.call_tool(tool_name, arguments)
-
-def get_mcp_client():
-    global mcp_client
-    if mcp_client is None:
-        url = MCP_SERVER_URL
-        logging.info(f"MCP CLIENT INIT: Connecting to {url}")
-        mcp_client = RemoteTools(url)
-    return mcp_client
+# (RemoteTools and get_mcp_client removed, now centralized in shared.utils)
 
 def sanitize_llm_html(raw_html):
     """
@@ -494,37 +177,22 @@ def sanitize_llm_html(raw_html):
     fence_match = re.match(fence_pattern, sanitized, re.DOTALL | re.IGNORECASE)
     if fence_match:
         sanitized = fence_match.group(1).strip()
-        
-    return sanitized
+
+    # 4. Anti-Leakage: Strip accidental JSON blocks at the start (common in agent drift)
+    # If the response starts with a code block contains "page_title" or "insight_type", it's leaked metadata
+    json_leak_pattern = r'^\s*```json\s*\{[\s\S]*?\}\s*```\s*'
+    if re.search(r'("page_title"|"insight_type"|"data_points")', sanitized[:500], re.IGNORECASE):
+        sanitized = re.sub(json_leak_pattern, '', sanitized, count=1, flags=re.IGNORECASE)
+
+    return sanitized.strip()
 
 # --- UNIFIED MODEL ADAPTER (The Brain Switch) ---
 
 
 # --- Safety Utils ---
-def scrub_pii(text):
-    """Simple PII scrubbing for memory and logs."""
-    if not isinstance(text, str): return text
-    # Mask emails
-    text = re.sub(r'[\w\.-]+@[\w\.-]+\.\w+', '[EMAIL_MASKED]', text)
-    # Mask common phone formats
-    text = re.sub(r'\+?\d{1,3}[-.\s]?\d{3}[-.\s]?\d{3}[-.\s]?\d{4}', '[PHONE_MASKED]', text)
-    return text
+# (scrub_pii removed - user requested removal of legacy PII logic)
 
-def detect_audience_context(history):
-    """
-    Search conversation history for tone or audience instructions (e.g., "8th-grader").
-    Returns a string describing the target audience.
-    """
-    default = "Likely Senior Marketers, CTOs, and Founders, but you must value clarity and simplicity above all. Use plain English and avoid dense jargon even when discussing complex technical concepts."
-    if not history: return default
-    
-    hist_lower = history.lower()
-    if "8-grader" in hist_lower or "8th grade" in hist_lower or "explain like i'm 5" in hist_lower or "eli5" in hist_lower:
-         return "An 8th-grader. Use extremely simple words, short sentences, and clear analogies. Avoid jargon."
-    elif "non-technical" in hist_lower:
-         return "Non-technical business owners. Focus on value and 'what it does' rather than 'how it works'."
-    
-    return default
+# (detect_audience_context removed, now imported from shared.utils)
 
 def log_safety_event(event_name, data):
     """Logs safety events to Google Cloud Logging for audit traces."""
@@ -551,60 +219,7 @@ def log_safety_event(event_name, data):
         print(f"Logging Block: {e}")
 
 # --- SYSTEM HARDENING: Centralized Safe Generator ---
-def safe_generate_content(model, prompt, system_instruction=None, generation_config=None):
-    """
-    A robust wrapper for model.generate_content that:
-    1. Catches Exceptions (Legacy Vertex Failures)
-    2. Catches Soft Failures (GPT-5 Refusal Strings like 'Error generating content')
-    3. Handles Automatic Fallback to Specialist Model (Claude)
-    """
-    global specialist_model
-    
-    # Default config if None
-    if generation_config is None: generation_config = {"temperature": 0.4}
-    
-    # 1. Primary Attempt
-    try:
-        response = model.generate_content(prompt, generation_config=generation_config, system_instruction=system_instruction)
-        text = response.text
-        
-        # 2. Refusal Trap (The "Soft Failure" Check)
-        refusal_triggers = ["I encountered a safety limit", "unable to generate", "Error generating content"]
-        if any(err in text for err in refusal_triggers):
-             raise ValueError(f"Model returned Soft Refusal: {text[:50]}...")
-             
-        return text.strip()
-
-    except Exception as e:
-        print(f"⚠️ SafeGen Primary Failed ({getattr(model, 'model_name', 'Unknown')}): {e}")
-        
-        # 3. Fallback to Specialist (Claude)
-        if specialist_model and model != specialist_model:
-            print(f"🔄 SafeGen FAILOVER: Switching to Specialist Model (Anthropic)...")
-            try:
-                # Ensure Key
-                if not os.environ.get("ANTHROPIC_API_KEY") and ANTHROPIC_API_KEY:
-                     os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
-                
-                # ADK FIX: Add explicit delay for 429 mitigation
-                import time
-                print(f"🔄 SafeGen FAILOVER: Cooling down for 2s before Anthropic call...")
-                time.sleep(2)
-                
-                # Retry with backup
-                fallback_resp = specialist_model.generate_content(prompt, generation_config={"temperature": 0.4}, system_instruction=system_instruction)
-                return fallback_resp.text.strip()
-            except Exception as e2:
-                # Catch Anthropic 429 specifically
-                if "rate_limit_error" in str(e2).lower():
-                    print("⚠️ Anthropic Rate Limit hit. Ultimate fallback triggered.")
-                    return "Cognitive overload (429). Repurpose/Draft command received but requires higher quota. Please try a smaller file or wait 60s."
-                
-                print(f"❌ SafeGen Fallback Failed: {e2}")
-                # Ultimate Safety Net: Allow clean failure handled by caller or return generic error
-                return "The system is currently maximizing its cognitive load. Please try again in 60 seconds."
-        else:
-             return "Service is busy (429). Please try again later."
+# (safe_generate_content removed, now imported from shared.utils)
 
 # --- Utils ---
 # (Moved ensure_markdown_spacing to line ~960 for consolidation as ensure_slack_compatibility)
@@ -857,164 +472,83 @@ def extract_market_data(context_text, history_text, topic_slug):
             "region": "Sub-Saharan Africa"
         }
 
+
+def extract_lp_data(context_text, history_text, topic_slug, topic):
+    """
+    Synthesises lp-data JSON for the codeinjection_head block of long-form Landing Pages.
+    Parallel to extract_market_data() but designed for LP pages — produces the full
+    lp-data object that N8N injects verbatim via JSON.stringify(data_points).
+    """
+    extraction_prompt = f"""
+    You are an LP Metadata Extractor. Synthesise structured metadata for a content-heavy
+    long-form landing page on: "{topic}"
+
+    CONVERSATION CONTEXT:
+    {history_text[:5000]}
+
+    RESEARCH CONTEXT:
+    {context_text[:10000]}
+
+    Output ONLY this JSON (no markdown fences):
+    {{
+      "insight_type": "lp",
+      "category_label": "<Short topic badge, e.g. 'AI Shopping Framework'>",
+      "reading_time_label": "<Estimated read e.g. '12 min read'>",
+      "last_updated": "<Month Year e.g. 'February 2025'>",
+      "cluster_tag": "<Internal Ghost tag slug e.g. 'privacy-ai-cluster'>",
+      "key_stats": [
+        {{ "label": "<Label>", "value": "<Value>" }}
+      ],
+      "faq": [
+        {{ "q": "<Question>", "a": "<Answer>" }}
+      ]
+    }}
+
+    Rules:
+    - insight_type: always "lp" (verbatim — used by the frontend router).
+    - category_label: 2-4 words max. Topic badge shown in hero.
+    - reading_time_label: estimate from 3,000+ words base. Use "X min read".
+    - last_updated: current month + year (February 2025).
+    - cluster_tag: lowercase, hyphenated, descriptive of this LP's content cluster.
+    - key_stats: 1-3 items. MANDATORY: Search the HISTORY and RESEARCH for specific ROI metrics (e.g. Bloomreach 21.7% lift, Friendbuy 25% AOV). Do NOT hallucinate generic placeholders.
+    - faq: 2-5 pairs. Use high-intent questions from the context. PRIORITIZE "People Also Ask" (PAA) queries found in the research context to align with real-world search intent.
+    - Omit keys with empty arrays entirely.
+    - NEGATIVE CONSTRAINT: Output ONLY JSON. Do not include any conversational preamble or metadata field names in the plain-text body.
+    """
+
+    try:
+        raw_json = safe_generate_content(
+            specialist_model or unimodel,
+            extraction_prompt,
+            generation_config={"temperature": 0.2}
+        )
+
+        # Sanitize JSON fences
+        if "```json" in raw_json:
+            raw_json = raw_json.split("```json")[1].split("```")[0].strip()
+        elif "```" in raw_json:
+            raw_json = raw_json.split("```")[1].split("```")[0].strip()
+
+        data = json.loads(raw_json)
+        # Guarantee insight_type is always "lp" regardless of model output
+        data["insight_type"] = "lp"
+        return data
+
+    except Exception as e:
+        print(f"⚠️ LP Data Extraction Failed: {e}")
+        return {
+            "insight_type": "lp",
+            "category_label": "Framework",
+            "reading_time_label": "12 min read",
+            "last_updated": "February 2025",
+            "cluster_tag": f"{topic_slug}-cluster"
+        }
+
 def strip_html_tags(text):
     """Removes HTML tags for clean context stitching and plain-text views."""
     return re.sub(r'<[^>]+>', '', text).strip()
 
-def convert_html_to_markdown(html_str):
-    """
-    Converts architectural HTML into Slack-friendly Markdown with a clear hierarchy.
-    Hardened to protect code blocks from global tag stripping (fixes < > consumptions).
-    """
-    if not html_str: return ""
-    import html
-    import uuid
-
-    # 0. Pre-Pass: Strip LLM Preamble/Banter
-    text = re.sub(r'(?i)^(Part \d+:?|Here is.*?:\s*)', '', str(html_str)).strip()
-    
-    # 0a. Pre-Pass: Fix "Leaky Markdown" (Backticks outside of code tags)
-    # This prevents double-encoding when LLM mistakenly uses markdown inside HTML
-    if "<code>" in text or "```" in text:
-        text = re.sub(r'(?<!<code>)```[a-z]*\n?([\s\S]*?)\n?```(?!</code>)', r'<code>\1</code>', text, flags=re.IGNORECASE)
-        text = re.sub(r'(?<!<code>)`([^`\n]+)`(?!</code>)', r'<code>\1</code>', text, flags=re.IGNORECASE)
-
-    # 1. Strip raw Markdown headers
-    text = re.sub(r'^\s*#{1,6}\s*(.*?)$', r'*\1*', text, flags=re.MULTILINE)
-    
-    # Placeholder system to protect code from final tag strip
-    protected_blocks = {}
-
-    def protect_block(md_content):
-        placeholder = f"__PROTECTED_CODE_{uuid.uuid4().hex}__"
-        protected_blocks[placeholder] = md_content
-        return placeholder
-
-    # 2. Mermaid Blocks (Specialist Visual Handling via MCP)
-    def mermaid_markdown_handler(match):
-        full_block = match.group(0)
-        code_match = re.search(r'<code[^>]*class="[^"]*mermaid[^"]*"[^>]*>([\s\S]*?)</code>', full_block, re.IGNORECASE)
-        if not code_match: return full_block
-        mermaid_code = code_match.group(1).strip()
-        
-        caption = "Mermaid Diagram"
-        caption_match = re.search(r'<figcaption>(.*?)</figcaption>', full_block, re.IGNORECASE)
-        if caption_match:
-            caption = re.sub(r'<[^>]+>', '', caption_match.group(1).strip())
-
-        try:
-            mcp = get_mcp_client()
-            md = mcp.call_tool("render_mermaid", {
-                "mermaid_code": mermaid_code, 
-                "format": "markdown",
-                "alt": caption,
-                "caption": caption
-            })
-            return protect_block(md)
-        except Exception:
-            return protect_block(f"```mermaid\n{mermaid_code}\n```")
-
-    fig_pattern = r'<figure[^>]*>(?:(?!</figure>)[\s\S])*?<code[^>]*class="[^"]*mermaid[^"]*"[^>]*>(?:(?!</figure>)[\s\S])*?</code>(?:(?!</figure>)[\s\S])*?</figure>'
-    text = re.sub(fig_pattern, mermaid_markdown_handler, text, flags=re.IGNORECASE)
-
-    # Orphan Mermaid Handler
-    orphan_pattern = r'<pre\s*[^>]*><code\s+class="[^"]*mermaid[^"]*">([\s\S]*?)</code></pre>|<code\s+class="[^"]*mermaid[^"]*">([\s\S]*?)</code>'
-    def orphan_handler(match):
-        code = (match.group(1) or match.group(2) or "").strip()
-        try:
-            mcp = get_mcp_client()
-            md = mcp.call_tool("render_mermaid", {"mermaid_code": code, "format": "markdown"})
-            return protect_block(md)
-        except Exception:
-            return protect_block(f"```mermaid\n{code}\n```")
-    text = re.sub(orphan_pattern, orphan_handler, text, flags=re.IGNORECASE)
-
-    # 3. General Code Blocks
-    def general_code_handler(match):
-        attrs = match.group(1)
-        code = match.group(2)
-        # SANITATION: Unescape entities and strip internal HTML tags from code
-        code = html.unescape(code)
-        # BUGFIX: Use more precise tag regex to avoid stripping < and > operators in logic (e.g. if x < 10)
-        code = re.sub(r'<[a-z/][^>]*>', '', code, flags=re.IGNORECASE)
-        
-        lang_match = re.search(r'language-(\w+)', attrs, re.IGNORECASE)
-        if lang_match or '\n' in code.strip():
-            lang = lang_match.group(1) if lang_match else ""
-            return protect_block(f"```{lang}\n{code.strip()}\n```")
-        return protect_block(f"`{code.strip()}`")
-
-    text = re.sub(r'<pre><code([^>]*)>([\s\S]*?)</code></pre>', general_code_handler, text, flags=re.IGNORECASE)
-    text = re.sub(r'<code([^>]*)>([\s\S]*?)</code>', general_code_handler, text, flags=re.IGNORECASE)
-
-    # 5. Tables (Simple to Pipe conversion for Slack)
-    def table_handler(match):
-        table_html = match.group(0)
-        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table_html, re.DOTALL | re.IGNORECASE)
-        if not rows: return ""
-        md_table = []
-        for i, row in enumerate(rows):
-            cols = re.findall(r'<(?:td|th)[^>]*>(.*?)</(?:td|th)>', row, re.DOTALL | re.IGNORECASE)
-            # Strip internal tags from columns
-            cols = [re.sub(r'<[^>]+>', '', c).strip() for c in cols]
-            if not cols: continue
-            md_table.append("| " + " | ".join(cols) + " |")
-            if i == 0 and len(rows) > 1: # Add separator after header
-                md_table.append("| " + " | ".join(["---"] * len(cols)) + " |")
-        return "\n" + "\n".join(md_table) + "\n"
-
-    # 5. Tables (Simple to Pipe conversion for Slack)
-    def table_handler(match):
-        table_html = match.group(0)
-        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', table_html, re.DOTALL | re.IGNORECASE)
-        if not rows: return ""
-        md_table = []
-        for i, row in enumerate(rows):
-            cols = re.findall(r'<(?:td|th)[^>]*>(.*?)</(?:td|th)>', row, re.DOTALL | re.IGNORECASE)
-            # Strip internal tags from columns
-            cols = [re.sub(r'<[^>]+>', '', c).strip() for c in cols]
-            if not cols: continue
-            md_table.append("| " + " | ".join(cols) + " |")
-            if i == 0 and len(rows) > 1: # Add separator after header
-                md_table.append("| " + " | ".join(["---"] * len(cols)) + " |")
-        return "\n" + "\n".join(md_table) + "\n"
-
-    text = re.sub(r'<table[^>]*>(.*?)</table>', table_handler, text, flags=re.DOTALL | re.IGNORECASE)
-
-    # 6. Hierarchical Elements (H1-H4, Sections)
-    text = re.sub(r'<h1>(.*?)</h1>', r'*\1*\n\n', text, flags=re.IGNORECASE)
-    text = re.sub(r'<h2>(.*?)</h2>', r'\n*\1*\n', text, flags=re.IGNORECASE)
-    text = re.sub(r'<h3>(.*?)</h3>', r'\n*\1*\n', text, flags=re.IGNORECASE)
-    text = re.sub(r'<h4>(.*?)</h4>', r'*\1*\n', text, flags=re.IGNORECASE)
-    text = text.replace('</section>', '\n\n---\n\n')
-    text = re.sub(r'<section[^>]*>', '', text, flags=re.IGNORECASE)
-
-    # 7. Lists
-    def list_item_handler(match):
-        content = match.group(1).strip()
-        if re.match(r'^(\d+\.|•|-|\*)', content):
-            return f"  {content}\n"
-        return f"  • {content}\n"
-
-    text = re.sub(r'<li>(.*?)</li>', list_item_handler, text, flags=re.DOTALL | re.IGNORECASE)
-    text = text.replace('<ul>', '\n').replace('</ul>', '\n').replace('<ol>', '\n').replace('</ol>', '\n')
-    
-    # 6. Paragraphs & Line Breaks
-    text = text.replace('<p>', '').replace('</p>', '\n\n')
-    text = text.replace('<br>', '\n').replace('<br/>', '\n')
-    
-    # 7. Final Strip of remaining tags
-    # BUGFIX: Use more precise tag regex to avoid stripping < and > operators
-    text = re.sub(r'<[a-z/][^>]*>', '', text, flags=re.IGNORECASE)
-    
-    # 8. Restore Protected Blocks
-    for placeholder, original in protected_blocks.items():
-        text = text.replace(placeholder, original)
-    
-    # 9. Clean up excess newlines
-    text = re.sub(r'\n{4,}', '\n\n', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
+# (convert_html_to_markdown removed, now imported from shared.utils)
 
 def extract_trend_term(user_prompt, history=""):
     """
@@ -1070,38 +604,7 @@ def get_search_api_key():
         search_api_key = get_secret("google-search-api-key")
     return search_api_key
 
-def extract_json(text):
-    """
-    Super-Listener: Hardened extraction of JSON from LLM responses.
-    Handles markdown fences (```json) and raw braced strings.
-    """
-    if not text: return None
-    
-    # 1. Look for Markdown-wrapped blocks first
-    markdown_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
-    if markdown_match:
-        content = markdown_match.group(1).strip()
-    else:
-        # 2. Hardened Bracket Discovery (Objects or Lists)
-        # Finds the outermost [...] or {...}
-        match = re.search(r'([\[\{][\s\S]*[\]\}])', text)
-        if not match: return None
-        content = match.group(1).strip()
-    
-    try:
-        return json.loads(content)
-    except Exception as e:
-        print(f"FAILED INITIAL JSON PARSE: {e}. Attempting repair...")
-        # REPAIR STRATEGY: Handle unescaped internal quotes
-        # We look for quotes that are NOT part of a "key": or "value",/,"value"} pair
-        try:
-            # Simple heuristic: Escape quotes that aren't preceded by : or followed by , or }
-            repaired = re.sub(r'(?<![:])\s*"\s*(?![,}])', r'\"', content)
-            # Second attempt at parsing after repair
-            return json.loads(repaired)
-        except:
-            print(f"FAILED REPAIRED JSON PARSE: Raw Content: {content[:200]}")
-            return None
+# (extract_json removed, now imported from shared.utils)
 
 def extract_urls_from_text(text):
     """Extracts ALL URLs from a given string, stripping trailing punctuation."""
@@ -1854,6 +1357,11 @@ def ensure_slack_compatibility(text):
         is_empty = not line.strip()
         
         processed_line = re.sub(r'\*\*(.+?)\*\*', r'*\1*', line)
+        
+        if is_header:
+            # Convert markdown headers (# Header) to Slack bold (*Header*), allowing leading whitespace
+            processed_line = re.sub(r'^\s*#+\s+(.+)$', r'*\1*', processed_line)
+            
         new_lines.append(processed_line)
         
         if not is_empty and not is_list_item and not is_header and not is_table_row and i < len(lines) - 1:
@@ -1871,7 +1379,7 @@ def ensure_slack_compatibility(text):
 def generate_natural_answer(topic, context, history="", session_id=None, output_target="MODERATOR_VIEW", intent_label="SIMPLE_QUESTION"):
     global unimodel, research_model
     style_mentors = get_stylistic_mentors(session_id)
-    topic_sector = classify_topic_sector(topic)
+    topic_sector = classify_topic_sector(topic, flash_model=flash_model)
     
     # ARCHITECTURAL FIX: Modular Instruction Assembly
     system_instruction = get_system_instructions(intent_label, output_target, topic_sector=topic_sector)
@@ -1890,8 +1398,6 @@ def generate_natural_answer(topic, context, history="", session_id=None, output_
     print(f"DEBUG: Routing Natural Answer to [{model_name}] | Context Size: {total_context_size} chars")
 
     prompt = f"""
-    You are a helpful, knowledgeable AI assistant.
-    
     ### CONVERSATION HISTORY:
     {history}
     
@@ -1902,22 +1408,7 @@ def generate_natural_answer(topic, context, history="", session_id=None, output_
     {topic}
     
     TASK:
-    Answer naturally and conversationally. 
-    Use the GROUNDING DATA to ensure accuracy.
-    
-    ### MULTI-NICHE AUDIT PROTOCOL:
-    1. **Signal Sifting**: Carefully examine the entire GROUNDING DATA for signals matching the user's specific sub-topic (e.g., 'Politics', 'Education', 'Law').
-    2. **Avoid "Sports Blindness"**: High-volume categories like 'Sports' often dominate trend feeds. You must look past global volume to find signals that relate to the user's specific query. 
-    3. **Nuance**: If the grounding data contains niche items like 'Iyabo Obasanjo' or 'NELFUND', prioritize explaining their context over simply reporting high-volume sports scores.
-    
-    ### FORMATTING RULES:
-    1. Use **bold** for key concepts.
-    2. Ensure paragraphs are separated by blank lines.
-    3. **Code Blocks (CRITICAL)**: 
-       - For any code snippets, use markdown fenced code blocks: ```language ... ```
-       - **NEVER** include normal explanatory text INSIDE a code block.
-       - **ALWAYS** close a code block immediately after the code snippet ends.
-       - If you have multiple snippets, use separate code blocks for each.
+    Answer naturally and conversationally using the GROUNDING DATA to ensure accuracy.
     """
     
     # Use Safe Gen Wrapper with system_instruction
@@ -1949,7 +1440,7 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
         formatting_directive = ""
 
     # ARCHITECTURAL FIX: Modular Instruction Assembly
-    topic_sector = classify_topic_sector(topic)
+    topic_sector = classify_topic_sector(topic, flash_model=flash_model)
     system_instruction = get_system_instructions(research_intent, output_target, topic_sector=topic_sector)
     system_instruction += f"\n\n{style_mentors}"
 
@@ -2008,7 +1499,6 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     
     ### CONTEXT & MISSION:
     The user is engaged in a thread about: "{context_topic}"
-    (Audience is already defined in persona above)
     
     ### LATEST INSTRUCTION (PRIORITY):
     "{topic}"
@@ -2022,23 +1512,6 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     ### FORMATTING GUIDANCE:
     {intent_instruction}
     {extract_labeled_sources(context)}
-    
-    TOPIC: {topic}
-    
-    ### CRITICAL RULES:
-    1. Generate a response that directly addresses the LATEST INSTRUCTION while using the GROUNDING DATA as supporting evidence.
-    2. **GROUNDING DATA PRIORITY (MANDATORY - Universal)**: If GROUNDING DATA contains current information on ANY topic, you MUST prioritize it over your training data. Your training data has a knowledge cutoff; GROUNDING DATA represents real-time, verified information. 
-    3. **Temporal Awareness Protocol**: When GROUNDING DATA contains timestamps or version information:
-       - Check if information is current or outdated.
-       - If information is superseded in GROUNDING DATA, use the replacement.
-       - Natural Integration: Weave temporal context naturally (e.g., "In early 2026," or "Current shifts show...") to avoid repetitive 'According to...' phrasing.
-    4. **Implementation Protocol** (for technical content):
-       - First, check GROUNDING DATA for current versions and deprecation status.
-       - Explicitly state which version you are using in comments or documentation.
-       - If GROUNDING DATA shows deprecation, use the replacement mentioned.
-    5. **Formatting Protocol (MANDATORY)**: 
-       - **If TARGET: CMS_DRAFT (Ghost)**: Use semantic HTML `<pre><code class="language-...">...</code></pre>`. Always specify the language (e.g., `language-python`) for syntax highlighting. PROHIBIT triple backticks. Use `<h2>` and `<h3>` for headers (PROHIBIT `#`). Use `<p>` for paragraphs.
-       - **If TARGET: MODERATOR_VIEW (Slack)**: Use markdown fenced code blocks with triple backticks and the language identifier (e.g., ```python). Use Markdown headers (`#`, `##`). Use `<p>` for prose paragraphs (Slack-safe).
     """
 
     # Use Safe Gen Wrapper with system_instruction
@@ -2244,7 +1717,7 @@ def chunked_refactor_article(source_text, audience_context, specialist_model, st
 def generate_pseo_article(topic, context, history="", history_events=None, is_initial_post=True, session_id=None, output_target="CMS_DRAFT"):
     global unimodel
     style_mentors = get_stylistic_mentors(session_id)
-    topic_sector = classify_topic_sector(topic)
+    topic_sector = classify_topic_sector(topic, flash_model=flash_model)
     
     # --- STRATEGIC CONTEXT SANITIZATION: Strip internal meta-talk from history ---
     if output_target == "CMS_DRAFT":
@@ -2355,23 +1828,14 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
 
         print("  + Using Single-Pass Refactor (Small Article)")
         refactor_prompt = f"""
-        You are a Content Refactor Engine specializing in high-fidelity Ghost CMS delivery.
-        
+        You are a Content Refactor Engine.
+        TASK: Convert the 'SOURCE TEXT' into target GHOST-FRIENDLY HTML format.
+
         TARGET AUDIENCE: {audience_context}
         
-        TASK: Convert the 'SOURCE TEXT' into target GHOST-FRIENDLY HTML format.
-        
-        4.  **Code Blocks**: Use semantic HTML: `<pre><code class="language-...">...</code></pre>`.
-        5.  **Mermaid Diagrams**: MUST be preserved. Wrap Mermaid code in a `<figure class="kg-card kg-image-card kg-width-wide">` block. Inside, include the `<pre><code class="language-mermaid">...</code></pre>` and a context-aware `<figcaption>...</figcaption>`.
-        6.  **Lists**: Use semantic `<ul><li>` or `<ol><li>`.
-        7.  **Paragraphs**: Wrap all text in <p> tags.
-        
-        CRITICAL CONTENT RULES:
-        - **Semantic Integrity**: Ensure the article flows logically and follows the structure of the source text.
-        - **Acronym Protocol**: Define all acronyms in parentheses on the first use.
-        - **Inline Anchored Links**: Ensure all external links are preserved as semantic HTML anchored tags: `<a href="URL">Anchor Text</a>`.
-        
-        {target_instruction}
+        STRATEGIC REQUIREMENTS:
+        - Preservation: Do NOT summarize. Refactor exactly as it appears.
+        - Acronym Protocol: Define acronyms on first use.
 
         SOURCE TEXT:
         {source_to_refactor}
@@ -2436,33 +1900,8 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     prompt = f"""
     {system_instruction}
     
-    AUDIENCE: 
-    {audience_context}
-    
-    TONE & STYLE:
-    {tone_instruction}
-    
-    {target_instruction}
-    
-    STRUCTURE REQUIREMENTS (Strict HTML):
-    1.  **<section class="intro">**: A compelling hook. **MEAT-FIRST**: Deliver core findings or data-driven insights immediately in the first paragraph.
-    2.  **<section class="body">**: Detailed analysis using <h2> and <h3> tags.
-    3.  **NO NUMBERED HEADINGS**: Do NOT include numbers (e.g., "1. ", "2. ") in your <h2> or <h3> headers.
-    4.  **Code Blocks**: Use semantic HTML: `<pre><code class="language-...">...</code></pre>`.
-    5.  **Mermaid Diagrams**: MUST be preserved (ONLY for TECHNICAL sector). Wrap Mermaid code in a `<figure class="kg-card kg-image-card kg-width-wide">` block. 
-    6.  **Lists**: Use semantic `<ul><li>` or `<ol><li>`.
-    7.  **<section class="methodology">**: A { 'TECHNICAL TRANSPARENCY' if topic_sector == 'TECHNICAL' else 'REFERENCES & ACCOUNTABILITY' if topic_sector == 'HUMANITIES' else 'INSIGHTS & SOURCES' } FOOTER. 
-    
-    CRITICAL CONTENT RULES:
-    - **Contextual Specificity**: Actively identify and expand on points of interest, debates, cultural markers, or specific real-world examples found in the research context.
-    - **Sector-Aware Mapping**: Identify relevant external frameworks (regulatory, structural, or conceptual for Technical; cultural or historical for Humanities) and explicitly link solutions/insights to those anchors.
-    - **Accuracy**: Ensure all claims are supported by the provided context.
-    - **Acronym Protocol**: Define all acronyms in parentheses on the first use (e.g. "Electronic Data Interchange (EDI)").
-    
-    CRITICAL RULES:
-    - Do NOT hallucinate.
-    - Return ONLY valid semantic HTML content. Absolutely NO MARKDOWN.
-    - Always specify the programming language in the code class.
+    AUDIENCE: {audience_context}
+    TONE & STYLE: {tone_instruction}
     
     CONTEXTUAL DATA:
     Current Topic: "{topic}"
@@ -2470,12 +1909,6 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     {context_block}
     
     {extract_labeled_sources(context_block)}
-    
-    CRITICAL CITATION RULE:
-    - **Inline Anchored Links**: When referencing facts or data points from the GROUNDING SOURCES, you MUST use semantic HTML anchored links inside the prose: `<a href="URL">Anchor Text</a>`.
-    - **No Link Dumps**: Absolutely PROHIBIT appending a list of "Sources" or "References" at the end of the article. Grounding must be 100% inline for SEO and readability.
-    
-    Article Draft:
     """
     
     raw_response = safe_generate_content(unimodel, prompt, system_instruction=sys_instruction, generation_config={"temperature": 0.4})
@@ -2488,7 +1921,7 @@ def generate_pseo_page(topic, context, history="", history_events=None, is_initi
     """
     global unimodel, specialist_model
     
-    topic_sector = classify_topic_sector(topic)
+    topic_sector = classify_topic_sector(topic, flash_model=flash_model)
     topic_lower = topic.lower()
     style_mentors = get_stylistic_mentors(session_id)
     audience_context = detect_audience_context(history)
@@ -2582,23 +2015,148 @@ def generate_pseo_page(topic, context, history="", history_events=None, is_initi
         AUDIENCE: {audience_context}
         
         {context_block}
-        
-        STRUCTURE REQUIREMENTS:
-        1. **Title**: <h1> or # Based on target.
-        2. **Overview**: Key stats and high-density summary.
-        3. **Details**: Nested tables and specific data breaks.
-        4. **FAQ**: Technical/Locational Q&A.
         """
         raw_response = safe_generate_content(unimodel, prompt, system_instruction=sys_instruction, generation_config={"temperature": 0.2})
 
     return post_process_mermaid_to_images(sanitize_llm_html(raw_response))
 
 
+# 14.2 The LP Page Generator (Long-Form Pillar Page)
+def generate_lp_page(topic, context, history="", history_events=None, is_initial_post=True, session_id=None, output_target="CMS_DRAFT"):
+    """
+    Generates a long-form Landing Page (LP) for a specific framework, concept, or strategy.
+    Uses the same REFACTOR / EXPAND / AUTHOR tri-state as generate_pseo_page(), but prompts
+    target 3,000+ word depth and never reference market geo fields.
+    """
+    global unimodel, specialist_model
+
+    topic_sector = classify_topic_sector(topic, flash_model=flash_model)
+    topic_lower = topic.lower()
+    style_mentors = get_stylistic_mentors(session_id)
+    audience_context = detect_audience_context(history)
+    is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
+
+    # 1. Tri-State Mode Detection (mirrors generate_pseo_page logic)
+    start_mode = "AUTHOR"
+    is_repurpose_cmd = any(kw in topic_lower for kw in ["dump", "repurpose", "re-purpose", "refactor", "correct", "fix", "update", "refine", "publish", "provision", "finalize"])
+    is_expand_cmd = any(kw in topic_lower for kw in ["expand", "flesh out", "write from", "based on outline", "polish", "rewrite"])
+    has_outline_structure = "## " in str(history) and len(str(history)) < 3500
+    has_full_draft_structure = ("## " in str(history) or "<table>" in str(history)) and len(str(history)) > 3500
+
+    if not is_initial_post and not is_repurpose_cmd and not is_expand_cmd and not has_full_draft_structure and not has_outline_structure:
+        start_mode = "AUTHOR"
+    elif is_repurpose_cmd and (has_full_draft_structure or not is_initial_post):
+        start_mode = "REFACTOR"
+    elif (is_expand_cmd and "## " in str(history)) or (has_outline_structure and not is_repurpose_cmd):
+        start_mode = "EXPAND"
+    elif is_repurpose_cmd and has_outline_structure:
+        start_mode = "EXPAND"
+    elif not is_initial_post:
+        start_mode = "REFACTOR"
+
+    print(f"  + LP Page Generation Mode Selected: {start_mode}")
+
+    # Always refactor based on holistic thread history for LPs
+    best_source_text = None
+    if history:
+        best_source_text = history
+        print(f"  + Holistic Grounding: Using full thread history ({len(history)} chars) for refactor/update.")
+
+    # 2. Instruction Assembly
+    # Port from PSEO_PAGE to PSEO_ARTICLE intent to ensure narrative depth/high-fidelity persona
+    sys_instruction = get_system_instructions("PSEO_ARTICLE", output_target, topic_sector=topic_sector)
+    sys_instruction += f"\n\n{style_mentors}"
+
+    # 3. Sector-Aware Persona Determination (Mirroring Article Logic)
+    if topic_sector == "LIFESTYLE":
+        persona = "Expert Travel & Lifestyle Journalist"
+        goal = "Clear, warm, and inviting prose."
+    elif topic_sector == "HUMANITIES":
+        persona = "Sociopolitical Analyst and Researcher"
+        goal = "Objective, authoritative, and nuanced prose."
+    else:
+        persona = "Pillar Page Strategist"
+        goal = "High-authority, 3,000+ word technical framework landing page."
+
+    context_block = f"Research Context for Depth and Citations:\n{context}" if is_grounded else "Use internal knowledge and expert synthesis."
+    
+    # 4. Prompt Engineering
+    if start_mode == "REFACTOR":
+        print("  + Executing LP Page REFACTOR with Specialist Model")
+        source_to_refactor = best_source_text or history
+        labeled_sources = extract_labeled_sources(str(context) + "\n" + str(source_to_refactor))
+        prompt = f"""
+        You are a Pillar Page Architect.
+        TASK: Refactor/Upgrade the 'SOURCE TEXT' into a definitive 3,000+ word strategy pillar.
+
+        AUDIENCE: {audience_context}
+        PERSONA: {persona} ({goal})
+
+        STRATEGIC REQUIREMENTS:
+        - Target: 3,000+ words minimum
+        - Focus on narrative authority and structural clarity.
+        - Ensure every H2 section is substantive and contains unique technical depth.
+
+        SOURCE TEXT:
+        {source_to_refactor}
+
+        {context_block}
+
+        {labeled_sources}
+        """
+        raw_response = safe_generate_content(specialist_model, prompt, system_instruction=sys_instruction, generation_config={"temperature": 0.2})
+
+    elif start_mode == "EXPAND":
+        print("  + Executing LP Page EXPAND with Unimodel")
+        labeled_sources = extract_labeled_sources(str(context) + "\n" + str(history))
+        prompt = f"""
+        You are an {persona}.
+        TASK: Write a comprehensive long-form landing page based on the OUTLINE/STRUCTURE below.
+
+        AUDIENCE: {audience_context}
+        GOAL: {goal}
+
+        STRUCTURE/OUTLINE:
+        {history}
+
+        STRATEGIC REQUIREMENTS:
+        - Target: 3,000+ words minimum.
+        - Every H2 section must be substantive — no single-paragraph stubs.
+        - Focus on narrative framework and persuasive storytelling.
+
+        {context_block}
+
+        {labeled_sources}
+        """
+        raw_response = safe_generate_content(unimodel, prompt, system_instruction=sys_instruction, generation_config={"temperature": 0.3})
+
+    else:
+        print("  + Executing LP Page AUTHOR with Unimodel")
+        prompt = f"""
+        You are an {persona}.
+        TOPIC: {topic}
+        TASK: Write a NEW long-form, high-authority landing page on this topic.
+
+        AUDIENCE: {audience_context}
+        GOAL: {goal}
+
+        STRATEGIC REQUIREMENTS:
+        - Minimum 3,000 words.
+        - Every H2 section must be substantive and authoritative.
+
+        {context_block}
+
+        {extract_labeled_sources(context_block)}
+        """
+        raw_response = safe_generate_content(unimodel, prompt, system_instruction=sys_instruction, generation_config={"temperature": 0.4})
+
+    return post_process_mermaid_to_images(sanitize_llm_html(raw_response))
+
 # 14.5 The Recursive Deep-Dive Generator (Dynamic Room-by-Room Construction)
 def generate_deep_dive_article(topic, context, history="", history_events=None, target_length=1500, target_geo="Global", session_id=None, output_target="MODERATOR_VIEW"):
     global unimodel
     style_mentors = get_stylistic_mentors(session_id)
-    topic_sector = classify_topic_sector(topic)
+    topic_sector = classify_topic_sector(topic, flash_model=flash_model)
     
     target_instruction = ""
     if output_target == "MODERATOR_VIEW":
@@ -2686,19 +2244,9 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     REGION: {target_geo}
     
     AUDIENCE: {audience_context}
-    STYLE: Clear, engaging, professional English. Use analogies for complex ideas.
-    
-    {target_instruction}
-    
     GOAL: {topic}
     
     {extract_labeled_sources(context if is_grounded else "")}
-    
-    CRITICAL CITATION RULE:
-    - **Inline Anchored Links**: When referencing facts or data points from the GROUNDING SOURCES, you MUST use semantic HTML anchored links inside the prose: `<a href="URL">Anchor Text</a>`.
-    - **No Link Dumps**: Absolutely PROHIBIT appending a list of "Sources" or "References" at the end of the section.
-    
-    OUTPUT: Return ONLY the content in semantic HTML (no markdown). Wrap paragraphs in <p>. Do NOT include <h1> or <h2> headers here.
     """
     intro_raw = safe_generate_content(unimodel, intro_prompt, system_instruction=intro_sys)
     article_parts.append(f'<section class="intro">\n{sanitize_llm_html(intro_raw)}\n</section>')
@@ -2727,19 +2275,8 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
         Write a {section_words}-word section for: "{title}".
         REGION: {target_geo}
         
-        {target_instruction}
-        
         CHAPTER {index+1}/{total_sections}: {section['title']}
         INSTRUCTION: {instruction}
-        TASK: Write a full {section['target_word_count']} word article section for the title: "{section['title']}".
-        OVERALL TOPIC: {title}
-        
-        ### WRITING GUIDANCE (FROM ARCHITECT):
-        {section['writing_instruction']}
-        
-        ### LINGUISTIC DIRECTIVES:
-        - **HUMAN FINGERPRINT**: Mandate punctuation diversity (semicolons/parentheses).
-        - **TACTICAL TRANSITIONS**: BAN robotic connectors. Use context-aware movements.
         
         GROUNDING DATA: {context if is_grounded else "Internal Knowledge base"}
         {extract_labeled_sources(context if is_grounded else "")}
@@ -2885,6 +2422,8 @@ def process_sales_transcript(transcript_text, output_target="MODERATOR_VIEW"):
     """
     global specialist_model, db
     
+    style_mentors = get_stylistic_mentors()
+    
     # ARCHITECTURAL FIX: Modular Instruction Assembly
     # Extraction phase uses lightweight reasoning.
     extraction_sys = get_system_instructions("SIMPLE_QUESTION", "MODERATOR_VIEW")
@@ -2950,7 +2489,6 @@ def process_sales_transcript(transcript_text, output_target="MODERATOR_VIEW"):
     # Solution Brief
     ## Executive Summary
     ## Objection Responses
-    {target_instruction}
     
     ### FORMATTING RULES (PRIORITY):
     1. Use **bold** for emphasis.
@@ -2987,7 +2525,7 @@ def process_story_logic(request):
 
 @functions_framework.http
 def _process_story_logic_inner(request):
-    global unimodel, flash_model, research_model, specialist_model, db, mcp_client
+    global unimodel, flash_model, research_model, specialist_model, db
 
     # 0. ENTRY TELEMETRY (Observability)
     now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -3016,8 +2554,8 @@ def _process_story_logic_inner(request):
     if db is None:
         db = firestore.Client(project=PROJECT_ID)
 
-    # Late-Init for MCP (Standardized Resilience) 🛡️🏗️🛡️
-    mcp_client = get_mcp_client()
+    # Late-Init for MCP (Shared Resilient Implementation) 🛡️🏗️🛡️
+    get_mcp_client()
 
     req = request.get_json(silent=True)
     if not req:
@@ -3267,7 +2805,7 @@ def _process_story_logic_inner(request):
         
         triage_prompt = f"""
             Analyze the user's latest message in the context of the conversation history.
-            Classify the PRIMARY GOAL into one of seven categories.
+            Classify the PRIMARY GOAL into one of the categories below.
             
             ### DECISION PRINCIPLES:
             1.  **Fresh Start Rule**: Treat every message as a fresh decision point. Do not assume the goal remains the same as the previous turn just because a specific mode (like pSEO) was active previously.
@@ -3311,7 +2849,12 @@ def _process_story_logic_inner(request):
                 *   *Super-Keyword Rule:* If the prompt contains "pSEO Ghost Page" or "pSEO Ghost CMS Page", this is MANDATORY.
                 *   *Triggers:* "Create a pSEO Ghost Page for NYC", "Generate the entity page on pSEO Ghost CMS", "Build the location specific page on pSEO Ghost CMS".
 
-            7.  **SALES_TRANSCRIPT**: **Sales Analysis.** Select this if the user provides a transcript or asks to analyze a sales call for objections, solution briefs, or deal coaching.
+            7.  **PSEO_LP**: **Long-Form Landing Page (Pillar/Hub Page).** Select this when the user wants a permanent, high-authority, long-form page (3,000+ words) on a framework, concept, or strategy — NOT a market-data entity page.
+                *   *Super-Keyword Rule:* If the prompt contains "**Ghost LP**", "**LP Ghost Page**", "**Ghost Landing Page**", or "**LP Ghost CMS**", this is MANDATORY.
+                *   *Triggers:* "Create a Ghost LP for the Privacy Framework", "Build the landing page on Ghost CMS", "Write a pillar page for Ghost LP".
+                *   *Dichotomy Rule:* Use PSEO_PAGE for geo/entity data cards. Use PSEO_LP for evergreen framework/strategy pages.
+
+            8.  **SALES_TRANSCRIPT**: **Sales Analysis.** Select this if the user provides a transcript or asks to analyze a sales call for objections, solution briefs, or deal coaching.
                 *   *Triggers:* "Analyze this call", "Create a solution brief", "Extract objections", "What were the pain points?".
                 *   *Rule:* If the user requests a "Solution Brief" from text, select this.
 
@@ -3322,7 +2865,7 @@ def _process_story_logic_inner(request):
             9.  **DIRECT_ANSWER**: **The Research Architect.** Select this ONLY for **NOVEL SYNTHESIS** or **TECHNICAL AUDITS** that require combining multiple external data sources into a new expert opinion. 
                 *   *Example:* "Analyze the security layer of AP2 vs standard PCI-DSS." 
 
-            10.  **OPERATIONAL_REFORMAT**: **The Efficiency Engine.** Select this for any structural command whose COMPLETE context is already available in the history.
+            10. **OPERATIONAL_REFORMAT**: **The Efficiency Engine.** Select this for any structural command whose COMPLETE context is already available in the history.
                 *   *Triggers:* "Summarize our progress", "Reformat these points as bullets", "Make it more professional", "Convert this into a brief".
                 *   *CRITICAL:* If the request is purely about structural formatting of existing knowledge, select this.
                 *   *EXCEPTION:* If the user says "Repurpose... for pSEO" or "Create a pSEO article", select **PSEO_ARTICLE**. 
@@ -3353,16 +2896,22 @@ def _process_story_logic_inner(request):
         # ADK HARDENING: Deterministic Triage Override (Keyword Overlord)
         # This prevents the LLM from misclassifying Ghost/pSEO requests as Operational Reformats.
         keyword_payload = sanitized_topic.lower()
-        
-        # PSEO_PAGE: Force intent for explicit page requests (First priority)
-        if any(kw in keyword_payload for kw in ["pseo ghost page", "pseo ghost cms page"]):
+
+        # PSEO_LP: Force intent for Landing Page requests (Highest priority — checked first)
+        if any(kw in keyword_payload for kw in ["ghost lp", "lp ghost", "ghost landing page", "landing page cms", "lp ghost cms", "ghost lp page"]):
+            if "PSEO_LP" not in intent:
+                print(f"🎯 TRIAGE OVERRIDE: Forcing PSEO_LP due to keywords in '{sanitized_topic[:30]}'")
+                intent = "PSEO_LP"
+
+        # PSEO_PAGE: Force intent for explicit entity-level page requests
+        elif any(kw in keyword_payload for kw in ["pseo ghost page", "pseo ghost cms page"]):
             if "PSEO_PAGE" not in intent:
                 print(f"🎯 TRIAGE OVERRIDE: Forcing PSEO_PAGE due to keywords in '{sanitized_topic[:30]}'")
                 intent = "PSEO_PAGE"
-        
+
         # PSEO_ARTICLE: Preserved logic (Noun base is sufficient as per user yardstick)
         elif any(kw in keyword_payload for kw in ["pseo", "pseo ghost", "pseo ghost cms"]):
-            if "PSEO_ARTICLE" not in intent and "PSEO_PAGE" not in intent:
+            if "PSEO_ARTICLE" not in intent and "PSEO_PAGE" not in intent and "PSEO_LP" not in intent:
                 print(f"🎯 TRIAGE OVERRIDE: Forcing PSEO_ARTICLE due to keywords in '{sanitized_topic[:30]}'")
                 intent = "PSEO_ARTICLE"
 
@@ -4040,12 +3589,9 @@ def _process_story_logic_inner(request):
                 # 3. Get session reference (used throughout this handler)
                 session_ref = db.collection('agent_sessions').document(session_id)
                 
-                # 4. Check if this is an update to an existing post (BEFORE updating session)
-                ghost_post_id = None
-                if not is_initial_post:
-                    # Try to find existing Ghost post ID from session metadata
-                    session_data = session_ref.get().to_dict()
-                    ghost_post_id = session_data.get('ghost_post_id') if session_data else None
+                # 4. Check for existing Ghost post ID (Prevent Duplicates)
+                session_data = session_ref.get().to_dict()
+                ghost_post_id = session_data.get('ghost_post_id') if session_data else None
                 
                 # 5. Determine operation type (ADK Interoperability: Support Pages of Posts)
                 is_page_target = (intent == "PSEO_PAGE") or any(kw in original_topic.lower() or kw in sanitized_topic.lower() for kw in ["pseo page", "collection page", "page template", "ghost page", "page slug"])
@@ -4074,12 +3620,12 @@ def _process_story_logic_inner(request):
                         slug = manual_slug
                         
                     delivery_payload["slug"] = slug
-                    # Placeholder for structured data points
                     # DYNAMIC EXTRACTION: Use the helper to get real data
                     print(f"🔍 Extracting Market Data for slug: {slug}...")
                     market_data = extract_market_data(research_data.get('context', ''), history_text, slug)
-                    
+
                     delivery_payload["data_points"] = market_data
+                    delivery_payload["script_id"] = "market-insight-data"  # N8N generic node uses this for <script id=...>
                 
                 # Set status to 'draft' ONLY for CREATE operations
                 # For UPDATE operations, omit status to preserve current status (draft or published)
@@ -4192,6 +3738,117 @@ def _process_story_logic_inner(request):
                     })
                 return jsonify({"msg": "pSEO Fallback Answer sent"}), 200
 
+        # === PATH C2: PSEO_LP GENERATION (Long-Form Landing Page) ===
+        elif intent == "PSEO_LP":
+            try:
+                target = get_output_target(intent)
+                article_html = generate_lp_page(
+                    sanitized_topic, research_data['context'],
+                    history=history_text, history_events=history_events,
+                    is_initial_post=is_initial_post, output_target=target
+                )
+
+                seo_data = generate_seo_metadata(article_html, original_topic, session_id=session_id, intent=intent)
+
+                session_ref = db.collection('agent_sessions').document(session_id)
+
+                # 4. Check for existing Ghost post ID (Prevent Duplicates)
+                session_data = session_ref.get().to_dict()
+                ghost_post_id = session_data.get('ghost_post_id') if session_data else None
+
+                # Slug generation: Check for explicit override, then fall back to generated
+                request_text = (feedback_text or original_topic).lower()
+                slug = seo_data.get("slug")
+                slug_match = re.search(r'(?:slug|link)\s+(?:to|be|is|=)\s*["\']?([a-zA-Z0-9-]+)["\']?', request_text)
+                if slug_match:
+                    slug = slug_match.group(1).strip()
+                    print(f"🎯 LP MANUAL SLUG OVERRIDE: '{slug}'")
+                
+                if not slug:
+                    fallback_text = seo_data.get("title") or sanitized_topic
+                    slug = re.sub(r'[^a-zA-Z0-9-]', '', fallback_text.lower().replace(' ', '-'))
+                # Prevent runaway slugs
+                slug = slug[:60].strip('-')
+
+                print(f"🔍 Extracting LP Data for slug: {slug}...")
+                lp_data = extract_lp_data(research_data.get('context', ''), history_text, slug, original_topic)
+
+                lp_tags = seo_data.get("tags", [])
+                if lp_data and lp_data.get("cluster_tag"):
+                    cluster_tag = f"#{lp_data.get('cluster_tag').lstrip('#')}"
+                    lp_tags = [cluster_tag]
+
+                delivery_payload = {
+                    "title": seo_data.get("title", "Untitled LP"),
+                    "html": article_html,
+                    "slug": slug,
+                    "tags": lp_tags,
+                    "meta_title": seo_data.get("meta_title"),
+                    "meta_description": seo_data.get("meta_description"),
+                    "custom_excerpt": seo_data.get("custom_excerpt"),
+                    "data_points": lp_data,
+                    "script_id": "lp-data",   # N8N generic node uses this for <script id="lp-data">
+                }
+
+                if not ghost_post_id:
+                    delivery_payload["status"] = "draft"
+                if ghost_post_id:
+                    delivery_payload["ghost_post_id"] = ghost_post_id
+
+                delivery_payload = {k: v for k, v in delivery_payload.items() if v is not None}
+
+                new_events.append({
+                    "event_type": "agent_proposal",
+                    "proposal_type": "pseo_lp",
+                    "text": convert_html_to_markdown(article_html),
+                    "proposal_data": {"article_html": article_html}
+                })
+
+                events_ref = session_ref.collection('events')
+                for event in new_events:
+                    if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
+                    _firestore_call_with_timeout(lambda: events_ref.add(event))
+
+                update_data = {
+                    "status": "awaiting_feedback",
+                    "type": "work_article",
+                    "slack_context": slack_context,
+                    "detected_geo": final_geo,
+                    "intent": intent,
+                    "last_updated": expire_time
+                }
+                if is_initial_post: update_data["topic"] = clean_topic
+                _firestore_call_with_timeout(lambda: session_ref.update(update_data))
+
+                safe_n8n_delivery({
+                    "session_id": session_id,
+                    "type": global_operation_type,
+                    "payload": delivery_payload,
+                    "query": sanitized_topic,
+                    "output_target": target,
+                    "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'),
+                    "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
+                    "is_initial_post": is_initial_post
+                })
+                return jsonify({"msg": "LP Draft sent"}), 200
+
+            except Exception as e:
+                print(f"⚠️ PSEO_LP Fallback: {e}")
+                target = get_output_target(intent)
+                answer_data = generate_comprehensive_answer(clean_topic, research_data['context'], history=history_text, context_topic=original_topic, output_target=target, intent_label=intent)
+                answer_text = answer_data['text']
+                research_intent = answer_data.get('intent', intent)
+                new_events.append({"event_type": "agent_answer", "text": answer_text, "intent": research_intent})
+                session_ref = db.collection('agent_sessions').document(session_id)
+                events_ref = session_ref.collection('events')
+                for event in new_events:
+                    if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
+                    _firestore_call_with_timeout(lambda: events_ref.add(event))
+                update_data = {"status": "awaiting_feedback", "type": "work_answer", "slack_context": slack_context, "detected_geo": final_geo, "intent": research_intent, "last_updated": expire_time}
+                if is_initial_post: update_data["topic"] = clean_topic
+                _firestore_call_with_timeout(lambda: session_ref.update(update_data))
+                safe_n8n_delivery({"session_id": session_id, "type": global_operation_type, "message": answer_text, "intent": research_intent, "output_target": target, "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel'), "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'), "is_initial_post": is_initial_post})
+                return jsonify({"msg": "LP Fallback Answer sent"}), 200
 
         else: 
             # ROBUST FALLBACK: If intent is unknown, default to a natural answer rather than crashing with 500

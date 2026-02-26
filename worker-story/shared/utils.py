@@ -1,11 +1,21 @@
 import os
+import random
+import hashlib
 import certifi
 import requests
 import concurrent.futures
+import re
+import json
+import uuid
+import datetime
+import html
+import logging
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from google.cloud import secretmanager
 import google.auth
+import google.auth.transport.requests
+from google.oauth2 import id_token
 import litellm
 from litellm import completion
 import vertexai
@@ -24,6 +34,9 @@ if not PROJECT_ID:
 
 LOCATION = os.environ.get("LOCATION", "us-central1")
 N8N_PROPOSAL_WEBHOOK_URL = os.environ.get("N8N_PROPOSAL_WEBHOOK_URL") 
+MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8080")
+mcp_client = None
+
 # Keys will be fetched dynamically below to avoid gRPC deadlocks
 
 safety_settings = {
@@ -44,7 +57,10 @@ def get_n8n_operation_type(intent, original_topic="", sanitized_topic="", ghost_
     intent_str = str(intent).upper()
     
     # PSEO Logic: Differentiate between Create and Update for Posts vs Pages
-    if intent_str in ["PSEO_ARTICLE", "PSEO_PAGE"]:
+    if intent_str in ["PSEO_ARTICLE", "PSEO_PAGE", "PSEO_LP"]:
+        if intent_str == "PSEO_LP":
+            return "pseo_lp_update" if ghost_post_id else "pseo_lp_create"
+            
         is_page_target = (intent_str == "PSEO_PAGE") or any(kw in original_topic.lower() or kw in sanitized_topic.lower() for kw in ["pseo page", "collection page", "page template", "ghost page", "page slug"])
         if is_page_target: 
             return "pseo_page_update" if ghost_post_id else "pseo_page_create"
@@ -60,7 +76,7 @@ def get_output_target(intent: str) -> str:
     """
     if not intent: return "MODERATOR_VIEW"
     intent_str = str(intent).upper().strip()
-    if intent_str in ["PSEO_ARTICLE", "PSEO_PAGE"]:
+    if intent_str in ["PSEO_ARTICLE", "PSEO_PAGE", "PSEO_LP"]:
         return "CMS_DRAFT"
     return "MODERATOR_VIEW"
 
@@ -247,3 +263,472 @@ class UnifiedModel:
                 class MockResponse:
                     def __init__(self, content): self.text = content
                 return MockResponse("Error generating content.")
+
+# --- MCP CLIENT ---
+
+class RemoteTools:
+    """Acts as a bridge to the MCP Sensory Tools Server."""
+    def __init__(self, server_url="http://localhost:8080"):
+        self.server_url = server_url.rstrip("/")
+        self.is_gcp = "run.app" in server_url or "cloudfunctions.net" in server_url
+
+    def _get_id_token(self):
+        """Fetches an OIDC ID token from the metadata server (only works on GCP)."""
+        try:
+            auth_req = google.auth.transport.requests.Request()
+            return id_token.fetch_id_token(auth_req, self.server_url)
+        except Exception as e:
+            print(f"Auth Hint: If local, ensure you are authenticated. Error: {e}")
+            return None
+
+    def call_tool(self, tool_name, arguments):
+        """Standard MCP call interface."""
+        print(f"MCP: Calling remote tool '{tool_name}'")
+        headers = {}
+        if self.is_gcp:
+            token = self._get_id_token()
+            if token: headers["Authorization"] = f"Bearer {token}"
+        try:
+            response = requests.post(
+                f"{self.server_url}/messages", 
+                json={"method": "tools/call", "params": {"name": tool_name, "arguments": arguments}},
+                headers=headers, timeout=300, verify=certifi.where()
+            )
+            return response.json().get("result", {}).get("content", [])
+        except Exception as e:
+            print(f"MCP Server Error: {e}")
+            return []
+
+    def call(self, tool_name, arguments):
+        return self.call_tool(tool_name, arguments)
+
+def get_mcp_client():
+    global mcp_client
+    if mcp_client is None:
+        mcp_client = RemoteTools(MCP_SERVER_URL)
+    return mcp_client
+
+# --- SHARED UTILITIES ---
+
+def extract_json(text):
+    """Hardened extraction of JSON from LLM responses."""
+    if not text: return None
+    markdown_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+    if markdown_match:
+        content = markdown_match.group(1).strip()
+    else:
+        match = re.search(r'([\[\{][\s\S]*[\]\}])', text)
+        if not match: return None
+        content = match.group(1).strip()
+    
+    try:
+        return json.loads(content)
+    except Exception as e:
+        print(f"FAILED INITIAL JSON PARSE: {e}. Attempting repair...")
+        try:
+            repaired = re.sub(r'(?<![:])\s*"\s*(?![,}])', r'\"', content)
+            return json.loads(repaired)
+        except:
+            return None
+
+def detect_audience_context(history):
+    """Detects target audience from conversation history."""
+    default = "Likely Senior Marketers, CTOs, and Founders, but you must value clarity and simplicity above all."
+    if not history: return default
+    hist_lower = history.lower()
+    if any(kw in hist_lower for kw in ["8-grader", "8th grade", "explain like i'm 5", "eli5"]):
+         return "An 8th-grader. Use extremely simple words, short sentences, and clear analogies."
+    elif "non-technical" in hist_lower:
+         return "Non-technical business owners. Focus on value and 'what it does'."
+    return default
+
+def safe_generate_content(model, prompt, system_instruction=None, generation_config=None):
+    """Universal wrapper for model generation with safety refusal traps."""
+    if generation_config is None: generation_config = {"temperature": 0.4}
+    try:
+        # Use UnifiedModel's native failover if applicable
+        if hasattr(model, 'generate_content'):
+            response = model.generate_content(prompt, generation_config=generation_config, system_instruction=system_instruction)
+            text = response.text if hasattr(response, 'text') else str(response)
+        else:
+            # Fallback for raw model objects
+            response = model.generate_content(prompt, generation_config=generation_config)
+            text = response.text
+            
+        refusal_triggers = ["I encountered a safety limit", "unable to generate", "Error generating content"]
+        if any(err in text for err in refusal_triggers):
+             raise ValueError(f"Model returned Soft Refusal")
+        return text.strip()
+    except Exception as e:
+        print(f"⚠️ safe_generate_content failure: {e}")
+        return "The system is currently maximizing its cognitive load. Please try again in 60 seconds."
+
+
+# --- MODULAR STYLE & SANITIZATION PROTOCOL (Zero-Loss Fidelity) ---
+
+PROTOCOL_GROUNDING_RAI = """
+- **CONTEXTUAL INTEGRITY (ZERO-INVENTION)**:
+    1. **DATA FIDELITY**: You are FORBIDDEN from generating any specific statistic (%), project count (e.g., "120 projects"), or implementation claim that is not explicitly in the USER PROMPT, PROVIDED FILES, or VERIFIED SEARCH RESULTS. Use qualitative descriptions if data is absent.
+    2. **LINK VERIFICATION**: Only generate URLs that have been explicitly provided or verified in the current turn's context. Never "guess" a logical URL path.
+    3. **ARCHITECTURAL ANCHORING**: Claims must align with the provided context (e.g., architectural or contextual specs). If a claim contradicts the Primary Anchor (Prompt/Files), the anchor takes precedence.
+    4. **GROUNDING DATA SUPREMACY (Universal)**: When GROUNDING DATA contains current information on ANY topic (APIs, news events, trend data, regulatory changes, market statistics, etc.), you MUST prioritize that information over your training data. Your training data has a knowledge cutoff; GROUNDING DATA represents real-time, verified information. Specific applications:
+       - **Technical**: API versions, library deprecations, framework updates
+       - **News/Events**: Current events, breaking news, recent announcements
+       - **Trends**: Search volume data, market shifts, emerging patterns
+       - **Regulatory**: New laws, policy changes, compliance updates
+       - **Statistics**: Current metrics, recent studies, updated benchmarks
+    5. **TEMPORAL VERIFICATION**: When GROUNDING DATA contains timestamps, publication dates, or version numbers, treat those as authoritative. If GROUNDING DATA shows information is outdated or superseded, you MUST use the current replacement mentioned in GROUNDING DATA.
+    6. **SYNTHETIC PROVENANCE**: While transparency is required, PROHIBIT repetitive name-dropping of search platforms (e.g., "According to TripAdvisor", "Bing results show") in the body prose. Instead, weave findings into a cohesive narrative and rely on **INLINE ANCHORED LINKS** for primary attribution. Use platform names ONLY for high-level context or when the platform itself is the subject of the claim.
+"""
+
+PROTOCOL_VISUAL_TABULAR = """
+- **MERMAID MANDATE**: You are strictly PROHIBITED from generating ASCII-based diagrams or logic maps (e.g., using arrows like `-->` or pipes `|` for flow). For any architectural maps, sequence flows, or visual logic, you MUST use `mermaid` code blocks. This ensures high-fidelity rendering via the MCP gateway.
+- **MERMAID MODULARITY**: Only generate a diagram if the content genuinely involves a visual structure (e.g., a multi-step flow or system architecture). When a diagram IS warranted and the architecture is complex, prefer multiple modular diagrams (e.g., Phase 1 vs Phase 2) over one dense block to prevent transport failures (Slack 3k URL limit).
+- **CODE BLOCKS — CONDITIONAL USE**: Only include fenced code blocks when the article is explicitly about a programming task, CLI command, or configuration syntax. Do NOT add code blocks as decoration or padding.
+- **TABLE COMPACTION**: PROHIBIT blank lines within Markdown tables. All rows (header, separator, and data) MUST be contiguous for parser integrity.
+"""
+
+PROTOCOL_LITERARY_CORE = """
+- **MEAT-FIRST NARRATIVE**: BAN robotic framing like "Short answer:", "Bottom line:", or "The takeaway is:". Start with direct data.
+- **HUMAN FINGERPRINT**: Vary sentence length. Mix punchy sentences (5-10 words) with fluid reflections (20-35 words).
+- **EM-DASH RESTRAINT**: Limit em-dashes (—) to max ONE per paragraph. Use semicolons (;) or parentheses ( ).
+- **NARRATIVE COLON BAN**: PROHIBIT colons in prose to connect claims to details. Use a period and a new sentence, or descriptive transitions. 
+- **COLON PROTOCOL (LISTS ONLY)**: Colons are for vertical bulleted lists ONLY. 
+- **MANDATORY CAPITALIZATION**: THE FIRST WORD AFTER ANY COLON MUST BE CAPITALIZED. Absolutely PROHIBIT "Label: lowercase" patterns.
+- **LEXICAL VARIETY (ANTI-CLUMPING)**: MANDATE categorical rotation. PROHIBIT repeating the same key noun/verb in adjacent sentences.
+- **ACTIVE VERB PRIORITY**: PRIORITIZE descriptive, context-aware actions. Use the provided Dynamic Palette as mentors.
+- **ZERO-PASSIVE VOICE**: PRIORITIZE active voice to drive narrative momentum.
+- **ANTI-WATERMARK**: BAN robotic buzzwords: 'delve', 'tapestry', 'landscape', 'unlock', 'embark', 'comprehensive', 'robust'. 
+- **NO COLON CLUMPING**: Do not use "Label: Definition" structures. Use active, descriptive narrative flow.
+- **TACTICAL TRANSITIONS**: BAN robotic connectors like "Furthermore" or "Moreover." Use the provided Dynamic Palette to maintain narrative "drag."
+"""
+
+PROTOCOL_FORMAT_CMS = """
+- **OUTPUT TARGET: CMS_DRAFT (STRATEGIC PROTOCOL)**:
+    1. **STRICT SEMANTIC HTML**: You MUST use semantic HTML tags ONLY. PROHIBIT all Markdown.
+    2. **HEADER PROTOCOL**: Use `<h2>` and `<h3>` for all section headers. **ABSOLUTELY PROHIBIT** Markdown hashtags (`#`, `##`, `###`). The presence of a single hashtag is a protocol failure.
+    3. **TABLE PROTOCOL**: Use strictly semantic `<table>`, `<tr>`, `<th>`, `<td>` tags. PROHIBIT Markdown pipe tables.
+    4. **PROSE PROTOCOL**: Wrap every paragraph in `<p>` tags.
+    5. **LISTS**: Use `<ul>`/`<li>` or `<ol>`/`<li>`.
+    6. **CODE**: Use `<pre><code class="language-...">...</code></pre>`.
+    7. **NO MARKDOWN ESCAPES**: Do not attempt to use `_` for italics or `**` for bold. Use `<em>` and `<strong>`.
+"""
+
+PROTOCOL_FORMAT_SLACK = """
+- **OUTPUT TARGET: MODERATOR_VIEW**: If the target is a Slack brief or research discovery, use Markdown exclusively for tables (pipes: `|`), headers (`#`, `##`), and code blocks. PROHIBIT all HTML tags (no `<p>`, `<h2>`, etc.). Use blank lines for paragraph separation.
+"""
+
+PROTOCOL_ANTI_SLOB = """
+- **STRATEGIC CONTEXT SANITIZATION (ANTI-META-TALK)**:
+    - **UNIVERSAL PROHIBITION**: You are strictly PROHIBITED from mentioning internal strategic decision-making, competitive audits, or benchmarking scores when the user's latest message PRIMARY GOAL (intent) is classified as DEEP_DIVE or PSEO_ARTICLE.
+    - **BANNED CATEGORIES**:
+        1. **SEO/Metrics**: "competitor gap," "audit scores," "ranking analysis," "search volume," "AEO strategy," "moat factor," "technical density score."
+        2. **Process/Turns**: "turn-based analysis," "Turn 1/2/3/4," "internal blueprint," "iterative refinement," "previous response," "vetted prompt."
+        3. **Implementation Meta**: "strategic decision primitives," "policy enforcement point (PEP) architecture," "architectural logic implementation."
+        4. **Comparative Bias**: "technical vacuum," "marketing hype," "marketing fluff," "displace leaders."
+    - **DEFINITION SHIELD**: PROHIBIT "Define [Abbreviation] as [Full Name]" sentence structures. Integrate definitions naturally (e.g., "The Policy Enforcement Point (PEP)...") or assume professional context.
+    - **TONE REPLACEMENT**: Instead of saying "Other guides score 2/10," simply present the authoritative technical finding with 10/10 technical depth. The "moat" is felt through your technical precision, not stated in prose.
+"""
+
+PROTOCOL_AUTHORITATIVE_GHOST = """
+- **CRITICAL "NO META-TALK" PROTOCOL**:
+    1. **ABSOLUTELY NO "Guides"**: Do NOT write "Here is how you would write this page..." or "This page structure is designed to...".
+    2. **DIRECT OUTPUT**: Start immediately with the Page/Article Title (<h1> or #) or the first structural content section.
+    3. **NO APOLOGIES**: If data is missing or unavailable, use a descriptive qualitative placeholder without apologizing to the reader.
+    4. **AUTHORITATIVE VOICE**: You are the definitive source. Do not use phrases like "based on the provided context."
+- **NARRATIVE FOCUS**: Weave facts into a cohesive, persuasive story. Avoid disjointed bullet points unless they support a specific technical breakdown.
+"""
+
+PROTOCOL_PSEO_PAGE = """
+- **ROLE: Specialized pSEO Data Weaver**: You create specific, data-rich pages for unique entity/location combinations.
+- **DATA DENSITY**: Prioritize tables and lists over long paragraphs.
+"""
+
+PROTOCOL_LIFESTYLE_PERSONA = """
+- **LIFESTYLE PERSONA**: You are a versatile Lifestyle Writer and Independent Curator. Your
+  scope spans all Lifestyle sub-categories: Health & Wellness, Food & Drink, Travel &
+  Adventure, Fashion & Beauty, Home & Decor, and Personal Development & Relationships.
+- **TONE**: Conversational, relatable, and authentic. Write like a trusted friend with
+  expertise — not a brand. Prioritise warmth and immediacy over formality.
+- **PRACTICAL VALUE FIRST**: Every piece must deliver immediate value — a solution to a daily
+  frustration, inspiration for a lifestyle change, or a pleasant mental escape. Lead with this.
+- **FORMAT INTELLIGENCE**: Detect the article type from context and shape structure accordingly:
+    - **How-To / Tutorial**: Open with the outcome, then numbered actionable steps.
+      Each step = one concrete action. No filler steps.
+    - **Listicle**: Scannable bold lead-ins per item. Items are self-contained and ordered
+      by relevance — not alphabetically or arbitrarily.
+    - **Personal Essay**: Open with a specific, vivid scene. Draw the universal lesson out
+      through story — never state the moral directly.
+    - **Product Review / Recommendation**: Lead with the verdict. Support with specific,
+      honest observations. PROHIBIT vague praise ("great quality", "highly recommend").
+- **SYNTHETIC NARRATIVE**: Avoid name-dropping review platforms (e.g., TripAdvisor, Yelp).
+  Weave findings into your own voice and use inline links for attribution only.
+- **NO VISUALS DIRECTIVE**: Do not reference or describe images. The pipeline does not process
+  visuals for Lifestyle articles at this time.
+"""
+
+PROTOCOL_HUMANITIES_PERSONA = """
+- **HUMANITIES PERSONA**: You are a Sociopolitical Analyst, Researcher, and Public Intellectual.
+  Your scope spans all Humanities sub-categories: Politics & Governance, Law & Policy, History,
+  Sociology & Culture, Security & Geopolitics, Ethics & Philosophy, and International Relations.
+- **TONE**: Objective, authoritative, and nuanced. Present complexity without sensationalism.
+  Avoid tribal framing or loaded emotional language. Let the evidence carry the weight.
+- **EVIDENCE ANCHORING**: Every significant claim must be grounded in a real event, established
+  framework, verified statistic, or named source. PROHIBIT vague generalisations
+  ("many experts say," "it is widely believed").
+- **MULTI-PERSPECTIVE INTEGRITY**: Where a topic is genuinely contested, represent the strongest
+  version of competing positions before resolving. Do not strawman opposing views.
+- **FORMAT INTELLIGENCE**: Detect the article type from context and shape structure accordingly:
+    - **Analysis**: Open with the core finding or insight, then build the systemic argument.
+      Use sub-sections for drivers, implications, and outlook.
+    - **Explainer**: Lead with the plain-language definition, then layer in complexity.
+      Use analogies to ground abstract concepts before introducing formal terms.
+    - **Opinion / Commentary**: State the argument in the first paragraph — don't bury the
+      thesis. Support with evidence, not assertion. Acknowledge the strongest counterpoint.
+    - **Profile (Person / Institution / Movement)**: Open with a defining action or moment,
+      then contextualise through their broader significance, not biography alone.
+- **SYSTEMIC FOCUS**: Prioritise structural drivers and institutional forces over individual
+  personalities. Name people where necessary, but keep the lens on systems.
+- **NO TECHNICAL ARTEFACTS**: PROHIBIT code blocks, mermaid diagrams, and JSON-LD schemas.
+  Use prose, simple Markdown tables (for comparative data), and inline citations.
+"""
+
+def get_system_instructions(intent: str, output_target: str, topic_sector: str = "TECHNICAL") -> str:
+    """
+    Architectural fix to assemble instructions modularly based on intent, target, and topic sector.
+    Prevents token waste while ensuring 100% rule fidelity for relevant tasks.
+    """
+    intent = intent.upper().strip()
+    instructions = "You are a professional AI Assistant. Protocols:\n"
+    instructions += PROTOCOL_GROUNDING_RAI
+
+    # Sector-Aware Visual Protocol
+    if topic_sector == "TECHNICAL":
+        instructions += PROTOCOL_VISUAL_TABULAR
+    else:
+        instructions += "\n- **VISUAL RESTRAINT**: For non-technical LIFESTYLE or HUMANITIES content, PROHIBIT Mermaid flowcharts and technical JSON-LD schema blocks unless explicitly requested. Use prose or simple Markdown tables instead.\n"
+    
+    if output_target == "CMS_DRAFT":
+        instructions += PROTOCOL_FORMAT_CMS
+        instructions += "\n- **CRITICAL**: CMS_DRAFT MODE ACTIVE. YOU ARE FORBIDDEN FROM OUTPUTTING MARKDOWN HASHTAGS (#). USE HTML TAGS ONLY."
+    else:
+        instructions += PROTOCOL_FORMAT_SLACK
+        
+    # Condition: High-Fidelity intents get the full Literary and Anti-Slob treatment.
+    high_fidelity_intents = [
+        "DEEP_DIVE", "PSEO_ARTICLE", "PSEO_PAGE", "PSEO_LP", 
+        "TECHNICAL_EXPLANATION", "BLOG_OUTLINE", "AUTHOR", 
+        "REWRITE", "REFINE", "THEN_VS_NOW_PROPOSAL",
+        "DIRECT_ANSWER", "SIMPLE_QUESTION", "FORMAT_GENERAL", "OPERATIONAL_REFORMAT"
+    ]
+    if intent in high_fidelity_intents:
+        instructions += PROTOCOL_LITERARY_CORE
+
+        # Sector-Aware Persona
+        if topic_sector == "LIFESTYLE":
+            instructions += PROTOCOL_LIFESTYLE_PERSONA
+        elif topic_sector == "HUMANITIES":
+            instructions += PROTOCOL_HUMANITIES_PERSONA
+        else:
+            instructions += "\n- **TECHNICAL PERSONA**: You are a Specialized Technical Writer. Use precise, efficient, and concept-driven prose. Prioritise clarity and conceptual depth. Include code examples or diagrams ONLY when they directly illustrate a point that prose alone cannot convey — never as padding."
+        
+    if intent == "PSEO_PAGE":
+        instructions += PROTOCOL_PSEO_PAGE
+        
+    if intent in ["PSEO_ARTICLE", "PSEO_LP", "PSEO_PAGE", "DEEP_DIVE"]:
+        instructions += PROTOCOL_ANTI_SLOB
+        if output_target == "CMS_DRAFT":
+            instructions += PROTOCOL_AUTHORITATIVE_GHOST
+        
+    return instructions.strip()
+
+def extract_labeled_sources(context_str):
+    """
+    Extracts URLs from context and returns a labeled list for the LLM.
+    """
+    if not context_str: return ""
+    urls = list(set(re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', str(context_str))))
+    if not urls: return ""
+    
+    labeled = "\n### VERIFIED SOURCES (GROUNDING ANCHORS):\n"
+    for i, url in enumerate(urls[:15], 1):
+        labeled += f"SOURCE_{i}: {url}\n"
+    labeled += "\nREQUIRED: Use inline links to these sources for any factual claim derived from them.\n"
+    return labeled
+
+def get_stylistic_mentors(session_id=None):
+    """
+    Dynamically retrieves randomized stylistic mentors from the shared linguistic palette.
+    Seeded by session_id to ensure consistency per-thread while maintaining cross-thread variety.
+    """
+    # Try multiple common relative paths for the shared JSON
+    current_dir = os.path.dirname(__file__)
+    paths_to_try = [
+        os.path.join(current_dir, "linguistic_palette.json"),
+        os.path.join(current_dir, "..", "shared", "linguistic_palette.json"),
+        os.path.join(current_dir, "shared", "linguistic_palette.json"),
+    ]
+    
+    palette_path = next((p for p in paths_to_try if os.path.exists(p)), None)
+    
+    try:
+        if not palette_path:
+            return ""
+            
+        with open(palette_path, 'r') as f:
+            palette = json.load(f)
+            
+        # Seed for stable variety within a session
+        if session_id:
+            seed_val = int(hashlib.md5(session_id.encode()).hexdigest(), 16) % (10**8)
+            rng = random.Random(seed_val)
+        else:
+            rng = random.Random()
+            
+        mentors = []
+        
+        # Pick 3 transitions from each core category
+        categories = palette.get("transitions", {})
+        key_categories = [
+            "opposition_limitation_contradiction", 
+            "cause_condition_purpose", 
+            "examples_support_emphasis",
+            "agreement_addition_similarity"
+        ]
+        
+        for cat in key_categories:
+            words = categories.get(cat, [])
+            if words:
+                sample = rng.sample(words, min(3, len(words)))
+                mentors.append(f"- {cat.replace('_', ' ').title()}: {', '.join(sample)}")
+            
+        # Pick 6 active verbs
+        verbs = palette.get("verbs", {}).get("active_mentors", [])
+        if verbs:
+            sample_verbs = rng.sample(verbs, min(6, len(verbs)))
+            mentors.append(f"- Active Verb Mentors: {', '.join(sample_verbs)}")
+            
+        return "\n### DYNAMIC STYLE PALETTE (TURN MENTORS):\nREQUIRED: Use at least two (2) words from the mentors below to maintain linguistic texture.\n" + "\n".join(mentors)
+    except Exception as e:
+        print(f"⚠️ get_stylistic_mentors error: {e}")
+        return ""
+
+def classify_topic_sector(topic: str, flash_model=None) -> str:
+    """
+    Semantic Sector Classification (ADK-FLASH):
+    Classifies a topic into LIFESTYLE, HUMANITIES, or TECHNICAL sectors.
+    """
+    topic_str = str(topic).strip()
+    
+    # 1. Semantic Match (Specialized Flash Call)
+    if flash_model:
+        classification_prompt = f"""
+        Strictly classify the following TOPIC into one of three SECTORS based on its semantic nature. 
+        The themes listed below are non-exhaustive EXAMPLES:
+        
+        1. LIFESTYLE (Example Themes: Tourism, Food, Travel, Lifestyle, Hangouts, Entertainment, Recreation)
+        2. HUMANITIES (Example Themes: Politics, Sociology, Governance, Security, Law, Policy, History, Ethics)
+        3. TECHNICAL (Example Themes: Software, AI, Engineering, Infrastructure, Data Systems, Scientific Method)
+        
+        TOPIC: "{topic_str}"
+        
+        Return ONLY the sector name (e.g., "LIFESTYLE").
+        """
+        
+        try:
+            # Use safe_generate_content if available in scope or just call model directly
+            raw_sector = safe_generate_content(flash_model, classification_prompt, generation_config={"temperature": 0.0, "max_output_tokens": 10})
+            sector = str(raw_sector).upper().strip()
+            
+            if any(s in sector for s in ["LIFESTYLE", "HUMANITIES", "TECHNICAL"]):
+                for s in ["LIFESTYLE", "HUMANITIES", "TECHNICAL"]:
+                    if s in sector:
+                        print(f"  + Semantic Sector Classification: {s}")
+                        return s
+        except Exception as e:
+            print(f"⚠️ Semantic Triage Failed: {e}. Falling back to keywords.")
+    
+    # 2. Keyword Fallback
+    t = topic_str.lower()
+    lifestyle_keywords = [
+        "hangout", "places to", "travel", "food", "lifestyle", "tourism", "restaurant", 
+        "club", "bar", "visit", "shopping", "mall", "lake", "hotel", "cafe", "nightlife"
+    ]
+    if any(kw in t for kw in lifestyle_keywords):
+        return "LIFESTYLE"
+        
+    humanities_keywords = [
+        "politics", "terrorism", "governance", "nigeria", "policy", "societal", 
+        "public", "international", "un ", "security", "human rights", "law", "ethics"
+    ]
+    if any(kw in t for kw in humanities_keywords):
+        return "HUMANITIES"
+        
+    return "TECHNICAL"
+
+def convert_html_to_markdown(html_str):
+    """Converts architectural HTML into Slack-friendly Markdown with a clear hierarchy."""
+    if not html_str: return ""
+    text = re.sub(r'(?i)^(Part \d+:?|Here is.*?:\s*)', '', str(html_str)).strip()
+    
+    # Leaky Markdown Fix
+    if "<code>" in text or "```" in text:
+        text = re.sub(r'(?<!<code>)```[a-z]*\n?([\s\S]*?)\n?```(?!</code>)', r'<code>\1</code>', text, flags=re.IGNORECASE)
+        text = re.sub(r'(?<!<code>)`([^`\n]+)`(?!</code>)', r'<code>\1</code>', text, flags=re.IGNORECASE)
+
+    text = re.sub(r'^\s*#{1,6}\s*(.*?)$', r'*\1*', text, flags=re.MULTILINE)
+    protected_blocks = {}
+    def protect_block(md_content):
+        placeholder = f"__PROTECTED_CODE_{uuid.uuid4().hex}__"
+        protected_blocks[placeholder] = md_content
+        return placeholder
+
+    # Code Blocks
+    def code_handler(match):
+        attrs = match.group(1) if match.lastindex >= 1 else ""
+        code = match.group(2) if match.lastindex >= 2 else match.group(0)
+        code = html.unescape(re.sub(r'<[a-z/][^>]*>', '', code, flags=re.IGNORECASE))
+        if '\n' in code.strip():
+            return protect_block(f"```\n{code.strip()}\n```")
+        return protect_block(f"`{code.strip()}`")
+
+    text = re.sub(r'<pre><code([^>]*)>([\s\S]*?)</code></pre>', code_handler, text, flags=re.IGNORECASE)
+    text = re.sub(r'<code([^>]*)>([\s\S]*?)</code>', code_handler, text, flags=re.IGNORECASE)
+
+    # Tables
+    def table_handler(match):
+        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', match.group(0), re.DOTALL | re.IGNORECASE)
+        if not rows: return ""
+        md_table = []
+        for i, row in enumerate(rows):
+            cols = [re.sub(r'<[^>]+>', '', c).strip() for c in re.findall(r'<(?:td|th)[^>]*>(.*?)</(?:td|th)>', row, re.DOTALL | re.IGNORECASE)]
+            if not cols: continue
+            md_table.append("| " + " | ".join(cols) + " |")
+            if i == 0 and len(rows) > 1: md_table.append("| " + " | ".join(["---"] * len(cols)) + " |")
+        return "\n" + "\n".join(md_table) + "\n"
+
+    text = re.sub(r'<table[^>]*>(.*?)</table>', table_handler, text, flags=re.DOTALL | re.IGNORECASE)
+
+    # Headers & Lists
+    text = re.sub(r'<h[1-4][^>]*>(.*?)</h[1-4]>', r'\n*\1*\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<li>(.*?)</li>', r'  • \1\n', text, flags=re.IGNORECASE)
+    text = text.replace('<ul>', '\n').replace('</ul>', '\n').replace('<ol>', '\n').replace('</ol>', '\n')
+    text = text.replace('<p>', '').replace('</p>', '\n\n').replace('<br>', '\n').replace('<br/>', '\n')
+    
+    text = re.sub(r'<[a-z/][^>]*>', '', text, flags=re.IGNORECASE)
+    
+    # Mermaid Diagram Restoration (Specialist)
+    def restore_mermaid_blocks(match):
+        try:
+            return get_mcp_client().call_tool("render_mermaid", {"mermaid_code": match.group(1), "format": "markdown"})
+        except Exception as e:
+            print(f"Mermaid Render Error: {e}")
+            return f"```mermaid\n{match.group(1)}\n```"
+
+    text = re.sub(r'<pre><code class="language-mermaid">([\s\S]*?)</code></pre>', restore_mermaid_blocks, text, flags=re.IGNORECASE)
+        
+    # Final Restore
+    for placeholder, original in protected_blocks.items():
+        text = text.replace(placeholder, original)
+    
+    return re.sub(r'\n{3,}', '\n\n', text).strip()

@@ -16,12 +16,10 @@ Write-Host "[1/4] Syncing shared utility modules into worker directories..."
 Write-Host "Cleaning existing shared directories in workers..."
 if (Test-Path ".\worker-story\shared") { Remove-Item ".\worker-story\shared" -Recurse -Force }
 if (Test-Path ".\worker-feedback\shared") { Remove-Item ".\worker-feedback\shared" -Recurse -Force }
-if (Test-Path ".\worker-tracker\shared") { Remove-Item ".\worker-tracker\shared" -Recurse -Force }
 
 Write-Host "Copying fresh shared libraries..."
 Copy-Item -Path ".\shared" -Destination ".\worker-story" -Recurse -Force
 Copy-Item -Path ".\shared" -Destination ".\worker-feedback" -Recurse -Force
-Copy-Item -Path ".\shared" -Destination ".\worker-tracker" -Recurse -Force
 
 Write-Host "✅ Modules synchronized."
 Write-Host ""

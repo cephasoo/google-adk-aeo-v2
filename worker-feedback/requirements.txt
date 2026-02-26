@@ -8,3 +8,6 @@ litellm
 google-cloud-logging
 google-cloud-secret-manager
 flask
+google-auth
+anthropic
+openai
