@@ -1518,7 +1518,7 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     text = safe_generate_content(active_model, prompt, generation_config={"temperature": 0.3}, system_instruction=system_instruction)
     
     # INTEGRATE MERMAID: Convert any Mermaid blocks to images before final formatting
-    processed_text = post_process_mermaid_to_images(text)
+    processed_text = post_process_mermaid_to_images(text, output_target)
     
     # Enforce spacing and Slack compatibility
     final_text = ensure_slack_compatibility(processed_text.strip())
@@ -1530,12 +1530,10 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     }
 
 # 13b. Mermaid Post-Processor (Ghost Compatibility Fix)
-def post_process_mermaid_to_images(html_content):
+def post_process_mermaid_to_images(html_content, output_target="CMS_DRAFT"):
     """
-    Detects Mermaid code blocks in HTML and converts them into visual images
-    via the MCP render_mermaid tool for Ghost compatibility.
-    Hardened to extract authored figcaptions for dynamic alt tags.
-    Now supports flexible class names and markdown-style fences.
+    Detects Mermaid code blocks in HTML and converts them into visual images.
+    Routes format to markdown if output_target is MODERATOR_VIEW.
     """
     if not html_content or 'mermaid' not in html_content.lower():
         return html_content
@@ -1563,13 +1561,18 @@ def post_process_mermaid_to_images(html_content):
         mermaid_code = code_match.group(1).strip()
         
         try:
-            # Call MCP with dynamic metadata
+            # Call MCP with dynamic metadata based on target
+            fmt = "markdown" if output_target == "MODERATOR_VIEW" else "html"
             rendered = mcp.call_tool("render_mermaid", {
                 "mermaid_code": mermaid_code, 
-                "format": "html",
+                "format": fmt,
                 "alt": safe_alt,
                 "caption": caption
             })
+            
+            if output_target == "MODERATOR_VIEW":
+                # For Slack, bypass the <figure> wrapper entirely
+                return "\n" + rendered + "\n"
             
             # Replace the <pre><code> block or just <code> block with the <img> tag
             # Flexible recursive replacement
@@ -1582,6 +1585,7 @@ def post_process_mermaid_to_images(html_content):
             print(f"⚠️ Mermaid MCP Error: {e}")
             return full_block
 
+
     # 1. Figure Pass: Capture metadata (broadened class)
     figure_pattern = r'<figure[^>]*>(?:(?!</figure>)[\s\S])*?<code[^>]*class="[^"]*mermaid[^"]*"[^>]*>(?:(?!</figure>)[\s\S])*?</code>(?:(?!</figure>)[\s\S])*?</figure>'
     result = re.sub(figure_pattern, replacer, html_content, flags=re.IGNORECASE)
@@ -1590,7 +1594,10 @@ def post_process_mermaid_to_images(html_content):
     def markdown_replacer(match):
         code = match.group(1).strip()
         try:
-            rendered = mcp.call_tool("render_mermaid", {"mermaid_code": code, "format": "html"})
+            fmt = "markdown" if output_target == "MODERATOR_VIEW" else "html"
+            rendered = mcp.call_tool("render_mermaid", {"mermaid_code": code, "format": fmt})
+            if output_target == "MODERATOR_VIEW":
+                return "\n" + rendered + "\n"
             return f'<figure class="kg-card kg-image-card kg-width-wide">{rendered}</figure>'
         except Exception as e:
             print(f"⚠️ Mermaid Markdown Error: {e}")
@@ -1607,8 +1614,11 @@ def post_process_mermaid_to_images(html_content):
         code = (match.group(1) or match.group(2) or "").strip()
         if not code: return match.group(0)
         try:
+            fmt = "markdown" if output_target == "MODERATOR_VIEW" else "html"
             # Wrap orphan images in a Ghost-friendly container by default
-            rendered = mcp.call_tool("render_mermaid", {"mermaid_code": code, "format": "html"})
+            rendered = mcp.call_tool("render_mermaid", {"mermaid_code": code, "format": fmt})
+            if output_target == "MODERATOR_VIEW":
+                return "\n" + rendered + "\n"
             return f'<figure class="kg-card kg-image-card kg-width-wide">{rendered}</figure>'
         except Exception as e:
             print(f"⚠️ Mermaid Orphan Error: {e}")
@@ -1711,7 +1721,7 @@ def chunked_refactor_article(source_text, audience_context, specialist_model, st
             print(f"  + [CHUNK {idx+1}] Refactor Complete.")
             
     final_html = "\n\n".join(results)
-    return post_process_mermaid_to_images(final_html)
+    return post_process_mermaid_to_images(final_html, output_target)
 
 # 14. The Dedicated pSEO Article Generator
 def generate_pseo_article(topic, context, history="", history_events=None, is_initial_post=True, session_id=None, output_target="CMS_DRAFT"):
@@ -1788,7 +1798,7 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
             proposal_data = event.get('proposal_data')
             if isinstance(proposal_data, dict) and proposal_data.get('article_html') and "refactor" not in topic_lower:
                 print(f"  + FAST-TRACK: Found clean HTML in proposal_data. Provisioning directly.")
-                return post_process_mermaid_to_images(proposal_data['article_html'])
+                return post_process_mermaid_to_images(proposal_data['article_html'], output_target)
             
             # 2. Look for existing text (Markdown) to REFACTOR
             content = event.get('text') or event.get('content')
@@ -1798,7 +1808,7 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
                 
                 if "<section" in content and "</section>" in content and not has_markdown_artifacts and "refactor" not in topic_lower:
                     print(f"  + FAST-TRACK: Found existing high-fidelity HTML draft. Provisioning directly.")
-                    return post_process_mermaid_to_images(content)
+                    return post_process_mermaid_to_images(content, output_target)
             
                 # Otherwise, this is our best source for the Refactor Engine
                 best_source_text = content
@@ -1842,7 +1852,7 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
         """
         # Use Specialist (Claude Sonnet 4.5) for high-fidelity refactoring with system_instruction
         raw_html = safe_generate_content(specialist_model, refactor_prompt, system_instruction=sys_instruction, generation_config={"temperature": 0.2})
-        return post_process_mermaid_to_images(sanitize_llm_html(raw_html))
+        return post_process_mermaid_to_images(sanitize_llm_html(raw_html), output_target)
 
     # --- PATH B & C: EXPAND / AUTHOR (Creative Synthesis) ---
     elif start_mode == "EXPAND":
@@ -1912,7 +1922,7 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     """
     
     raw_response = safe_generate_content(unimodel, prompt, system_instruction=sys_instruction, generation_config={"temperature": 0.4})
-    return post_process_mermaid_to_images(sanitize_llm_html(raw_response))
+    return post_process_mermaid_to_images(sanitize_llm_html(raw_response), output_target)
 
 def generate_pseo_page(topic, context, history="", history_events=None, is_initial_post=True, session_id=None, output_target="CMS_DRAFT"):
     """
@@ -2018,7 +2028,7 @@ def generate_pseo_page(topic, context, history="", history_events=None, is_initi
         """
         raw_response = safe_generate_content(unimodel, prompt, system_instruction=sys_instruction, generation_config={"temperature": 0.2})
 
-    return post_process_mermaid_to_images(sanitize_llm_html(raw_response))
+    return post_process_mermaid_to_images(sanitize_llm_html(raw_response), output_target)
 
 
 # 14.2 The LP Page Generator (Long-Form Pillar Page)
@@ -2150,7 +2160,7 @@ def generate_lp_page(topic, context, history="", history_events=None, is_initial
         """
         raw_response = safe_generate_content(unimodel, prompt, system_instruction=sys_instruction, generation_config={"temperature": 0.4})
 
-    return post_process_mermaid_to_images(sanitize_llm_html(raw_response))
+    return post_process_mermaid_to_images(sanitize_llm_html(raw_response), output_target)
 
 # 14.5 The Recursive Deep-Dive Generator (Dynamic Room-by-Room Construction)
 def generate_deep_dive_article(topic, context, history="", history_events=None, target_length=1500, target_geo="Global", session_id=None, output_target="MODERATOR_VIEW"):
@@ -2342,7 +2352,7 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
 
     full_html = "\n\n".join(article_parts)
     print(f"  -> Deep-Dive Complete. Est words: {len(full_html.split())}")
-    return post_process_mermaid_to_images(full_html)
+    return post_process_mermaid_to_images(full_html, output_target)
 
 #15. The Euphemistic 'Then vs Now' Linker
 def create_euphemistic_links(keyword_context, is_initial=True, session_id=None):

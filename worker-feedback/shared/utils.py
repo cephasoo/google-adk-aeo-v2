@@ -242,8 +242,13 @@ class UnifiedModel:
                     messages.append({"role": "system", "content": str(system_instruction)})
                 messages.append({"role": "user", "content": prompt})
 
+                # LiteLLM requires provider/model format for unknown/new models
+                litellm_model = self.model_name
+                if self.provider and f"{self.provider}/" not in litellm_model:
+                    litellm_model = f"{self.provider}/{self.model_name}"
+
                 response = completion(
-                    model=self.model_name, 
+                    model=litellm_model, 
                     messages=messages,
                     temperature=temp,
                     max_tokens=8192,
@@ -294,10 +299,21 @@ class RemoteTools:
                 json={"method": "tools/call", "params": {"name": tool_name, "arguments": arguments}},
                 headers=headers, timeout=300, verify=certifi.where()
             )
-            return response.json().get("result", {}).get("content", [])
+            content_list = response.json().get("result", {}).get("content", [])
+            
+            text_outputs = []
+            for item in content_list:
+                if isinstance(item, dict) and "text" in item:
+                    text_outputs.append(item["text"])
+                else:
+                    text_outputs.append(str(item))
+            
+            final_text = "\n".join(text_outputs)
+            print(f"TELEMETRY: MCP Hub: [{tool_name}] execution complete. Size: {len(final_text)} chars.")
+            return final_text
         except Exception as e:
             print(f"MCP Server Error: {e}")
-            return []
+            return f"MCP Server Error: {e}"
 
     def call(self, tool_name, arguments):
         return self.call_tool(tool_name, arguments)
