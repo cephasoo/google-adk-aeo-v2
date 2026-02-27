@@ -1680,7 +1680,7 @@ def chunked_refactor_article(source_text, audience_context, specialist_model, st
         TASK: Convert this 'SOURCE SEGMENT' into target GHOST-FRIENDLY HTML format.
         
         STRUCTURE REQUIREMENTS (Strict HTML):
-        1.  **Semantic Structuring**: Use <section> wrappers with appropriate classes (e.g., class="intro", class="body", class="deep-dive", class="methodology").
+        1.  **Semantic Structuring**: Use <section> wrappers with appropriate classes (e.g., class="intro", class="body", class="deep-dive", class="conclusion").
         2.  **Semantic Headers**: Use <h1> for the main title, <h2> for major sections, and <h3> for sub-sections.
         3.  **NO NUMBERED HEADINGS**: Do NOT include numbers (e.g., "1. ", "2. ") in your <h2> or <h3> headers.
         4.  **Code Blocks**: Use semantic HTML: `<pre><code class="language-...">...</code></pre>`.
@@ -2097,7 +2097,14 @@ def generate_lp_page(topic, context, history="", history_events=None, is_initial
         labeled_sources = extract_labeled_sources(str(context) + "\n" + str(source_to_refactor))
         prompt = f"""
         You are a Pillar Page Architect.
-        TASK: Refactor/Upgrade the 'SOURCE TEXT' into a definitive 3,000+ word strategy pillar.
+        
+        USER DIRECTIVE FOR THIS UPDATE:
+        {topic}
+
+        TASK: Refactor the 'SOURCE TEXT' according to the USER DIRECTIVE above.
+
+        CRITICAL OUTPUT MANDATE:
+        You MUST integrate the USER DIRECTIVE into the SOURCE TEXT, while retaining the fidelity of the original document's word count (except told otherwise). If the user only asked to rewrite one or two sections, you MUST still output the rest of the unmodified sections exactly as they appear in the SOURCE TEXT. DO NOT summarize, omit, or truncate the rest of the page. The final output must be the complete, fully updated landing page according to the USER DIRECTIVE.
 
         AUDIENCE: {audience_context}
         PERSONA: {persona} ({goal})
@@ -2106,6 +2113,7 @@ def generate_lp_page(topic, context, history="", history_events=None, is_initial
         - Target: 3,000+ words minimum
         - Focus on narrative authority and structural clarity.
         - Ensure every H2 section is substantive and contains unique technical depth.
+        - Enforce PROTOCOL_LITERARY_CORE: ABSOLUTELY NO colon clumping (colons in prose to connect claims to details, e.g., "Label: detail"). Use fluid, active prose. Use semicolons or periods and a new sentence, or descriptive transitions.
 
         SOURCE TEXT:
         {source_to_refactor}
@@ -2133,6 +2141,7 @@ def generate_lp_page(topic, context, history="", history_events=None, is_initial
         - Target: 3,000+ words minimum.
         - Every H2 section must be substantive — no single-paragraph stubs.
         - Focus on narrative framework and persuasive storytelling.
+        - Enforce PROTOCOL_LITERARY_CORE: ABSOLUTELY NO colon clumping (colons in prose to connect claims to details, e.g., "Label: detail"). Use fluid, active prose. Use semicolons or periods and a new sentence, or descriptive transitions.
 
         {context_block}
 
@@ -2153,6 +2162,7 @@ def generate_lp_page(topic, context, history="", history_events=None, is_initial
         STRATEGIC REQUIREMENTS:
         - Minimum 3,000 words.
         - Every H2 section must be substantive and authoritative.
+        - Enforce PROTOCOL_LITERARY_CORE: ABSOLUTELY NO colon clumping (colons in prose to connect claims to details, e.g., "Label: detail"). Use fluid, active prose. Use semicolons or periods and a new sentence, or descriptive transitions.
 
         {context_block}
 
@@ -2249,6 +2259,9 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     intro_sys = get_system_instructions("DEEP_DIVE", output_target, topic_sector=topic_sector)
     intro_sys += f"\n\n{style_mentors}"
 
+    # BUGFIX: Define intro_words (consistent with blueprint budget: target_length - 300 for sections)
+    intro_words = max(150, min(350, target_length // 5))
+
     intro_prompt = f"""
     Write a compelling {intro_words}-word intro for: '{title}'.
     REGION: {target_geo}
@@ -2336,19 +2349,6 @@ def generate_deep_dive_article(topic, context, history="", history_events=None, 
     conc_raw = safe_generate_content(unimodel, conc_prompt, system_instruction=conc_sys)
     article_parts.append(f'<section class="conclusion">\n<h2>Final Reflection</h2>\n{sanitize_llm_html(conc_raw)}\n</section>')
 
-    # PHASE 3: Methodology
-    print("  + Finalizing Methodology & Transparency...")
-    # Calculate interim word count for the footer
-    current_content = " ".join(article_parts)
-    est_words = len(current_content.split())
-
-    methodology_text = f"""
-    <section class="methodology">
-    <h2>Methodology & Transparency</h2>
-    <p>This {est_words}-word technical analysis was recursively architected using a multi-agent orchestration framework. Concepts were synthesized through a combination of contextual grounding and forensic technical auditing to ensure architectural accuracy.</p>
-    </section>
-    """
-    article_parts.append(methodology_text)
 
     full_html = "\n\n".join(article_parts)
     print(f"  -> Deep-Dive Complete. Est words: {len(full_html.split())}")
@@ -2901,7 +2901,7 @@ def _process_story_logic_inner(request):
         # --- EXECUTION: Triage Model Selection ---
         # Triage on the Command (sanitized_topic) but with history context
         # Use Flash Model for Speed/Cost Efficiency (Gemini 2.0 Flash)
-        intent = safe_generate_content(flash_model, triage_prompt)
+        intent = str(safe_generate_content(flash_model, triage_prompt)).strip()
         
         # ADK HARDENING: Deterministic Triage Override (Keyword Overlord)
         # This prevents the LLM from misclassifying Ghost/pSEO requests as Operational Reformats.
@@ -2924,6 +2924,17 @@ def _process_story_logic_inner(request):
             if "PSEO_ARTICLE" not in intent and "PSEO_PAGE" not in intent and "PSEO_LP" not in intent:
                 print(f"🎯 TRIAGE OVERRIDE: Forcing PSEO_ARTICLE due to keywords in '{sanitized_topic[:30]}'")
                 intent = "PSEO_ARTICLE"
+
+        # MEDIA AND LINK GATE: If images or URLs are attached, signal fast-exit paths to skip
+        # and fall through to the Heavy Lifting research phase instead.
+        # The original intent is PRESERVED so the post-research output router uses the right generator.
+        urls_in_request = extract_urls_from_text(sanitized_topic)
+        force_research = bool(
+            (images or urls_in_request) and
+            intent in ["OPERATIONAL_REFORMAT", "BLOG_OUTLINE", "SOCIAL_CONVERSATION", "SALES_TRANSCRIPT"]
+        )
+        if force_research:
+            print(f"🎯 MEDIA/LINK GATE: Intent [{intent}] preserved but fast-exit skipped — media or links detected. Routing to research path.")
 
         print(f"TELEMETRY: Triage V6.0 -> Intent classified as: [{intent}] for command: '{sanitized_topic[:50]}...'")
 
@@ -2952,7 +2963,7 @@ def _process_story_logic_inner(request):
         # --- STEP 4: ROUTING & EXECUTION ---
 
         # === PATH A: SOCIAL (Fast Exit) ===
-        if intent == "SOCIAL_CONVERSATION":
+        if intent == "SOCIAL_CONVERSATION" and not force_research:
             # Just reply naturally using the history context. No research tools.
             print("Executing Social Response (No Research)")
             social_prompt = f"""
@@ -2998,7 +3009,7 @@ def _process_story_logic_inner(request):
             return jsonify({"msg": "Social reply sent"}), 200
 
         # === PATH B: OPERATIONAL REFORMAT / FAST FOLLOW-UP (Fast Exit) ===
-        elif intent == "OPERATIONAL_REFORMAT":
+        elif intent == "OPERATIONAL_REFORMAT" and not force_research:
             # GROUNDING GUARD: We only "Fast-Exit" if we actually have history to reformat.
             # If this is the first turn and the topic is new, we MUST research.
             has_substantive_history = len(history_events) > 0 or len(sanitized_topic) > 100 
@@ -3046,7 +3057,7 @@ def _process_story_logic_inner(request):
                 pass
 
         # === PATH CX: BLOG OUTLINE (High-Fidelity Structure) ===
-        elif intent == "BLOG_OUTLINE":
+        elif intent == "BLOG_OUTLINE" and not force_research:
             print(f"Executing Blog Outline generation for command: {sanitized_topic[:50]}")
             # Determined Output Target
             target = get_output_target(intent)
@@ -3083,7 +3094,7 @@ def _process_story_logic_inner(request):
             return jsonify({"msg": "Blog outline sent"}), 200
 
         # === PATH C: SALES TRANSCRIPT (Fast Exit) ===
-        elif intent == "SALES_TRANSCRIPT" or req.get('type') == 'sales_transcript':
+        elif (intent == "SALES_TRANSCRIPT" or req.get('type') == 'sales_transcript') and not force_research:
             print("Executing Sales Transcript Processing (Fast Exit)")
             transcript_text = req.get('transcript', sanitized_topic)
             target = get_output_target(intent)
@@ -3296,7 +3307,62 @@ def _process_story_logic_inner(request):
 
         # 3. Generate Output based on Intent
         # UPGRADE: Handle structural intents (FORMAT_*) and provide a robust fallback
-        if intent in ["DIRECT_ANSWER", "BLOG_OUTLINE"] or str(intent).startswith("FORMAT_"):
+
+        # --- POST-RESEARCH HANDLERS for formerly-fast-exit intents (force_research=True path) ---
+        if intent == "OPERATIONAL_REFORMAT" and force_research:
+            # Re-run as a grounded natural answer using the media/URL-enriched research context
+            print(f"Executing Grounded Operational Reformat (via research path) for: {clean_topic[:50]}")
+            target = get_output_target(intent)
+            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text, session_id=session_id, output_target=target, intent_label=intent)
+            answer_text = answer_data['text']
+            research_intent = answer_data.get('intent', "OPERATIONAL_REFORMAT")
+
+            new_events.append({"event_type": "agent_answer", "text": answer_text, "intent": "OPERATIONAL_REFORMAT"})
+            session_ref = db.collection('agent_sessions').document(session_id)
+            events_ref = session_ref.collection('events')
+            for event in new_events:
+                if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
+            _firestore_call_with_timeout(lambda: session_ref.update({
+                "status": "completed", "type": "operational_answer", "last_updated": expire_time
+            }))
+            safe_n8n_delivery({
+                "session_id": session_id, "type": global_operation_type,
+                "message": answer_text, "query": sanitized_topic,
+                "intent": "OPERATIONAL_REFORMAT", "output_target": target,
+                "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'),
+                "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
+                "is_initial_post": is_initial_post
+            })
+            return jsonify({"msg": "Grounded operational reformat sent"}), 200
+
+        elif intent == "SOCIAL_CONVERSATION" and force_research:
+            # Grounded social reply using media/URL-enriched context
+            print("Executing Grounded Social Response (via research path)")
+            target = get_output_target(intent)
+            answer_data = generate_natural_answer(clean_topic, research_data['context'], history=history_text, session_id=session_id, output_target=target, intent_label=intent)
+            reply_text = ensure_slack_compatibility(answer_data['text'])
+
+            new_events.append({"event_type": "agent_reply", "text": reply_text})
+            session_ref = db.collection('agent_sessions').document(session_id)
+            events_ref = session_ref.collection('events')
+            for event in new_events:
+                if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
+            _firestore_call_with_timeout(lambda: session_ref.update({
+                "status": "completed", "type": "social", "last_updated": expire_time
+            }))
+            safe_n8n_delivery({
+                "session_id": session_id, "type": global_operation_type,
+                "message": reply_text, "query": sanitized_topic, "output_target": target,
+                "channel_id": slack_context.get('channel') or slack_context.get('channel_id') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'),
+                "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'),
+                "is_initial_post": is_initial_post
+            })
+            return jsonify({"msg": "Grounded social reply sent"}), 200
+
+        elif intent in ["DIRECT_ANSWER", "BLOG_OUTLINE"] or str(intent).startswith("FORMAT_"):
+
             if intent == "BLOG_OUTLINE": print(f"Executing Blog Outline generation for command: {clean_topic[:50]}")
             
             # Determined Output Target

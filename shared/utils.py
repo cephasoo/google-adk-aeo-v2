@@ -417,6 +417,7 @@ PROTOCOL_LITERARY_CORE = """
 - **ANTI-WATERMARK**: BAN robotic buzzwords: 'delve', 'tapestry', 'landscape', 'unlock', 'embark', 'comprehensive', 'robust'. 
 - **NO COLON CLUMPING**: Do not use "Label: Definition" structures. Use active, descriptive narrative flow.
 - **TACTICAL TRANSITIONS**: BAN robotic connectors like "Furthermore" or "Moreover." Use the provided Dynamic Palette to maintain narrative "drag."
+- **DESCRIPTIVE ANCHOR TEXT (SEO MANDATE)**: PROHIBIT non-descriptive hyperlink anchors: 'here', 'click here', 'this link', 'read more', 'learn more', 'source'. Every hyperlink MUST use contextually descriptive anchor text that conveys the topic or claim being cited (e.g., `context rot in long-context benchmarks` not `here`).
 """
 
 PROTOCOL_FORMAT_CMS = """
@@ -453,6 +454,10 @@ PROTOCOL_AUTHORITATIVE_GHOST = """
     3. **NO APOLOGIES**: If data is missing or unavailable, use a descriptive qualitative placeholder without apologizing to the reader.
     4. **AUTHORITATIVE VOICE**: You are the definitive source. Do not use phrases like "based on the provided context."
 - **NARRATIVE FOCUS**: Weave facts into a cohesive, persuasive story. Avoid disjointed bullet points unless they support a specific technical breakdown.
+- **ANCHOR TEXT PROTOCOL (HTML)**:
+    - **PROHIBIT**: `<a href="...">here</a>`, `<a href="...">click here</a>`, `<a href="...">this link</a>`, `<a href="...">read more</a>`, `<a href="...">source</a>`.
+    - **MANDATE**: Anchor text MUST describe the destination topic or claim. Example — CORRECT: `<a href="https://example.com">context rot in multi-agent retrieval pipelines</a>`. INCORRECT: `<a href="https://example.com">here</a>`.
+    - **PLACEMENT**: Embed the link inline within the sentence at the exact phrase it attributes, not appended after the sentence as a trailing 'here'.
 """
 
 PROTOCOL_PSEO_PAGE = """
