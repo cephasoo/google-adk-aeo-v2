@@ -534,7 +534,8 @@ def handle_tool_call(name, arguments):
                 vector_field="embedding",
                 query_vector=Vector(query_embedding),
                 distance_measure=DistanceMeasure.COSINE,
-                limit=8
+                limit=8,
+                distance_threshold=0.4
             ).get()
             
             # 2. TYPE-SAFE FALLBACK: Global Grounding Mission (Prefix Match)
@@ -549,7 +550,8 @@ def handle_tool_call(name, arguments):
                     vector_field="embedding",
                     query_vector=Vector(query_embedding),
                     distance_measure=DistanceMeasure.COSINE,
-                    limit=8
+                    limit=8,
+                    distance_threshold=0.4
                 ).get()
             
             memories = []
@@ -597,7 +599,8 @@ def handle_tool_call(name, arguments):
                     vector_field="embedding",
                     query_vector=Vector(query_embedding),
                     distance_measure=DistanceMeasure.COSINE,
-                    limit=limit
+                    limit=limit,
+                    distance_threshold=0.4
                 ).get()
             except Exception as e:
                 print(f"WARNING: Filtered vector search failed: {e}. Falling back to Local Semantic Search.")
