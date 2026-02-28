@@ -1763,6 +1763,9 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     
     # Signals
     topic_lower = topic.lower()
+    # has_pseo_keyword: guards the has_full_draft_structure LLM-failure fallback below.
+    # PSEO_ARTICLE triage always requires the 'pseo' superkeyword — so if both LLMs fail,
+    # we only trust has_full_draft_structure when the keyword is present.
     has_pseo_keyword = "pseo" in topic_lower
 
     # has_full_draft_structure retained as Flash classifier fallback (not primary gate)
@@ -1814,7 +1817,7 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
                 print(f"  + Specialist REFACTOR Signal: {str(flash_signal).strip()} → is_repurpose_cmd={is_repurpose_cmd}")
             except Exception as e2:
                 print(f"  + Specialist REFACTOR classifier also failed ({e2}). Using has_full_draft_structure fallback.")
-                is_repurpose_cmd = has_full_draft_structure
+                is_repurpose_cmd = has_full_draft_structure and has_pseo_keyword
 
     # Derive mode from structural signals
     if is_repurpose_cmd:
@@ -1826,37 +1829,50 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     print(f"  + Generation Mode Selected: {start_mode}")
 
     # --- FAST-TRACK: DIRECT PROVISIONING (Bypass LLM) ---
-    # Case: "Publish this draft" - Extract the existing HTML from history_events.
+    # Case: "Publish this draft" - Extract the agreed-upon deep_dive draft from history_events.
     best_source_text = None
     if is_repurpose_cmd and history_events:
+        # PASS 1: Specifically target deep_dive proposals (the agreed MODERATOR_VIEW draft).
+        # Must scan for deep_dive BEFORE falling through to general article_html search,
+        # otherwise a stale pseo_article event (e.g. a prior failed push) would be returned instead.
         for event in reversed(history_events):
-            # 1. Look for recent agent_proposal (pseo_article) with clean HTML
-            # HARDENING: Skip direct provisioning if the user explicitly asked to "refactor"
             proposal_data = event.get('proposal_data')
-            if isinstance(proposal_data, dict) and proposal_data.get('article_html') and "refactor" not in topic_lower:
-                print(f"  + FAST-TRACK: Found clean HTML in proposal_data. Provisioning directly.")
+            if not isinstance(proposal_data, dict):
+                continue
+            if proposal_data.get('proposal_type') != 'deep_dive':
+                continue
+            # Found a deep_dive proposal — try clean HTML first
+            if proposal_data.get('article_html') and "refactor" not in topic_lower:
+                print(f"  + FAST-TRACK: Found deep_dive HTML in proposal_data. Provisioning directly.")
                 return post_process_mermaid_to_images(proposal_data['article_html'], output_target)
-            
-            # 2. Look for existing text (Markdown) to REFACTOR
+            # No article_html on deep_dive — use its text as source for Refactor Engine
             content = event.get('text') or event.get('content')
             if content and isinstance(content, str) and len(content) > 500:
-                # HARDENING: Reject Fast-Track if it contains raw markdown artifacts
-                has_markdown_artifacts = "```" in content or "\n- " in content or "\n* " in content
-                
-                if "<section" in content and "</section>" in content and not has_markdown_artifacts and "refactor" not in topic_lower:
-                    print(f"  + FAST-TRACK: Found existing high-fidelity HTML draft. Provisioning directly.")
-                    return post_process_mermaid_to_images(content, output_target)
-            
-                # Otherwise, this is our best source for the Refactor Engine
                 best_source_text = content
-                print(f"  + FAST-TRACK: Found potential source text ({len(content)} chars) for Refactoring.")
-                break
-        
+                print(f"  + FAST-TRACK: Found deep_dive text ({len(content)} chars) for Refactoring.")
+            break  # deep_dive found (with or without html) — stop searching
+
+        # PASS 2 (fallback): If no deep_dive found, look for any high-fidelity HTML in history
+        if not best_source_text:
+            for event in reversed(history_events):
+                content = event.get('text') or event.get('content')
+                if content and isinstance(content, str) and len(content) > 500:
+                    has_markdown_artifacts = "```" in content or "\n- " in content or "\n* " in content
+                    if "<section" in content and "</section>" in content and not has_markdown_artifacts and "refactor" not in topic_lower:
+                        print(f"  + FAST-TRACK: Found existing high-fidelity HTML draft. Provisioning directly.")
+                        return post_process_mermaid_to_images(content, output_target)
+                    best_source_text = content
+                    print(f"  + FAST-TRACK: Found potential source text ({len(content)} chars) for Refactoring.")
+                    break
+
         if best_source_text:
             print("  + FAST-TRACK: Shifting to REFACTOR mode using found source text.")
             start_mode = "REFACTOR"
         else:
-            print("  + FAST-TRACK: No suitable source found. Falling back to EXPAND/AUTHOR.")
+            # No provisionable source found — do NOT silently refactor raw history.
+            # Reset to EXPAND (if an outline exists in this session) or AUTHOR.
+            start_mode = "EXPAND" if has_outline_event else "AUTHOR"
+            print(f"  + FAST-TRACK: No suitable source found. Falling back to {start_mode}.")
 
     if start_mode == "REFACTOR":
         # --- PATH A: STRICT REFACTOR (Specialist Model) ---
@@ -1907,6 +1923,7 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
         system_instruction = f"""
         You are an {persona}.
         TASK: Write a comprehensive pSEO article based on the provided OUTLINE/BLUEPRINT.
+        {target_instruction}
         
         RULES:
         1.  **FOLLOW STRUCTURE**: Strictly follow the headers defined in the 'BLUEPRINT'.
@@ -1933,9 +1950,9 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
             goal = "High-authority technical article."
 
         if is_grounded:
-            system_instruction = f"You are an {persona}. Base the article PRIMARILY on the provided 'Research Context'."
+            system_instruction = f"You are an {persona}. {target_instruction} Base the article PRIMARILY on the provided 'Research Context'."
         else:
-            system_instruction = f"You are an {persona}. Use the provided context to write a {goal}"
+            system_instruction = f"You are an {persona}. {target_instruction} Use the provided context to write a {goal}"
         
         tone_instruction = f"Tone: {goal} Use analogies to explain complex ideas."
         context_block = f"Research Context:\n{context}\n\nConversation History:\n{history}"
