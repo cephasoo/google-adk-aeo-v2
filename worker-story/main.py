@@ -1781,11 +1781,10 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     has_deep_dive_draft = False
     if history_events:
         for event in history_events:
-            if event.get('event_type') == 'agent_proposal':
-                pd = event.get('proposal_data') or {}
-                if pd.get('proposal_type') == 'deep_dive':
-                    has_deep_dive_draft = True
-                    break
+            # proposal_type is stored at event top level, NOT inside proposal_data
+            if event.get('event_type') == 'agent_proposal' and event.get('proposal_type') == 'deep_dive':
+                has_deep_dive_draft = True
+                break
 
     # EXPAND signal: any agent_answer with BLOG_OUTLINE intent in history.
     has_outline_event = any(
@@ -1836,11 +1835,10 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
         # Must scan for deep_dive BEFORE falling through to general article_html search,
         # otherwise a stale pseo_article event (e.g. a prior failed push) would be returned instead.
         for event in reversed(history_events):
-            proposal_data = event.get('proposal_data')
-            if not isinstance(proposal_data, dict):
+            # proposal_type is stored at event top level, NOT inside proposal_data
+            if event.get('event_type') != 'agent_proposal' or event.get('proposal_type') != 'deep_dive':
                 continue
-            if proposal_data.get('proposal_type') != 'deep_dive':
-                continue
+            proposal_data = event.get('proposal_data') or {}
             # Found a deep_dive proposal — try clean HTML first
             if proposal_data.get('article_html') and "refactor" not in topic_lower:
                 print(f"  + FAST-TRACK: Found deep_dive HTML in proposal_data. Provisioning directly.")
