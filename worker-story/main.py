@@ -1680,7 +1680,7 @@ def chunked_refactor_article(source_text, audience_context, specialist_model, st
         TASK: Convert this 'SOURCE SEGMENT' into target GHOST-FRIENDLY HTML format.
         
         STRUCTURE REQUIREMENTS (Strict HTML):
-        1.  **Semantic Structuring**: Use <section> wrappers with appropriate classes (e.g., class="intro", class="body", class="deep-dive", class="conclusion").
+        1.  **Semantic Structuring**: Use <section> wrappers with appropriate classes (e.g., class="intro", class="body", class="deep-dive", class="reflection").
         2.  **Semantic Headers**: Use <h1> for the main title, <h2> for major sections, and <h3> for sub-sections.
         3.  **NO NUMBERED HEADINGS**: Do NOT include numbers (e.g., "1. ", "2. ") in your <h2> or <h3> headers.
         4.  **Code Blocks**: Use semantic HTML: `<pre><code class="language-...">...</code></pre>`.
@@ -1739,11 +1739,12 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
         for kw in internal_keywords:
             history = re.sub(rf"(?i){kw}.*?\n?", "[STRATEGIC_CONTEXT_OMITTED] ", history)
     
+
     target_instruction = ""
     if output_target == "MODERATOR_VIEW":
-        target_instruction = "TARGET: MODERATOR_VIEW (Slack). Use Markdown Pipes (|) for tables. Use standard Slack formatting."
+        target_instruction = "OUTPUT TARGET: MODERATOR_VIEW (Slack). Use Markdown Pipes (|) for tables. Use standard Slack formatting. Do NOT use HTML tags."
     else:
-        target_instruction = "TARGET: CMS_DRAFT (Ghost). Use Semantic HTML <table> tags. PROHIBIT Markdown."
+        target_instruction = "OUTPUT TARGET: CMS_DRAFT (Ghost CMS). Use Semantic HTML <table> tags. PROHIBIT raw Markdown."
 
     print(f"Tool: Generating pSEO Article for '{topic}'")
     
@@ -1763,29 +1764,65 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     # Signals
     topic_lower = topic.lower()
     has_pseo_keyword = "pseo" in topic_lower
-    
-    # Path A Signals (Verbatim Finalization)
-    is_repurpose_cmd = any(kw in topic_lower for kw in ["dump", "repurpose", "refactor", "publish the", "provision the", "for the draft", "finalize the"])
-    
-    # Path B Signals (Creative Iteration)
-    is_expand_cmd = any(kw in topic_lower for kw in ["expand", "flesh out", "write from", "based on outline", "refine", "polish", "rewrite"])
-    
-    has_outline_structure = "## " in str(history) and len(str(history)) < 3000 # Rough heuristic: Outlines are shorter
-    has_full_draft_structure = "## " in str(history) and len(str(history)) > 3000
-    
-    # FUTURE-PROOFING: If follow-up, favor REFACTOR/EXPAND mode if content exists.
-    # Only force AUTHOR mode if no pseo/article context is found in the current turn OR history.
-    if not is_initial_post and not has_pseo_keyword and not has_full_draft_structure and not has_outline_structure:
-        print("  + Follow-up turn without 'pSEO' keyword or existing structure. Defaulting to AUTHOR mode for safety.")
-        start_mode = "AUTHOR"
-    elif is_repurpose_cmd and has_full_draft_structure:
+
+    # has_full_draft_structure retained as Flash classifier fallback (not primary gate)
+    _hist_str = str(history)
+    has_full_draft_structure = (
+        ("## " in _hist_str or ("*" in _hist_str and len(_hist_str) > 3000))
+        and len(_hist_str) > 3000
+    )
+
+    # --- STRUCTURAL EVENT SCANNING (Replaces all keyword gates) ---
+    # REFACTOR signal: any agent_proposal with proposal_type "deep_dive" in history.
+    # Scan ALL (not just nearest) — user may reference any prior deep_dive draft.
+    has_deep_dive_draft = False
+    if history_events:
+        for event in history_events:
+            if event.get('event_type') == 'agent_proposal':
+                pd = event.get('proposal_data') or {}
+                if pd.get('proposal_type') == 'deep_dive':
+                    has_deep_dive_draft = True
+                    break
+
+    # EXPAND signal: any agent_answer with BLOG_OUTLINE intent in history.
+    has_outline_event = any(
+        event.get('event_type') == 'agent_answer'
+        and str(event.get('intent', '')).upper() == 'BLOG_OUTLINE'
+        for event in (history_events or [])
+    )
+
+    # Flash classifier — fires ONLY when a deep_dive draft exists (zero latency on AUTHOR/EXPAND turns)
+    is_repurpose_cmd = False
+    if has_deep_dive_draft and flash_model:
+        try:
+            flash_signal = safe_generate_content(
+                flash_model,
+                f"Reply YES or NO only. Is this command asking to publish or provision an existing draft verbatim into a CMS? Command: '{topic}'",
+                generation_config={"temperature": 0.0, "max_output_tokens": 5}
+            )
+            is_repurpose_cmd = "YES" in str(flash_signal).upper()
+            print(f"  + Flash REFACTOR Signal: {str(flash_signal).strip()} → is_repurpose_cmd={is_repurpose_cmd}")
+        except Exception as e:
+            print(f"  + Flash REFACTOR classifier failed ({e}). Falling back to specialist_model.")
+            try:
+                flash_signal = safe_generate_content(
+                    specialist_model,
+                    f"Reply YES or NO only. Is this command asking to publish or provision an existing draft verbatim into a CMS? Command: '{topic}'",
+                    generation_config={"temperature": 0.0, "max_output_tokens": 5}
+                )
+                is_repurpose_cmd = "YES" in str(flash_signal).upper()
+                print(f"  + Specialist REFACTOR Signal: {str(flash_signal).strip()} → is_repurpose_cmd={is_repurpose_cmd}")
+            except Exception as e2:
+                print(f"  + Specialist REFACTOR classifier also failed ({e2}). Using has_full_draft_structure fallback.")
+                is_repurpose_cmd = has_full_draft_structure
+
+    # Derive mode from structural signals
+    if is_repurpose_cmd:
         start_mode = "REFACTOR"
-    elif (is_expand_cmd and "## " in str(history)) or (has_outline_structure and not is_repurpose_cmd):
+    elif has_outline_event:
         start_mode = "EXPAND"
-    elif is_repurpose_cmd and has_outline_structure:
-        # User said "Repurpose this outline" -> They likely mean "Expand this outline into an article"
-        start_mode = "EXPAND" 
-        
+    # else: start_mode remains "AUTHOR"
+
     print(f"  + Generation Mode Selected: {start_mode}")
 
     # --- FAST-TRACK: DIRECT PROVISIONING (Bypass LLM) ---
@@ -1842,6 +1879,7 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
         TASK: Convert the 'SOURCE TEXT' into target GHOST-FRIENDLY HTML format.
 
         TARGET AUDIENCE: {audience_context}
+        {target_instruction}
         
         STRATEGIC REQUIREMENTS:
         - Preservation: Do NOT summarize. Refactor exactly as it appears.
@@ -1912,6 +1950,7 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     
     AUDIENCE: {audience_context}
     TONE & STYLE: {tone_instruction}
+    {target_instruction}
     
     CONTEXTUAL DATA:
     Current Topic: "{topic}"
