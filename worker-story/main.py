@@ -1776,14 +1776,19 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     )
 
     # --- STRUCTURAL EVENT SCANNING (Replaces all keyword gates) ---
-    # REFACTOR signal: any agent_proposal with proposal_type "deep_dive" in history.
-    # Scan ALL (not just nearest) — user may reference any prior deep_dive draft.
-    has_deep_dive_draft = False
+    # REFACTOR signal: fires if thread contains EITHER:
+    #   - agent_proposal with proposal_type 'deep_dive' (full draft, 1..N per thread)
+    #   - agent_answer with intent 'OPERATIONAL_REFORMAT' (edit iteration, always 1..N)
+    # Both can recur; reversed() picks the most recent for FAST-TRACK sourcing.
+    has_provisionable_draft = False
     if history_events:
         for event in history_events:
-            # proposal_type is stored at event top level, NOT inside proposal_data
-            if event.get('event_type') == 'agent_proposal' and event.get('proposal_type') == 'deep_dive':
-                has_deep_dive_draft = True
+            et = event.get('event_type')
+            if et == 'agent_proposal' and event.get('proposal_type') == 'deep_dive':
+                has_provisionable_draft = True
+                break
+            if et == 'agent_answer' and str(event.get('intent', '')).upper() == 'OPERATIONAL_REFORMAT':
+                has_provisionable_draft = True
                 break
 
     # EXPAND signal: any agent_answer with BLOG_OUTLINE intent in history.
@@ -1793,9 +1798,9 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
         for event in (history_events or [])
     )
 
-    # Flash classifier — fires ONLY when a deep_dive draft exists (zero latency on AUTHOR/EXPAND turns)
+    # Flash classifier — fires ONLY when a provisionable draft exists (zero latency on AUTHOR/EXPAND turns)
     is_repurpose_cmd = False
-    if has_deep_dive_draft and flash_model:
+    if has_provisionable_draft and flash_model:
         try:
             flash_signal = safe_generate_content(
                 flash_model,
@@ -1828,27 +1833,39 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     print(f"  + Generation Mode Selected: {start_mode}")
 
     # --- FAST-TRACK: DIRECT PROVISIONING (Bypass LLM) ---
-    # Case: "Publish this draft" - Extract the agreed-upon deep_dive draft from history_events.
+    # Case: "Publish this draft" - Extract the most recent provisionable draft from history_events.
     best_source_text = None
     if is_repurpose_cmd and history_events:
-        # PASS 1: Specifically target deep_dive proposals (the agreed MODERATOR_VIEW draft).
-        # Must scan for deep_dive BEFORE falling through to general article_html search,
-        # otherwise a stale pseo_article event (e.g. a prior failed push) would be returned instead.
+
+        # PASS 1a: Prefer most recent OPERATIONAL_REFORMAT agent_answer.
+        # This is the user-approved EDITED draft — the latest refinement of the deep_dive.
+        # OPERATIONAL_REFORMAT events are 1..N per thread; reversed() picks the most recent.
         for event in reversed(history_events):
-            # proposal_type is stored at event top level, NOT inside proposal_data
-            if event.get('event_type') != 'agent_proposal' or event.get('proposal_type') != 'deep_dive':
+            if event.get('event_type') != 'agent_answer':
                 continue
-            proposal_data = event.get('proposal_data') or {}
-            # Found a deep_dive proposal — try clean HTML first
-            if proposal_data.get('article_html') and "refactor" not in topic_lower:
-                print(f"  + FAST-TRACK: Found deep_dive HTML in proposal_data. Provisioning directly.")
-                return post_process_mermaid_to_images(proposal_data['article_html'], output_target)
-            # No article_html on deep_dive — use its text as source for Refactor Engine
+            if str(event.get('intent', '')).upper() != 'OPERATIONAL_REFORMAT':
+                continue
             content = event.get('text') or event.get('content')
             if content and isinstance(content, str) and len(content) > 500:
                 best_source_text = content
-                print(f"  + FAST-TRACK: Found deep_dive text ({len(content)} chars) for Refactoring.")
-            break  # deep_dive found (with or without html) — stop searching
+                print(f"  + FAST-TRACK 1a: Found OPERATIONAL_REFORMAT draft ({len(content)} chars). Using as REFACTOR source.")
+                break
+
+        # PASS 1b: Fallback to most recent deep_dive proposal (the original, pre-edit full draft).
+        # deep_dive is 1..N per thread (re-occurs when new grounding data forces re-synthesis).
+        if not best_source_text:
+            for event in reversed(history_events):
+                if event.get('event_type') != 'agent_proposal' or event.get('proposal_type') != 'deep_dive':
+                    continue
+                proposal_data = event.get('proposal_data') or {}
+                if proposal_data.get('article_html') and 'refactor' not in topic_lower:
+                    print(f"  + FAST-TRACK 1b: Found deep_dive HTML. Provisioning directly.")
+                    return post_process_mermaid_to_images(proposal_data['article_html'], output_target)
+                content = event.get('text') or event.get('content')
+                if content and isinstance(content, str) and len(content) > 500:
+                    best_source_text = content
+                    print(f"  + FAST-TRACK 1b: Found deep_dive text ({len(content)} chars). Using as REFACTOR source.")
+                break
 
         # PASS 2 (fallback): If no deep_dive found, look for any high-fidelity HTML in history
         if not best_source_text:
