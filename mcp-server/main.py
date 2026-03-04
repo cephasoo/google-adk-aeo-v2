@@ -21,6 +21,9 @@ from litellm import completion
 import time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import google.auth
+import google.auth.transport.requests
+import google.oauth2.id_token
 
 # --- Configuration ---
 PROJECT_ID = os.environ.get("PROJECT_ID")
@@ -28,6 +31,7 @@ LOCATION = os.environ.get("LOCATION", "us-central1")
 SEARCH_ENGINE_ID = os.environ.get("SEARCH_ENGINE_ID")
 # These will be fetched from Secret Manager in production
 SERPAPI_API_KEY = None
+WORKER_SCHEMA_URL = os.environ.get("WORKER_SCHEMA_URL")
 BROWSERLESS_API_KEY = None
 FLASH_MODEL_NAME = os.environ.get("FLASH_MODEL_NAME", "gemini-2.0-flash")
 ANTHROPIC_API_KEY = None
@@ -46,7 +50,6 @@ app = FastAPI(title="Sensory-Tools-Server")
 # --- Global Clients ---
 db = None
 secret_client = None
-flash_model = None
 
 # --- Safety Configuration (ADK/RAI Compliant) ---
 safety_settings = {
@@ -97,10 +100,9 @@ def ensure_initialized():
         _is_initialized = True
 
 def get_flash_model():
-    global flash_model
-    if flash_model is None:
-        flash_model = GenerativeModel(FLASH_MODEL_NAME, safety_settings=safety_settings)
-    return flash_model
+    """Returns a fresh GenerativeModel instance per call for gRPC fork-safety."""
+    ensure_initialized()
+    return GenerativeModel(FLASH_MODEL_NAME, safety_settings=safety_settings)
 
 # --- Shared Helper: SERP Parser ---
 def _parse_bing_results(results):
@@ -362,7 +364,8 @@ def handle_tool_call(name, arguments):
         "google_scholar_search", "google_news_search", "google_simple_search",
         "bing_search", "bing_copilot", "youtube_search",
         "detect_geo", "detect_intent", "analyze_image", "generate_image",
-        "google_ai_overview", "analyze_code_file", "render_mermaid"
+        "google_ai_overview", "analyze_code_file", "render_mermaid",
+        "schema_audit"
     ]
     if name not in allowed_tools:
         return f"Error: Tool '{name}' is not in the allowed list."
@@ -1061,6 +1064,38 @@ def handle_tool_call(name, arguments):
                     result = f"```mermaid\n{mermaid_code}\n```"
         except Exception as e:
             result = f"Error rendering mermaid: {str(e)}"
+
+    elif name == "schema_audit":
+        if not WORKER_SCHEMA_URL: return "Error: WORKER_SCHEMA_URL not configured on MCP server."
+        site_url = arguments.get("site_url")
+        if not site_url: return "Error: Missing site_url in schema_audit."
+        
+        session_id = arguments.get("session_id")
+        mode = arguments.get("mode", "validate")
+        ghost_post_id = arguments.get("ghost_post_id")
+        
+        try:
+            print(f"MCP Hub: Calling worker-schema for [{site_url}] | Mode: {mode}")
+            auth_req = google.auth.transport.requests.Request()
+            id_token = google.oauth2.id_token.fetch_id_token(auth_req, WORKER_SCHEMA_URL)
+            
+            resp = requests.post(
+                WORKER_SCHEMA_URL,
+                headers={"Authorization": f"Bearer {id_token}", "Content-Type": "application/json"},
+                json={
+                    "site_url": site_url,
+                    "session_id": session_id,
+                    "mode": mode,
+                    "ghost_post_id": ghost_post_id
+                },
+                timeout=60
+            )
+            resp.raise_for_status()
+            audit_data = resp.json().get("audit", {})
+            findings = "\n".join(f"- {f}" for f in audit_data.get("findings", [])[:5])
+            result = f"Schema Audit Result for {site_url}:\nEDS Score: {audit_data.get('eds_score')}/100\nFindings:\n{findings}"
+        except Exception as e:
+            result = f"Error calling worker-schema via MCP: {str(e)}"
 
     else:
         return f"Error: Tool '{name}' implementation logic not found."

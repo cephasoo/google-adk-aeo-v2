@@ -14,3 +14,4 @@ certifi
 google-api-python-client
 tenacity
 anthropic
+google-auth

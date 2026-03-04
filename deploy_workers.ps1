@@ -6,7 +6,7 @@ Write-Host "=========================================="
 Write-Host "🚀 Sonnet & Prose - Worker Deployment Tool"
 Write-Host "=========================================="
 Write-Host ""
-Write-Host "[1/4] Syncing shared utility modules into worker directories..."
+Write-Host "[1/7] Syncing shared utility modules into worker directories..."
 
 # 1. Copy the 'shared' folder into both worker directories
 # This ensures that 'from shared.utils import ...' works natively in the Cloud Build environment
@@ -16,14 +16,18 @@ Write-Host "[1/4] Syncing shared utility modules into worker directories..."
 Write-Host "Cleaning existing shared directories in workers..."
 if (Test-Path ".\worker-story\shared") { Remove-Item ".\worker-story\shared" -Recurse -Force }
 if (Test-Path ".\worker-feedback\shared") { Remove-Item ".\worker-feedback\shared" -Recurse -Force }
+if (Test-Path ".\worker-tracker\shared") { Remove-Item ".\worker-tracker\shared" -Recurse -Force }
+if (Test-Path ".\worker-schema\shared") { Remove-Item ".\worker-schema\shared" -Recurse -Force }
 
 Write-Host "Copying fresh shared libraries..."
 Copy-Item -Path ".\shared" -Destination ".\worker-story" -Recurse -Force
 Copy-Item -Path ".\shared" -Destination ".\worker-feedback" -Recurse -Force
+Copy-Item -Path ".\shared" -Destination ".\worker-tracker" -Recurse -Force
+Copy-Item -Path ".\shared" -Destination ".\worker-schema" -Recurse -Force
 
 Write-Host "✅ Modules synchronized."
 Write-Host ""
-Write-Host "[2/6] Deploying worker-feedback (Dockerized via Cloud Run)..."
+Write-Host "[2/7] Deploying worker-feedback (Dockerized via Cloud Run)..."
 
 Set-Location .\worker-feedback
 try {
@@ -38,7 +42,7 @@ finally {
 }
 
 Write-Host ""
-Write-Host "[3/6] Deploying worker-story (Dockerized via Cloud Run)..."
+Write-Host "[3/7] Deploying worker-story (Dockerized via Cloud Run)..."
 
 Set-Location .\worker-story
 try {
@@ -52,21 +56,36 @@ finally {
 }
 
 Write-Host ""
-Write-Host "[4/6] Deploying worker-tracker (Dockerized via Cloud Run)..."
+Write-Host "[4/7] Deploying worker-tracker (Dockerized via Cloud Run)..."
 
 Set-Location .\worker-tracker
 try {
     $region = $env:LOCATION
     if (-not $region) { $region = "us-central1" }
     
-    gcloud run deploy worker-tracker --source . --region=$region --clear-base-image --memory 1Gi
+    gcloud run deploy worker-tracker --source . --region=$region --clear-base-image
 }
 finally {
     Set-Location ..
 }
 
 Write-Host ""
-Write-Host "[5/6] Deploying mcp-sensory-server (Dockerized via Cloud Run)..."
+Write-Host "[5/7] Deploying worker-schema (Dockerized via Cloud Run)..."
+
+Set-Location .\worker-schema
+try {
+    $region = $env:LOCATION
+    if (-not $region) { $region = "us-central1" }
+    
+    gcloud run deploy process-schema-logic --source . --region=$region --clear-base-image `
+
+}
+finally {
+    Set-Location ..
+}
+
+Write-Host ""
+Write-Host "[6/7] Deploying mcp-sensory-server (Dockerized via Cloud Run)..."
 
 Set-Location .\mcp-server
 try {
@@ -80,7 +99,7 @@ finally {
 }
 
 Write-Host ""
-Write-Host "[6/6] Deploying dispatchers (Dockerized via Cloud Run)..."
+Write-Host "[7/7] Deploying dispatchers (Dockerized via Cloud Run)..."
 
 Set-Location .\dispatcher-story
 try {
@@ -107,4 +126,4 @@ finally {
 }
 
 Write-Host ""
-Write-Host "✅ Deployment Pipeline Complete! All 6 services have been Dockerized to completely bypass Serverless gRPC bugs."
+Write-Host "✅ Deployment Pipeline Complete! All 7 services have been Dockerized to completely bypass Serverless gRPC bugs."

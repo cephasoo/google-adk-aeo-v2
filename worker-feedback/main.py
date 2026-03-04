@@ -23,7 +23,10 @@ from shared.utils import (
 import re
 import uuid
 import datetime
+import requests
 from google.cloud import firestore, tasks_v2, logging as cloud_logging
+import google.auth.transport.requests as google_auth_requests
+import google.oauth2.id_token
 
 safety_settings = {
     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
@@ -307,12 +310,12 @@ def process_feedback_logic(request):
         refusal_text = "I'm sorry, I cannot process this feedback as it violates my safety guidelines. If you are in Nigeria and need support, please contact the Nigerian Mental Health helplines: https://www.nigerianmentalhealth.org/helplines"
         
         # Log to Firestore
-        db.collection('agent_sessions').document(session_id).collection('events').add({
+        _firestore_call_with_timeout(lambda: db.collection('agent_sessions').document(session_id).collection('events').add({
             "event_type": "safety_block",
             "text": refusal_text,
             "reason": "RAI_FILTER",
             "timestamp": datetime.datetime.now(datetime.timezone.utc)
-        })
+        }))
         
         # Determine global operation type for all N8N payloads
         ghost_post_id = session_data.get('ghost_post_id') if isinstance(session_data, dict) else None
@@ -396,9 +399,16 @@ def process_feedback_logic(request):
     tokens = re.sub(r'[^\w\s]', '', user_feedback).strip().lower().split()
     is_quick_approval = len(tokens) <= 3 and any(t in ["approved", "approve"] for t in tokens)
 
+    # ADK FIX: SCHEMA fast-exit override (highest specificity — checked first)
+    if any(kw in user_feedback.lower() for kw in ["inject schema", "fix schema", "remediate schema", "add json-ld", "push schema"]):
+        intent = "SCHEMA_INJECT"
+        print(f"Schema Inject intent detected in feedback. Routing to worker-schema.")
+    elif any(kw in user_feedback.lower() for kw in ["validate schema", "check schema", "audit schema", "eds score", "schema score", "json-ld"]):
+        intent = "SCHEMA_VALIDATE"
+        print(f"Schema Validate intent detected in feedback. Routing to worker-schema.")
     # ADK FIX: Explicitly DELEGATE pSEO/Ghost requests to the Story Worker engine.
     # The pSEO pipeline is NOT an approval flow; it's a closed-ended provisioning directive.
-    if any(kw in user_feedback.lower() for kw in ["pseo", "ghost", "cms", "publish as", "lp"]):
+    elif any(kw in user_feedback.lower() for kw in ["pseo", "ghost", "cms", "publish as", "lp"]):
         intent = "DELEGATE"
         print(f"pSEO/Ghost intent detected. Forcing DELEGATE to Story Worker.")
     elif is_quick_approval:
@@ -437,7 +447,89 @@ def process_feedback_logic(request):
     global_operation_type = get_n8n_operation_type(intent, session_data.get('topic', ''), user_feedback, ghost_post_id)
     
     # --- 3. STATE-AWARE ROUTING LOGIC ---
-    if intent == "DELEGATE":
+
+    # SCHEMA COUPLED-TASK DETECTION: Use Flash LLM to determine if schema request
+    # needs additional research/enrichment beyond pure validation/injection.
+    # Falls back to keywords if LLM call fails.
+    has_coupled_task = False
+    if intent in ["SCHEMA_VALIDATE", "SCHEMA_INJECT"]:
+        _SCHEMA_FALLBACK_SIGNALS = ["research", "enrich", "generate description", "paa", "summarize"]
+        try:
+            coupling_prompt = (
+                "You are a schema intent classifier. The user sent this message:\n"
+                f'"{user_feedback}"\n\n'
+                f"The detected intent is: {intent}\n\n"
+                "Does this request require ANYTHING beyond pure schema validation or injection?\n"
+                "This includes: researching content for schema fields, generating descriptions, "
+                "PAA/FAQ enrichment, or other additional tasks.\n\n"
+                "Answer with ONLY one word: YES or NO."
+            )
+            coupling_answer = str(safe_generate_content(unimodel, coupling_prompt, generation_config={"temperature": 0.0})).strip().upper()
+            has_coupled_task = coupling_answer.startswith("YES")
+            print(f"TELEMETRY: Schema coupling LLM check → [{coupling_answer}] for feedback: '{user_feedback[:40]}'")
+        except Exception as _e:
+            print(f"⚠️ Schema coupling LLM failed, falling back to keywords: {_e}")
+            has_coupled_task = any(sig in user_feedback.lower() for sig in _SCHEMA_FALLBACK_SIGNALS)
+
+    is_pure_schema = intent in ["SCHEMA_VALIDATE", "SCHEMA_INJECT"] and not images and not has_coupled_task
+
+
+    if is_pure_schema:
+        print(f"Executing Schema Fast-Exit from feedback loop: [{intent}]")
+        schema_worker_url = os.environ.get("WORKER_SCHEMA_URL")
+        target_url = req.get("site_url") or req.get("url")
+        schema_ghost_post_id = req.get("ghost_post_id") or session_data.get("ghost_post_id")
+        schema_mode = "inject" if intent == "SCHEMA_INJECT" else "validate"
+
+        schema_result = None
+        schema_reply = "Schema audit complete."
+        try:
+            auth_req = google_auth_requests.Request()
+            id_token = google.oauth2.id_token.fetch_id_token(auth_req, schema_worker_url)
+            schema_resp = requests.post(
+                schema_worker_url,
+                headers={"Authorization": f"Bearer {id_token}", "Content-Type": "application/json"},
+                json={"site_url": target_url, "session_id": session_id, "mode": schema_mode, "ghost_post_id": schema_ghost_post_id},
+                timeout=30
+            )
+            schema_resp.raise_for_status()
+            schema_result = schema_resp.json().get("audit", {})
+            eds = schema_result.get("eds_score", "N/A")
+            findings = schema_result.get("findings", [])
+            remediations = schema_result.get("remediations", [])
+            priority = schema_result.get("priority", "NORMAL")
+            injection = schema_result.get("injection_status", "N/A")
+            schema_reply = (
+                f"*🔍 Schema Audit: {target_url}*\n"
+                f"*EDS Score:* `{eds}/100` | *Priority:* `{priority}`\n"
+                f"*Findings:*\n" + "\n".join(f"  • {f}" for f in findings[:5]) +
+                (f"\n*Remediations:* {len(remediations)} items flagged." if remediations else "") +
+                (f"\n*Injection:* `{injection}`" if schema_mode == "inject" else "")
+            )
+        except Exception as e:
+            print(f"⚠️ Schema Fast-Exit Error (feedback): {e}")
+            schema_reply = f"Schema audit error: {str(e)[:100]}"
+
+        _firestore_call_with_timeout(lambda: doc_ref.collection('events').add({
+            "event_type": "schema_audit",
+            "text": schema_reply,
+            "audit": schema_result,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc)
+        }))
+        _firestore_call_with_timeout(lambda: doc_ref.update({"status": "completed", "last_updated": expire_time}))
+        safe_n8n_delivery({
+            "session_id": session_id,
+            "type": global_operation_type,
+            "message": schema_reply,
+            "query": user_feedback,
+            "output_target": get_output_target(intent),
+            "channel_id": slack_context.get('channel'),
+            "thread_ts": slack_context.get('ts'),
+            "is_initial_post": False
+        })
+        return jsonify({"msg": "Schema audit complete", "eds_score": schema_result.get("eds_score") if schema_result else None}), 200
+
+    elif intent == "DELEGATE":
         # This now handles all factual questions, meta-questions, and simple chat.
         print("Intent requires new research or is conversational. Delegating to story worker...")
         _firestore_call_with_timeout(lambda: doc_ref.update({

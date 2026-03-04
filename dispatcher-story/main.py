@@ -48,7 +48,8 @@ def start_story_workflow(request):
     if db is None: db = firestore.Client()
 
     request_json = request.get_json(silent=True)
-    if not request_json: return jsonify({"error": "No JSON payload"}), 400
+    if not request_json: 
+        return jsonify({"error": "No JSON payload"}), 400
     if isinstance(request_json, list): request_json = request_json[0]
     
     text_input = request_json.get('topic') or request_json.get('text')
@@ -60,7 +61,16 @@ def start_story_workflow(request):
         "channel": request_json.get('slack_channel') or request_json.get('channel') or request_json.get('event', {}).get('channel')
     }
 
+    # IGNORE: System events (message_changed, hidden, etc.) that don't satisfy our trigger requirements.
+    # We return 200 instead of 400 to avoid Cloud Run 'Warning' severity and retries for non-errors.
     if not text_input and not images: 
+        subtype = request_json.get('subtype')
+        is_hidden = request_json.get('hidden')
+        if subtype or is_hidden:
+            print(f"INFO: Ignoring Slack system event (subtype: {subtype}, hidden: {is_hidden})")
+            return jsonify({"type": "ignored", "msg": "System event ignored"}), 200
+            
+        print(f"WARNING: Invalid request - Missing both 'topic'/'text' and 'images'. Keys: {list(request_json.keys())}")
         return jsonify({"error": "Invalid request"}), 400
     
     session_id = str(uuid.uuid4())

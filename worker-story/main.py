@@ -40,6 +40,7 @@ import requests
 import certifi # Explicitly kept to avert legacy SSL issues
 import google.auth
 import google.auth.transport.requests
+import google.oauth2.id_token
 from google.cloud import firestore
 from google.cloud.firestore_v1.vector import Vector
 import concurrent.futures
@@ -911,6 +912,7 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
        - **TRENDS**: (USE SPARINGLY) For broad regional trending topics only (e.g., "Top searches in US").
        - **ANALYSIS**: For topic-specific historical interest and volume (e.g., "Tesla Model 2 interest").
        - **COMPLIANCE**: Legal and regulatory documentation.
+       - **SCHEMA**: Technical audit of on-page JSON-LD structured data and EDS scoring. ALWAYS recruit this tool alongside other tools for PSEO/content creation tasks (blog posts, landing pages, collection pages) to generate appropriate JSON-LD structured data for the new page.
        - **USE_CONVERSATIONAL_CONTEXT**: If existing history is sufficient.
     
     OUTPUT FORMAT (Raw JSON Only):
@@ -1099,6 +1101,29 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
         if research_context:
             context_snippets.append(research_context)
             tool_logs.append({"event_type": "tool_call", "tool_name": tool_name, "input": raw_topic, "status": "success"})
+
+    # --- 1.2 SPECIALIZED DOMAIN TOOLS (Schema) ---
+    if "SCHEMA" in selected_tools:
+        print("Sensory Router: Category [SCHEMA] active. Performing technical audit...")
+        # Extract target URL from topic or history if possible
+        target_url = next((u for u in extract_urls_from_text(raw_topic)), None)
+        if not target_url and history_context:
+            all_urls = extract_urls_from_text(history_context)
+            if all_urls: target_url = all_urls[0]
+            
+        if target_url:
+            print(f"  + Auditing Schema for: {target_url}")
+            schema_context = get_mcp_client().call("schema_audit", {"site_url": target_url, "session_id": session_id})
+            if schema_context:
+                context_snippets.append(f"[Current Schema on {target_url}]:\n{schema_context}")
+                tool_logs.append({
+                    "event_type": "tool_call", 
+                    "tool_name": "mcp_schema_audit", 
+                    "input": target_url, 
+                    "status": "success"
+                })
+        else:
+            print("  ⚠️ Schema tool selected but no target URL found in context.")
 
     # --- 1.5 COMPLIANCE KNOWLEDGE TOOLS ---
     if "COMPLIANCE" in selected_tools:
@@ -1670,7 +1695,6 @@ def chunked_refactor_article(source_text, audience_context, specialist_model, st
     results = [None] * len(chunks)
     
     def process_chunk(idx, chunk_text):
-        is_first = (idx == 0)
         chunk_refactor_prompt = f"""
         You are a Content Refactor Engine specializing in high-fidelity Ghost CMS delivery.
         
@@ -2942,9 +2966,11 @@ def _process_story_logic_inner(request):
             8.  **SIMPLE_QUESTION**: **The Factual Scout.** For fact-checks, definitions, or retrieving specific data points that require external grounding or RAG search.
                 *   *Triggers:* "What is...", "Explain the concept of...", "Find me the rules for...", "Check the status of...".
                 *   *Rule:* Use this for initial questions about the world. If the user asks for a STRUCTURE (Outline/Brief), pick **OPERATIONAL_REFORMAT** instead.
+                *   *NEGATIVE RULE:* If the user's prompt contains the word "Schema" or "JSON-LD", NEVER pick this.
 
             9.  **DIRECT_ANSWER**: **The Research Architect.** Select this ONLY for **NOVEL SYNTHESIS** or **TECHNICAL AUDITS** that require combining multiple external data sources into a new expert opinion. 
                 *   *Example:* "Analyze the security layer of AP2 vs standard PCI-DSS." 
+                *   *NEGATIVE RULE:* If the user's prompt contains the word "Schema" or "JSON-LD", NEVER pick this.
 
             10. **OPERATIONAL_REFORMAT**: **The Efficiency Engine.** Select this for any structural command whose COMPLETE context is already available in the history.
                 *   *Triggers:* "Summarize our progress", "Reformat these points as bullets", "Make it more professional", "Convert this into a brief".
@@ -2954,6 +2980,16 @@ def _process_story_logic_inner(request):
             11. **BLOG_OUTLINE**: **The Content Blueprint.** Select this for requests to create, repurpose, or draft a Blog Outline, Content Structure, or Strategy Document.
                 *   *Triggers:* "Repurpose the strategy into a proper blog outline", "Create an outline", "Develop a content structure", "Draft a plan".
                 *   *Rule:* If the user asks for a structural blueprint (not the full 2500 word article yet), pick this.
+
+            12. **SCHEMA_VALIDATE**: **Schema Sensory Audit.** Select this when the user wants to audit, check, or score the JSON-LD structured data on a given URL.
+                *   *Super-Keyword Rule:* If the prompt contains "validate schema", "check schema", "audit schema", "EDS score", or "schema score", this is MANDATORY.
+                *   *Triggers:* "Validate the schema on this page", "Check the JSON-LD", "What's the EDS score for...", "Audit structured data".
+                *   *Rule:* Use this for pure audit requests. If the user also asks to research or enrich the schema content, this still applies but will use the full LLM pipeline.
+
+            13. **SCHEMA_INJECT**: **Schema Remediation & Injection.** Select this when the user wants to generate corrected JSON-LD and inject it directly into a Ghost post or page.
+                *   *Super-Keyword Rule:* If the prompt contains "inject schema", "fix schema", "remediate schema", "add JSON-LD", or "push schema to Ghost", this is MANDATORY.
+                *   *Triggers:* "Fix the schema on this Ghost post", "Inject JSON-LD into this page", "Remediate the schema for...", "Push corrected schema to Ghost".
+                *   *Rule:* Requires a Ghost post/page ID or URL. Use this for schema write-back operations.
 
             ### NEGATIVE CONSTRAINTS (DO NOT CLASSIFY AS DEEP_DIVE IF):
             - The word "Outline" is present.
@@ -2974,9 +3010,17 @@ def _process_story_logic_inner(request):
         # Use Flash Model for Speed/Cost Efficiency (Gemini 2.0 Flash)
         intent = str(safe_generate_content(flash_model, triage_prompt)).strip()
         
+        keyword_payload = sanitized_topic.lower()
+
+        # --- ADK SAFE-CATCH: Prevent Schema Mistriage ---
+        # If the LLM picked a non-schema intent, but the prompt clearly discusses schema, force it back on track.
+        if "schema" in keyword_payload or "json-ld" in keyword_payload:
+            if intent not in ["SCHEMA_VALIDATE", "SCHEMA_INJECT"]:
+                print(f"🎯 SAFE-CATCH: LLM wrongly picked [{intent}] for a Schema request. Correcting to SCHEMA_VALIDATE.")
+                intent = "SCHEMA_VALIDATE"
+
         # ADK HARDENING: Deterministic Triage Override (Keyword Overlord)
         # This prevents the LLM from misclassifying Ghost/pSEO requests as Operational Reformats.
-        keyword_payload = sanitized_topic.lower()
 
         # PSEO_LP: Force intent for Landing Page requests (Highest priority — checked first)
         if any(kw in keyword_payload for kw in ["ghost lp", "lp ghost", "ghost landing page", "landing page cms", "lp ghost cms", "ghost lp page"]):
@@ -2996,6 +3040,18 @@ def _process_story_logic_inner(request):
                 print(f"🎯 TRIAGE OVERRIDE: Forcing PSEO_ARTICLE due to keywords in '{sanitized_topic[:30]}'")
                 intent = "PSEO_ARTICLE"
 
+        # SCHEMA_INJECT: Keyword Overlord for schema write-back commands
+        elif any(kw in keyword_payload for kw in ["inject schema", "fix schema", "remediate schema", "add json-ld", "push schema"]):
+            if "SCHEMA_INJECT" not in intent:
+                print(f"🎯 TRIAGE OVERRIDE: Forcing SCHEMA_INJECT due to keywords in '{sanitized_topic[:30]}'")
+                intent = "SCHEMA_INJECT"
+
+        # SCHEMA_VALIDATE: Keyword Overlord for schema audit commands
+        elif any(kw in keyword_payload for kw in ["validate schema", "check schema", "audit schema", "eds score", "schema score", "json-ld"]):
+            if "SCHEMA_VALIDATE" not in intent:
+                print(f"🎯 TRIAGE OVERRIDE: Forcing SCHEMA_VALIDATE due to keywords in '{sanitized_topic[:30]}'")
+                intent = "SCHEMA_VALIDATE"
+
         # MEDIA AND LINK GATE: If images or URLs are attached, signal fast-exit paths to skip
         # and fall through to the Heavy Lifting research phase instead.
         # The original intent is PRESERVED so the post-research output router uses the right generator.
@@ -3006,6 +3062,39 @@ def _process_story_logic_inner(request):
         )
         if force_research:
             print(f"🎯 MEDIA/LINK GATE: Intent [{intent}] preserved but fast-exit skipped — media or links detected. Routing to research path.")
+
+        # SCHEMA COUPLED-TASK DETECTION: Use Flash LLM to determine if schema request
+        # needs additional research/enrichment beyond pure validation/injection.
+        # Falls back to keywords if LLM call fails.
+        has_coupled_task = False
+        if intent in ["SCHEMA_VALIDATE", "SCHEMA_INJECT"]:
+            _SCHEMA_FALLBACK_SIGNALS = ["research", "enrich", "generate description", "paa", "summarize"]
+            try:
+                coupling_prompt = (
+                    "You are a schema intent classifier. The user sent this request:\n"
+                    f'"{sanitized_topic}"\n\n'
+                    f"The detected intent is: {intent}\n\n"
+                    "Does this request require ANYTHING beyond pure schema validation or injection?\n"
+                    "This includes: researching content for schema fields, generating descriptions, "
+                    "PAA/FAQ enrichment, or other additional tasks.\n\n"
+                    "Answer with ONLY one word: YES or NO."
+                )
+                coupling_answer = str(safe_generate_content(flash_model, coupling_prompt, generation_config={"temperature": 0.0})).strip().upper()
+                has_coupled_task = coupling_answer.startswith("YES")
+                print(f"TELEMETRY: Schema coupling LLM check → [{coupling_answer}] for: '{sanitized_topic[:40]}'")
+            except Exception as _e:
+                print(f"⚠️ Schema coupling LLM failed, falling back to keywords: {_e}")
+                has_coupled_task = any(sig in sanitized_topic.lower() for sig in _SCHEMA_FALLBACK_SIGNALS)
+
+        force_schema_full_pipeline = bool(
+            intent in ["SCHEMA_VALIDATE", "SCHEMA_INJECT"] and
+            (images or has_coupled_task)
+        )
+
+        if intent in ["SCHEMA_VALIDATE", "SCHEMA_INJECT"] and not force_schema_full_pipeline:
+            print(f"🎯 SCHEMA FAST-EXIT GATE: Pure schema task detected [{intent}] — routing directly to worker-schema.")
+        elif force_schema_full_pipeline:
+            print(f"🎯 SCHEMA FULL PIPELINE: Schema task [{intent}] has coupled tasks or media — routing to LLM pipeline.")
 
         print(f"TELEMETRY: Triage V6.0 -> Intent classified as: [{intent}] for command: '{sanitized_topic[:50]}...'")
 
@@ -3078,6 +3167,86 @@ def _process_story_logic_inner(request):
                 "is_initial_post": is_initial_post
             })
             return jsonify({"msg": "Social reply sent"}), 200
+
+        # === PATH C: SCHEMA FAST-EXIT (Direct OIDC call to worker-schema) ===
+        elif intent in ["SCHEMA_VALIDATE", "SCHEMA_INJECT"] and not force_schema_full_pipeline:
+            print(f"Executing Schema Fast-Exit: calling worker-schema for [{intent}]")
+            schema_worker_url = os.environ.get("WORKER_SCHEMA_URL")
+            
+            # Extract target URL from request (the site/page to audit)
+            target_url = req.get("site_url") or req.get("url") or next(
+                (u for u in extract_urls_from_text(sanitized_topic)), None
+            )
+            schema_ghost_post_id = req.get("ghost_post_id") or (session_data.get('ghost_post_id') if isinstance(session_data, dict) else None)
+            schema_mode = "inject" if intent == "SCHEMA_INJECT" else "validate"
+
+            schema_result = None
+            schema_reply = "Schema audit complete."
+            try:
+                # OIDC auth for service-to-service call (ADK Production Standard)
+                auth_req = google.auth.transport.requests.Request()
+                id_token = google.oauth2.id_token.fetch_id_token(auth_req, schema_worker_url)
+                schema_headers = {
+                    "Authorization": f"Bearer {id_token}",
+                    "Content-Type": "application/json"
+                }
+                schema_payload = {
+                    "site_url": target_url,
+                    "session_id": session_id,
+                    "mode": schema_mode,
+                    "ghost_post_id": schema_ghost_post_id,
+                }
+                schema_resp = requests.post(
+                    schema_worker_url,
+                    headers=schema_headers,
+                    json=schema_payload,
+                    timeout=30
+                )
+                schema_resp.raise_for_status()
+                schema_result = schema_resp.json().get("audit", {})
+
+                # Format a Slack-friendly score card reply
+                eds = schema_result.get("eds_score", "N/A")
+                findings = schema_result.get("findings", [])
+                remediations = schema_result.get("remediations", [])
+                priority = schema_result.get("priority", "NORMAL")
+                injection = schema_result.get("injection_status", "N/A")
+
+                schema_reply = (
+                    f"*🔍 Schema Audit: {target_url}*\n"
+                    f"*EDS Score:* `{eds}/100` | *Priority:* `{priority}`\n"
+                    f"*Findings:*\n" + "\n".join(f"  • {f}" for f in findings[:5]) +
+                    (f"\n*Remediations:* {len(remediations)} items flagged." if remediations else "") +
+                    (f"\n*Injection:* `{injection}`" if schema_mode == "inject" else "")
+                )
+            except Exception as e:
+                print(f"⚠️ Schema Fast-Exit Error: {e}")
+                schema_reply = f"Schema audit encountered an error: {str(e)[:100]}"
+
+            new_events.append({"event_type": "schema_audit", "text": schema_reply, "audit": schema_result})
+
+            session_ref = db.collection('agent_sessions').document(session_id)
+            events_ref = session_ref.collection('events')
+            for event in new_events:
+                if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
+            _firestore_call_with_timeout(lambda: session_ref.update({
+                "status": "completed",
+                "type": "schema_audit",
+                "last_updated": expire_time
+            }))
+            target = get_output_target(intent)
+            safe_n8n_delivery({
+                "session_id": session_id,
+                "type": global_operation_type,
+                "message": schema_reply,
+                "query": sanitized_topic,
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or slack_context.get('channel_id') or req.get('channel'),
+                "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'),
+                "is_initial_post": is_initial_post
+            })
+            return jsonify({"msg": "Schema audit complete", "eds_score": schema_result.get("eds_score") if schema_result else None}), 200
 
         # === PATH B: OPERATIONAL REFORMAT / FAST FOLLOW-UP (Fast Exit) ===
         elif intent == "OPERATIONAL_REFORMAT" and not force_research:
@@ -3255,7 +3424,82 @@ def _process_story_logic_inner(request):
                         new_events.append({"event_type": "tool_call", "tool_name": "analyze_scraped_image", "status": "success", "content": f"[VISUAL_INSIGHT]: {visual_context}"})
         
         # TIER 2: Grounding & Signal Detection (Images or URLs)
-        if images or urls:
+        if force_schema_full_pipeline:
+            # === SCHEMA FULL PIPELINE: Constrained Authority Research ===
+            # Instead of the generic Sensory Router, we scrape only:
+            # 1. The user's target URL (already done above in L3398)
+            # 2. Google Search Gallery (the definitive guide for rich results)
+            # 3. Schema.org Hierarchy (the foundational vocabulary)
+            # Then deep-link follow within those domains to find the specific type pages.
+            print("TELEMETRY: 🎯 Schema Full Pipeline — Launching Constrained Authority Research...")
+
+            GOOGLE_GALLERY_URL = "https://developers.google.com/search/docs/appearance/structured-data/search-gallery"
+            SCHEMA_ORG_URL = "https://schema.org/docs/full.html"
+
+            # --- Authority Source 1: Google Search Gallery ---
+            print(f"  + Scraping Google Search Gallery: {GOOGLE_GALLERY_URL}")
+            gallery_content = fetch_article_content(GOOGLE_GALLERY_URL)
+            if gallery_content and len(gallery_content) > 200:
+                combined_context.append(f"[SCHEMA_AUTHORITY - Google Search Gallery]:\n{gallery_content}")
+                new_events.append({"event_type": "tool_call", "tool_name": "scrape_schema_authority", "status": "success", "content": f"Source: {GOOGLE_GALLERY_URL}"})
+
+                # Deep-link follow: Extract internal links from Gallery that point to specific schema type pages
+                gallery_links = re.findall(r'(https://developers\.google\.com/search/docs/appearance/structured-data/[a-zA-Z0-9_-]+)', gallery_content)
+                unique_gallery_links = list(dict.fromkeys(gallery_links))  # Dedupe preserving order
+                if unique_gallery_links:
+                    # Use the scraped user page + gallery content to identify which schema types are relevant
+                    type_selection_prompt = (
+                        "You are a Schema.org expert. Based on the page content below, identify the 1-3 MOST RELEVANT "
+                        "Google structured data types from the Gallery links provided.\n\n"
+                        f"PAGE CONTENT:\n{str(combined_context[0])[:5000]}\n\n"
+                        f"AVAILABLE GALLERY LINKS:\n{chr(10).join(unique_gallery_links[:30])}\n\n"
+                        "Return ONLY the URLs of the most relevant types, one per line. No explanation."
+                    )
+                    try:
+                        selected_urls_raw = safe_generate_content(flash_model, type_selection_prompt, generation_config={"temperature": 0.0})
+                        selected_urls = [u.strip() for u in str(selected_urls_raw).strip().split('\n') if u.strip().startswith('https://')]
+                        print(f"  + LLM selected {len(selected_urls)} relevant schema type pages for deep-link follow")
+                    except Exception as _e:
+                        print(f"  ⚠️ Type selection LLM failed: {_e}. Falling back to top 2 gallery links.")
+                        selected_urls = unique_gallery_links[:2]
+
+                    for sub_url in selected_urls[:3]:
+                        print(f"    → Deep-link following: {sub_url}")
+                        sub_content = fetch_article_content(sub_url)
+                        if sub_content and len(sub_content) > 300:
+                            combined_context.append(f"[SCHEMA_AUTHORITY - Google Type Detail ({sub_url})]:\n{sub_content}")
+                            new_events.append({"event_type": "tool_call", "tool_name": "scrape_schema_deep_link", "status": "success", "content": f"Source: {sub_url}"})
+                        else:
+                            print(f"    ❌ Thin content from {sub_url}. Skipping.")
+            else:
+                print(f"  ⚠️ Google Gallery scrape yielded thin content ({len(gallery_content) if gallery_content else 0} chars).")
+
+            # --- Authority Source 2: Schema.org Full Hierarchy ---
+            print(f"  + Scraping Schema.org Hierarchy: {SCHEMA_ORG_URL}")
+            schema_org_content = fetch_article_content(SCHEMA_ORG_URL)
+            if schema_org_content and len(schema_org_content) > 200:
+                combined_context.append(f"[SCHEMA_AUTHORITY - Schema.org Hierarchy]:\n{schema_org_content}")
+                new_events.append({"event_type": "tool_call", "tool_name": "scrape_schema_authority", "status": "success", "content": f"Source: {SCHEMA_ORG_URL}"})
+            else:
+                print(f"  ⚠️ Schema.org scrape yielded thin content ({len(schema_org_content) if schema_org_content else 0} chars).")
+
+            # --- Schema Audit via MCP (the actual EDS scoring) ---
+            schema_audit_url = next((u for u in urls), None) if urls else None
+            if schema_audit_url:
+                print(f"  + Running schema_audit via MCP for: {schema_audit_url}")
+                schema_audit_result = get_mcp_client().call("schema_audit", {"site_url": schema_audit_url, "session_id": session_id})
+                if schema_audit_result:
+                    combined_context.append(f"[SCHEMA_AUDIT_RESULT - {schema_audit_url}]:\n{schema_audit_result}")
+                    new_events.append({"event_type": "tool_call", "tool_name": "mcp_schema_audit", "input": schema_audit_url, "status": "success"})
+
+            research_data = {
+                "context": combined_context,
+                "tool_logs": [e for e in new_events if e.get("event_type") == "tool_call"],
+                "research_intent": json.dumps({"intent": intent, "rationale": "Schema Full Pipeline — constrained authority research"}),
+                "detected_geo": DEFAULT_GEO
+            }
+
+        elif images or urls:
             print(f"TELEMETRY: Media-Rich Request detected. Analyzing signals and grounding assets...")
             # We call find_trending_keywords to get Geo/Intent signals and analyze any direct images
             r_result = find_trending_keywords(sanitized_topic, history_context=history_text, session_id=session_id, images=images, mission_topic=original_topic, session_metadata=session_data, initial_context=code_analysis_context, triage_intent=intent)
@@ -3431,6 +3675,119 @@ def _process_story_logic_inner(request):
                 "is_initial_post": is_initial_post
             })
             return jsonify({"msg": "Grounded social reply sent"}), 200
+
+        # === PATH: SCHEMA FULL PIPELINE (Post-Research Output) ===
+        elif intent in ["SCHEMA_VALIDATE", "SCHEMA_INJECT"] and force_schema_full_pipeline:
+            print(f"Executing Schema Full Pipeline Output for [{intent}]: {clean_topic[:60]}")
+            target = get_output_target("DIRECT_ANSWER")  # Use MODERATOR_VIEW formatting
+            
+            # Schema-specialist system instruction override (Layer 3: Dual-mode)
+            schema_ghost_post_id = req.get("ghost_post_id") or (session_data.get('ghost_post_id') if isinstance(session_data, dict) else None)
+            is_creation_mode = intent == "SCHEMA_INJECT" and not schema_ghost_post_id
+            
+            schema_system_addendum = """
+                ### SCHEMA STRATEGIC AUDIT PROTOCOL
+                You are a Schema.org and Google Structured Data expert.
+
+                **MODE DETECTION:**
+                - If creating a NEW page/post (no existing schema to audit), generate a COMPLETE 
+                  JSON-LD block based on the page content, title, and topic. Use the research context 
+                  to determine the most specific Schema.org type.
+                - If auditing/validating an EXISTING page, follow the audit hierarchy below.
+
+                **Priority 1: Google Search Gallery Compliance**
+                - Start with Google's requirements from the Search Gallery documentation provided in your grounding context.
+                - List EVERY "Required" property for the recommended schema type(s).
+                - List "Recommended" properties that would unlock rich result features.
+
+                **Priority 2: Schema.org Specificity Layering**
+                - Use the MOST SPECIFIC subtype from Schema.org (e.g., `OnlineStore` instead of `Organization`, `Dentist` instead of `LocalBusiness`).
+                - Layer additional properties from Schema.org that Google doesn't explicitly require but strengthen authority (e.g., `sameAs`, `knowsAbout`, `hasOfferCatalog`).
+
+                **Priority 3: Actionable Remediation / Creation**
+                - For NEW pages: Generate a COMPLETE JSON-LD code block with ALL required and 
+                  recommended properties pre-filled from the page content. Return the JSON-LD 
+                  as a parseable ```json code block.
+                - For EXISTING pages with EDS 0/100: Provide a COMPLETE JSON-LD code block ready for injection.
+                - For EXISTING pages with EDS > 0: Identify missing required/recommended properties and provide corrected JSON-LD.
+                - Always explain WHY each property matters for Google's rich results.
+
+                **CRITICAL: Always include the complete JSON-LD in a ```json code block so it can be extracted programmatically.**
+
+                **Output Format: Use clear sections:**
+                1. 🔍 Current State (EDS Score, existing schema findings)
+                2. 🎯 Recommended Schema Type(s) (with justification from Google Gallery)
+                3. 📋 Required Properties (from Google)
+                4. ✨ Recommended Properties (from Google + Schema.org layering)
+                5. 💻 Complete JSON-LD Code Block (ready for injection)
+                6. 📝 Implementation Notes
+            """
+            # Inject schema specialist instructions into context for LLM grounding
+            schema_enriched_context = [f"[SCHEMA_SPECIALIST_INSTRUCTIONS]:\n{schema_system_addendum}"] + research_data['context']
+            
+            answer_data = generate_comprehensive_answer(
+                clean_topic, schema_enriched_context, 
+                history=history_text, context_topic=original_topic, 
+                session_id=session_id, output_target=target, 
+                intent_label=intent
+            )
+            answer_text = answer_data['text']
+            research_intent = answer_data.get('intent', intent)
+            
+            # --- POST-ANSWER: Extract JSON-LD for N8N delivery (Layer 4: Clean Payload) ---
+            schema_json = None
+            if intent == "SCHEMA_INJECT":
+                json_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', answer_text)
+                if json_match:
+                    try:
+                        schema_json = json.loads(json_match.group(1))
+                        print(f"TELEMETRY: ✅ Schema JSON-LD extracted: @type={schema_json.get('@type', 'unknown')}")
+                    except json.JSONDecodeError:
+                        print("TELEMETRY: ⚠️ Schema JSON-LD parse failed — sending audit text only")
+
+            new_events.append({"event_type": "agent_answer", "text": answer_text, "intent": research_intent})
+            
+            session_ref = db.collection('agent_sessions').document(session_id)
+            events_ref = session_ref.collection('events')
+            for event in new_events:
+                if 'timestamp' not in event: event['timestamp'] = datetime.datetime.now(datetime.timezone.utc)
+                _firestore_call_with_timeout(lambda: events_ref.add(event))
+
+            update_data = {
+                "status": "awaiting_feedback", 
+                "type": "schema_audit", 
+                "slack_context": slack_context,
+                "detected_geo": final_geo,
+                "intent": research_intent,
+                "last_updated": expire_time
+            }
+            if is_initial_post: update_data["topic"] = clean_topic
+            _firestore_call_with_timeout(lambda: session_ref.update(update_data))
+
+            # Build N8N delivery payload
+            n8n_payload = {
+                "session_id": session_id, 
+                "type": global_operation_type, 
+                "message": convert_html_to_markdown(answer_text), 
+                "query": sanitized_topic,
+                "intent": research_intent,
+                "output_target": target,
+                "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel') or req.get('event', {}).get('channel'), 
+                "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
+                "is_initial_post": is_initial_post
+            }
+            # Include schema payload for Ghost CMS injection via N8N (clean data only)
+            if schema_json and intent == "SCHEMA_INJECT":
+                n8n_payload["payload"] = {
+                    "ghost_post_id": schema_ghost_post_id,
+                    "schema_json": schema_json,
+                    "script_id": "ld-json",
+                }
+                print(f"TELEMETRY: 📦 Schema payload included for N8N delivery [ghost_post_id={schema_ghost_post_id}]")
+
+            safe_n8n_delivery(n8n_payload)
+            return jsonify({"msg": "Schema full pipeline answer sent"}), 200
+
 
         elif intent in ["DIRECT_ANSWER", "BLOG_OUTLINE"] or str(intent).startswith("FORMAT_"):
 
@@ -3925,6 +4282,18 @@ def _process_story_logic_inner(request):
                     cluster_tag = f"#{lp_data.get('cluster_tag').lstrip('#')}"
                     lp_tags = [cluster_tag]
 
+                # Schema-by-default: Extract JSON-LD from research context if SCHEMA tool ran
+                lp_schema_json = None
+                research_ctx_str = str(research_data.get('context', ''))
+                if '[Schema Audit' in research_ctx_str:
+                    schema_ld_match = re.search(r'\{[^{}]*"@context"\s*:\s*"https?://schema\.org"[^{}]*\}', research_ctx_str)
+                    if schema_ld_match:
+                        try:
+                            lp_schema_json = json.loads(schema_ld_match.group(0))
+                            print(f"TELEMETRY: ✅ LP Schema-by-default: extracted @type={lp_schema_json.get('@type', 'unknown')}")
+                        except json.JSONDecodeError:
+                            pass
+
                 delivery_payload = {
                     "title": seo_data.get("title", "Untitled LP"),
                     "html": article_html,
@@ -3935,6 +4304,7 @@ def _process_story_logic_inner(request):
                     "custom_excerpt": seo_data.get("custom_excerpt"),
                     "data_points": lp_data,
                     "script_id": "lp-data",   # N8N generic node uses this for <script id="lp-data">
+                    "schema_json": lp_schema_json,  # Schema-by-default: raw JSON-LD for N8N
                 }
 
                 if not ghost_post_id:
