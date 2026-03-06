@@ -83,6 +83,12 @@ def extract_on_page_schema(url):
             data = json.loads(script.string)
             if isinstance(data, list):
                 schema_blocks.extend(data)
+            elif isinstance(data, dict):
+                # Unwrap @graph pattern: {"@context":..., "@graph":[{...},{...}]}
+                if "@graph" in data and isinstance(data["@graph"], list):
+                    schema_blocks.extend(data["@graph"])
+                else:
+                    schema_blocks.append(data)
             else:
                 schema_blocks.append(data)
         except Exception as e:

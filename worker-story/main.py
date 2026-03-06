@@ -3414,14 +3414,24 @@ def _process_story_logic_inner(request):
             # --- SENSORY "DOUBLE-TAP": Analyze detected images from scrape ---
             # Reuse the image pattern from find_trending_keywords
             img_pattern = r'(https?://[^\s<>|]+(?:\.(?:jpg|jpeg|png|webp|gif|pdf)|format=(?:jpg|jpeg|png|webp|gif))(?:\?[^\s<>|]*)?)'
-            for ctx in combined_context:
-                found_images = re.findall(img_pattern, ctx)
-                if found_images:
-                    print(f"Sensory Double-Tap: Analyzing {len(found_images[:2])} images found in scrape...")
-                    for img_url in found_images[:2]:
-                        visual_context = analyze_image(img_url, prompt=f"Analyze this image in the context of the user request: {sanitized_topic}")
+            
+            # Extract URLs from a snapshot of current context to avoid infinite loop
+            images_to_analyze = []
+            for ctx in tuple(combined_context):
+                images_to_analyze.extend(re.findall(img_pattern, ctx))
+                
+            # Dedupe and analyze only top 2
+            images_to_analyze = list(dict.fromkeys(images_to_analyze))
+            if images_to_analyze:
+                print(f"Sensory Double-Tap: Analyzing {len(images_to_analyze[:2])} images found in scrape...")
+                for img_url in images_to_analyze[:2]:
+                    visual_context = analyze_image(img_url, prompt=f"Analyze this image in the context of the user request: {sanitized_topic}")
+                    if visual_context and not visual_context.startswith("Error"):
                         combined_context.append(f"[VISUAL_INSIGHT]: {visual_context}")
                         new_events.append({"event_type": "tool_call", "tool_name": "analyze_scraped_image", "status": "success", "content": f"[VISUAL_INSIGHT]: {visual_context}"})
+                    else:
+                        print(f"Sensory Double-Tap: Skipped failed image: {img_url}")
+                        new_events.append({"event_type": "tool_call", "tool_name": "analyze_scraped_image", "status": "error", "content": visual_context or "empty response"})
         
         # TIER 2: Grounding & Signal Detection (Images or URLs)
         if force_schema_full_pipeline:
@@ -3690,29 +3700,27 @@ def _process_story_logic_inner(request):
                 You are a Schema.org and Google Structured Data expert.
 
                 **MODE DETECTION:**
-                - If creating a NEW page/post (no existing schema to audit), generate a COMPLETE 
-                  JSON-LD block based on the page content, title, and topic. Use the research context 
-                  to determine the most specific Schema.org type.
-                - If auditing/validating an EXISTING page, follow the audit hierarchy below.
+                - If AUDITING/VALIDATING an existing page, follow the full audit hierarchy below.
+                - If CREATING a new page/post (no existing schema), produce `schema_overrides` — 
+                  enrichment values ONLY. The frontend owns the JSON-LD template. You supply values 
+                  the frontend cannot derive from Ghost CMS alone.
 
+                ---
+                #### AUDIT MODE (existing pages)
                 **Priority 1: Google Search Gallery Compliance**
                 - Start with Google's requirements from the Search Gallery documentation provided in your grounding context.
                 - List EVERY "Required" property for the recommended schema type(s).
                 - List "Recommended" properties that would unlock rich result features.
 
                 **Priority 2: Schema.org Specificity Layering**
-                - Use the MOST SPECIFIC subtype from Schema.org (e.g., `OnlineStore` instead of `Organization`, `Dentist` instead of `LocalBusiness`).
-                - Layer additional properties from Schema.org that Google doesn't explicitly require but strengthen authority (e.g., `sameAs`, `knowsAbout`, `hasOfferCatalog`).
+                - Use the MOST SPECIFIC subtype from Schema.org (e.g., `OnlineStore` instead of `Organization`).
+                - Layer additional properties that strengthen authority (e.g., `sameAs`, `knowsAbout`, `hasOfferCatalog`).
 
-                **Priority 3: Actionable Remediation / Creation**
-                - For NEW pages: Generate a COMPLETE JSON-LD code block with ALL required and 
-                  recommended properties pre-filled from the page content. Return the JSON-LD 
-                  as a parseable ```json code block.
-                - For EXISTING pages with EDS 0/100: Provide a COMPLETE JSON-LD code block ready for injection.
-                - For EXISTING pages with EDS > 0: Identify missing required/recommended properties and provide corrected JSON-LD.
-                - Always explain WHY each property matters for Google's rich results.
-
-                **CRITICAL: Always include the complete JSON-LD in a ```json code block so it can be extracted programmatically.**
+                **Priority 3: Actionable Remediation**
+                - For EDS 0/100: Provide a COMPLETE JSON-LD code block ready for injection.
+                - For EDS > 0: Identify missing required/recommended properties and provide corrected JSON-LD.
+                - Always explain WHY each property matters for rich results.
+                - Always include the complete JSON-LD in a ```json code block.
 
                 **Output Format: Use clear sections:**
                 1. 🔍 Current State (EDS Score, existing schema findings)
@@ -3721,6 +3729,28 @@ def _process_story_logic_inner(request):
                 4. ✨ Recommended Properties (from Google + Schema.org layering)
                 5. 💻 Complete JSON-LD Code Block (ready for injection)
                 6. 📝 Implementation Notes
+
+                ---
+                #### CREATION MODE (new pages — schema_overrides)
+                The FRONTEND owns these Schema templates (the agent does NOT produce full JSON-LD):
+                - Blog post → `ArticleSchema` (Article)
+                - Landing page → `LpSchema` (WebPage + FAQPage)
+                - Market insight → `MarketInsightSchema` (Article + spatialCoverage)
+                - Author page → `ProfilePageSchema` (ProfilePage + Person)
+
+                Your job: return a ```json block with ENRICHMENT VALUES the frontend templates
+                will merge. Keys are flat, not nested JSON-LD. Example for a landing page:
+                ```json
+                {
+                    "speakable_css_selector": [".article-body h2", ".article-body p:first-of-type"],
+                    "about": "Consumer protection in AI-driven commerce",
+                    "keywords": ["AI consumer protection", "regulatory compliance"],
+                    "faq": [{"q": "What is...?", "a": "It is..."}]
+                }
+                ```
+                Only include properties the frontend CANNOT derive from Ghost API data.
+                Do NOT include: headline, datePublished, dateModified, author, publisher, image,
+                url, @context, @type — the frontend handles all of these.
             """
             # Inject schema specialist instructions into context for LLM grounding
             schema_enriched_context = [f"[SCHEMA_SPECIALIST_INSTRUCTIONS]:\n{schema_system_addendum}"] + research_data['context']
@@ -3776,14 +3806,14 @@ def _process_story_logic_inner(request):
                 "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'),
                 "is_initial_post": is_initial_post
             }
-            # Include schema payload for Ghost CMS injection via N8N (clean data only)
+            # Include schema enrichment payload for Ghost CMS injection via N8N
             if schema_json and intent == "SCHEMA_INJECT":
                 n8n_payload["payload"] = {
                     "ghost_post_id": schema_ghost_post_id,
-                    "schema_json": schema_json,
+                    "schema_overrides": schema_json,  # Enrichment values for frontend template
                     "script_id": "ld-json",
                 }
-                print(f"TELEMETRY: 📦 Schema payload included for N8N delivery [ghost_post_id={schema_ghost_post_id}]")
+                print(f"TELEMETRY: 📦 Schema overrides included for N8N delivery [ghost_post_id={schema_ghost_post_id}]")
 
             safe_n8n_delivery(n8n_payload)
             return jsonify({"msg": "Schema full pipeline answer sent"}), 200
@@ -4282,15 +4312,15 @@ def _process_story_logic_inner(request):
                     cluster_tag = f"#{lp_data.get('cluster_tag').lstrip('#')}"
                     lp_tags = [cluster_tag]
 
-                # Schema-by-default: Extract JSON-LD from research context if SCHEMA tool ran
-                lp_schema_json = None
+                # Schema-by-default: Extract enrichment overrides from research context if SCHEMA tool ran
+                lp_schema_overrides = None
                 research_ctx_str = str(research_data.get('context', ''))
                 if '[Schema Audit' in research_ctx_str:
-                    schema_ld_match = re.search(r'\{[^{}]*"@context"\s*:\s*"https?://schema\.org"[^{}]*\}', research_ctx_str)
+                    schema_ld_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', research_ctx_str)
                     if schema_ld_match:
                         try:
-                            lp_schema_json = json.loads(schema_ld_match.group(0))
-                            print(f"TELEMETRY: ✅ LP Schema-by-default: extracted @type={lp_schema_json.get('@type', 'unknown')}")
+                            lp_schema_overrides = json.loads(schema_ld_match.group(0))
+                            print(f"TELEMETRY: ✅ LP Schema-by-default: extracted overrides keys={list(lp_schema_overrides.keys()) if lp_schema_overrides else 'none'}")
                         except json.JSONDecodeError:
                             pass
 
@@ -4304,7 +4334,7 @@ def _process_story_logic_inner(request):
                     "custom_excerpt": seo_data.get("custom_excerpt"),
                     "data_points": lp_data,
                     "script_id": "lp-data",   # N8N generic node uses this for <script id="lp-data">
-                    "schema_json": lp_schema_json,  # Schema-by-default: raw JSON-LD for N8N
+                    "schema_overrides": lp_schema_overrides,  # Enrichment values for frontend Schema template
                 }
 
                 if not ghost_post_id:

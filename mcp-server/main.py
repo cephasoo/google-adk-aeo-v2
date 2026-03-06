@@ -496,17 +496,30 @@ def handle_tool_call(name, arguments):
                 header_context = "\n\n[DETECTED_HEADERS]:\n" + "\n".join(headers[:25]) if headers else ""
 
                 schemas = []
+                def _extract_schema_types(data):
+                    if isinstance(data, dict):
+                        has_known = False
+                        if "@graph" in data and isinstance(data["@graph"], list):
+                            has_known = True
+                            for item in data["@graph"]:
+                                _extract_schema_types(item)
+                        if "@type" in data:
+                            has_known = True
+                            t = data["@type"]
+                            if isinstance(t, list):
+                                for ty in t: schemas.append(f"- Schema Type: {ty}")
+                            else:
+                                schemas.append(f"- Schema Type: {t}")
+                        if not has_known:
+                            schemas.append("- Schema Type: Unknown")
+                    elif isinstance(data, list):
+                        for item in data:
+                            _extract_schema_types(item)
+
                 for script in soup.find_all("script", type="application/ld+json"):
                     try:
                         schema_data = json.loads(script.string)
-                        if isinstance(schema_data, dict):
-                            stype = schema_data.get("@type", "Unknown")
-                            schemas.append(f"- Schema Type: {stype}")
-                        elif isinstance(schema_data, list):
-                            for item in schema_data:
-                                if isinstance(item, dict):
-                                    stype = item.get("@type", "Unknown")
-                                    schemas.append(f"- Schema Type: {stype}")
+                        _extract_schema_types(schema_data)
                     except: continue
                 schema_context = "\n\n[DETECTED_SCHEMA]:\n" + "\n".join(list(set(schemas))[:10]) if schemas else ""
 
@@ -914,9 +927,10 @@ def handle_tool_call(name, arguments):
                 part = Part.from_data(data=decoded, mime_type=mime_type)
             
             response = model.generate_content([prompt, part])
-            result = f"[VISUAL_INSIGHT]:\n{response.text}"
+            result = response.text
         except Exception as e:
-            result = f"Error analyzing file: {str(e)}"
+            error_type = type(e).__name__
+            result = f"Error analyzing file: {error_type} — {getattr(e, 'response', None) and e.response.status_code or 'unknown status'}"
 
     elif name == "generate_image":
         prompt = arguments.get("prompt")
