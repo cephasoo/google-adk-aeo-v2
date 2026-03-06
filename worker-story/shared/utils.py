@@ -700,6 +700,17 @@ def classify_topic_sector(topic: str, flash_model=None) -> str:
         
     return "TECHNICAL"
 
+def convert_markdown_links_to_slack(text):
+    """
+    Converts standard markdown links into Slack's mrkdwn format.
+    Example: [Text](https://example.com) -> <https://example.com|Text>
+    Uses a negative lookbehind `(?<!\!)` to ignore markdown images `![Alt](URL)`.
+    """
+    if not text or not isinstance(text, str): 
+        return text
+        
+    return re.sub(r'(?<!\!)\[([^\]]+)\]\(([^)]+)\)', r'<\2|\1>', text)
+
 def convert_html_to_markdown(html_str):
     """Converts architectural HTML into Slack-friendly Markdown with a clear hierarchy."""
     if not html_str: return ""

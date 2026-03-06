@@ -16,6 +16,7 @@ from shared.utils import (
     detect_audience_context,
     safe_generate_content,
     convert_html_to_markdown,
+    convert_markdown_links_to_slack,
     get_system_instructions,
     extract_labeled_sources,
     get_stylistic_mentors
@@ -326,7 +327,7 @@ def process_feedback_logic(request):
         safe_n8n_delivery({
             "session_id": session_id,
             "type": global_operation_type,
-            "message": refusal_text,
+            "message": convert_markdown_links_to_slack(refusal_text) if target in ["MODERATOR_VIEW", "MARKDOWN_VIEW"] else refusal_text,
             "query": user_feedback,
             "output_target": target,
             "channel_id": slack_context.get('channel'),
@@ -517,12 +518,13 @@ def process_feedback_logic(request):
             "timestamp": datetime.datetime.now(datetime.timezone.utc)
         }))
         _firestore_call_with_timeout(lambda: doc_ref.update({"status": "completed", "last_updated": expire_time}))
+        target = get_output_target(intent)
         safe_n8n_delivery({
             "session_id": session_id,
             "type": global_operation_type,
-            "message": schema_reply,
+            "message": convert_markdown_links_to_slack(schema_reply) if target in ["MODERATOR_VIEW", "MARKDOWN_VIEW"] else schema_reply,
             "query": user_feedback,
-            "output_target": get_output_target(intent),
+            "output_target": target,
             "channel_id": slack_context.get('channel'),
             "thread_ts": slack_context.get('ts'),
             "is_initial_post": False
@@ -642,10 +644,14 @@ def process_feedback_logic(request):
         _firestore_call_with_timeout(lambda: events_ref.add({"event_type": "final_output", "content": target_content, "timestamp": datetime.datetime.now(datetime.timezone.utc)}))
         
         target = get_output_target(global_operation_type)
+        proposal_link = convert_html_to_markdown(target_content)
+        if target in ["MODERATOR_VIEW", "MARKDOWN_VIEW"]:
+            proposal_link = convert_markdown_links_to_slack(proposal_link)
+
         safe_n8n_delivery({
             "session_id": session_id, 
             "type": global_operation_type,
-            "proposal": [{"link": convert_html_to_markdown(target_content)}], 
+            "proposal": [{"link": proposal_link}], 
             "query": user_feedback,
             "output_target": target,
             "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'), 
@@ -700,11 +706,15 @@ def process_feedback_logic(request):
         _firestore_call_with_timeout(lambda: doc_ref.update({"last_updated": expire_time}))
         
         target = get_output_target(global_operation_type)
+        proposal_links = [convert_html_to_markdown(c) if isinstance(c, str) else c for c in new_prop['interlinked_concepts']]
+        if target in ["MODERATOR_VIEW", "MARKDOWN_VIEW"]:
+            proposal_links = [convert_markdown_links_to_slack(p) if isinstance(p, str) else p for p in proposal_links]
+
         safe_n8n_delivery({
             "session_id": session_id, 
             "type": global_operation_type,
             "approval_id": new_id, 
-            "proposal": [convert_html_to_markdown(c) if isinstance(c, str) else c for c in new_prop['interlinked_concepts']], 
+            "proposal": proposal_links, 
             "query": user_feedback,
             "output_target": target,
             "thread_ts": slack_context.get('ts') or slack_context.get('thread_ts'), 
