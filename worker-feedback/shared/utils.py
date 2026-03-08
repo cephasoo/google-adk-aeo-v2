@@ -151,6 +151,10 @@ def safe_n8n_delivery(payload, timeout=45):
     )
     session.mount('https://', HTTPAdapter(max_retries=retries))
     
+    # Centralized Slack link formatting: convert markdown links for all MODERATOR_VIEW deliveries
+    if payload.get("output_target") == "MODERATOR_VIEW" and "message" in payload:
+        payload["message"] = convert_markdown_links_to_slack(payload["message"])
+
     try:
         print(f"DEBUG: Attempting safe_n8n_delivery [Session: {payload.get('session_id')}]")
         response = session.post(

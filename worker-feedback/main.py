@@ -327,7 +327,7 @@ def process_feedback_logic(request):
         safe_n8n_delivery({
             "session_id": session_id,
             "type": global_operation_type,
-            "message": convert_markdown_links_to_slack(refusal_text) if target in ["MODERATOR_VIEW", "MARKDOWN_VIEW"] else refusal_text,
+            "message": refusal_text,
             "query": user_feedback,
             "output_target": target,
             "channel_id": slack_context.get('channel'),
@@ -522,7 +522,7 @@ def process_feedback_logic(request):
         safe_n8n_delivery({
             "session_id": session_id,
             "type": global_operation_type,
-            "message": convert_markdown_links_to_slack(schema_reply) if target in ["MODERATOR_VIEW", "MARKDOWN_VIEW"] else schema_reply,
+            "message": schema_reply,
             "query": user_feedback,
             "output_target": target,
             "channel_id": slack_context.get('channel'),
@@ -645,7 +645,7 @@ def process_feedback_logic(request):
         
         target = get_output_target(global_operation_type)
         proposal_link = convert_html_to_markdown(target_content)
-        if target in ["MODERATOR_VIEW", "MARKDOWN_VIEW"]:
+        if target == "MODERATOR_VIEW":
             proposal_link = convert_markdown_links_to_slack(proposal_link)
 
         safe_n8n_delivery({
@@ -707,7 +707,7 @@ def process_feedback_logic(request):
         
         target = get_output_target(global_operation_type)
         proposal_links = [convert_html_to_markdown(c) if isinstance(c, str) else c for c in new_prop['interlinked_concepts']]
-        if target in ["MODERATOR_VIEW", "MARKDOWN_VIEW"]:
+        if target == "MODERATOR_VIEW":
             proposal_links = [convert_markdown_links_to_slack(p) if isinstance(p, str) else p for p in proposal_links]
 
         safe_n8n_delivery({

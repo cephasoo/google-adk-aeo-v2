@@ -19,7 +19,6 @@ from shared.utils import (
     detect_audience_context,
     safe_generate_content,
     convert_html_to_markdown,
-    convert_markdown_links_to_slack,
     get_mcp_client,
     get_system_instructions,
     extract_labeled_sources,
@@ -1548,7 +1547,7 @@ def generate_comprehensive_answer(topic, context, history="", intent_metadata=No
     
     # Enforce spacing and Slack compatibility
     final_text = ensure_slack_compatibility(processed_text.strip())
-    
+
     return {
         "text": final_text,
         "intent": research_intent,
@@ -3013,13 +3012,6 @@ def _process_story_logic_inner(request):
         
         keyword_payload = sanitized_topic.lower()
 
-        # --- ADK SAFE-CATCH: Prevent Schema Mistriage ---
-        # If the LLM picked a non-schema intent, but the prompt clearly discusses schema, force it back on track.
-        if "schema" in keyword_payload or "json-ld" in keyword_payload:
-            if intent not in ["SCHEMA_VALIDATE", "SCHEMA_INJECT"]:
-                print(f"🎯 SAFE-CATCH: LLM wrongly picked [{intent}] for a Schema request. Correcting to SCHEMA_VALIDATE.")
-                intent = "SCHEMA_VALIDATE"
-
         # ADK HARDENING: Deterministic Triage Override (Keyword Overlord)
         # This prevents the LLM from misclassifying Ghost/pSEO requests as Operational Reformats.
 
@@ -3816,9 +3808,6 @@ def _process_story_logic_inner(request):
                 }
                 print(f"TELEMETRY: 📦 Schema overrides included for N8N delivery [ghost_post_id={schema_ghost_post_id}]")
 
-            if target == "MODERATOR_VIEW" and "message" in n8n_payload:
-                n8n_payload["message"] = convert_markdown_links_to_slack(n8n_payload["message"])
-
             safe_n8n_delivery(n8n_payload)
             return jsonify({"msg": "Schema full pipeline answer sent"}), 200
 
@@ -4398,7 +4387,7 @@ def _process_story_logic_inner(request):
                 update_data = {"status": "awaiting_feedback", "type": "work_answer", "slack_context": slack_context, "detected_geo": final_geo, "intent": research_intent, "last_updated": expire_time}
                 if is_initial_post: update_data["topic"] = clean_topic
                 _firestore_call_with_timeout(lambda: session_ref.update(update_data))
-                safe_n8n_delivery({"session_id": session_id, "type": global_operation_type, "message": convert_markdown_links_to_slack(answer_text) if target == "MODERATOR_VIEW" else answer_text, "intent": research_intent, "output_target": target, "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel'), "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'), "is_initial_post": is_initial_post})
+                safe_n8n_delivery({"session_id": session_id, "type": global_operation_type, "message": answer_text, "intent": research_intent, "output_target": target, "channel_id": slack_context.get('channel') or req.get('channel') or req.get('slack_channel'), "thread_ts": slack_context.get('thread_ts') or slack_context.get('ts'), "is_initial_post": is_initial_post})
                 return jsonify({"msg": "LP Fallback Answer sent"}), 200
 
         else: 
@@ -4432,7 +4421,7 @@ def _process_story_logic_inner(request):
             safe_n8n_delivery({
                 "session_id": session_id, 
                 "type": global_operation_type, 
-                "message": convert_markdown_links_to_slack(answer_text) if target == "MODERATOR_VIEW" else answer_text, 
+                "message": answer_text,
                 "intent": research_intent,
                 "directive": formatting_directive,
                 "query": sanitized_topic,
