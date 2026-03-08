@@ -919,9 +919,14 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     {{"visual_intent": "YES/NO", "new_geo": "...", "adequacy": "...", "selected_tools": [], "timeframe": "Today/7 Days/12 Months", "rationale": "..."}}
     """
     
-    router_raw = safe_generate_content(specialist_model, router_prompt, generation_config={"temperature": 0.2})
+    # NOTE: Router uses unimodel (Gemini Flash) instead of specialist_model (Anthropic)
+    # because it needs reliable structured JSON output, not prose quality.
+    # Perplexity (Anthropic's fallback) refuses to act as a JSON router.
+    router_raw = safe_generate_content(unimodel, router_prompt, generation_config={"temperature": 0.2})
     try:
         router_data = extract_json(router_raw)
+        if not router_data:
+            raise ValueError(f"Router returned unparseable response: {str(router_raw)[:120]}")
         is_recollective_visual_query = router_data.get("visual_intent") == "YES"
         new_geo_signal = router_data.get("new_geo", "Inherit")
         

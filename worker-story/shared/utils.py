@@ -194,7 +194,7 @@ class UnifiedModel:
             else:
                 vertexai.init()
             self._native_model = GenerativeModel(model_name, safety_settings=safety_settings)
-            print(f"✅ Executed clean vertexai.init for {model_name}.")
+            print(f"Executed clean vertexai.init for {model_name}.")
 
     def generate_content(self, prompt, generation_config=None, max_retries=3, system_instruction=None):
         import time
@@ -228,21 +228,25 @@ class UnifiedModel:
                     if "429" in error_msg or "resource exhausted" in error_msg:
                         if retries < max_retries:
                             wait_time = (2 ** retries) + random.uniform(0, 1)
-                            print(f"⚠️ Vertex 429: Retrying in {wait_time:.2f}s... (Attempt {retries+1}/{max_retries})")
+                            print(f"Vertex 429: Retrying in {wait_time:.2f}s... (Attempt {retries+1}/{max_retries})")
                             time.sleep(wait_time)
                             retries += 1
                             continue
                             
-                    print(f"⚠️ Vertex AI Safety/gRPC Error: {e}. Attempting Specialist Failover to Claude 4.5...")
+                    print(f"Vertex AI Safety/gRPC Error: {e}. Attempting Specialist Failover to Claude 4.5...")
                     failover_model = UnifiedModel(provider="anthropic", model_name="claude-sonnet-4-5")
                     return failover_model.generate_content(prompt, system_instruction=system_instruction, generation_config=generation_config)
 
         # Universal Route (Anthropic via HTTP/LiteLLM)
         else:
-            print(f"🔄 Fallback to HTTP via LiteLLM ({self.provider})...", flush=True)
+            print(f"Fallback to HTTP via LiteLLM ({self.provider})...", flush=True)
             if self.provider == "anthropic":
                 key = os.environ.get("ANTHROPIC_API_KEY") or get_secret("anthropic-api-key")
                 if key: os.environ["ANTHROPIC_API_KEY"] = key
+            elif self.provider == "perplexity":
+                key = os.environ.get("PERPLEXITYAI_API_KEY") or get_secret("perplexity-api-key")
+                if key: 
+                    os.environ["PERPLEXITYAI_API_KEY"] = key
             elif self.provider == "openai":
                 key = os.environ.get("OPENAI_API_KEY") or get_secret("openai-api-key")
                 if key: os.environ["OPENAI_API_KEY"] = key
@@ -278,10 +282,24 @@ class UnifiedModel:
                 content = response.choices[0].message.content
                 if not content:
                     content = "The model was unable to generate a response."
+                
+                # Strip reasoning XML blocks from models like sonar-reasoning-pro
+                # These appear as <think>...</think> or <reasoning>...</reasoning> in the response
+                if self.provider == "perplexity":
+                    content = re.sub(r'<think>[\s\S]*?</think>', '', content, flags=re.IGNORECASE).strip()
+                    content = re.sub(r'<reasoning>[\s\S]*?</reasoning>', '', content, flags=re.IGNORECASE).strip()
+                
                 return MockResponse(content)
                 
             except Exception as e:
-                print(f"❌ HTTP LiteLLM Error: {e}")
+                print(f"HTTP LiteLLM Error: {e}")
+                
+                # SPECIALIST FALLBACK: If Anthropic fails, recover via OpenAI to preserve Persona
+                if self.provider == "anthropic":
+                    print("Anthropic Failure (Credits/API). Attempting OpenAI Resiliency Chain...")
+                    failover_model = UnifiedModel(provider="openai", model_name="gpt-4o")
+                    return failover_model.generate_content(prompt, system_instruction=system_instruction, generation_config=generation_config)
+                
                 class MockResponse:
                     def __init__(self, content): self.text = content
                 return MockResponse("Error generating content.")
@@ -346,6 +364,12 @@ def get_mcp_client():
 def extract_json(text):
     """Hardened extraction of JSON from LLM responses."""
     if not text: return None
+    
+    # Strip Perplexity sonar-reasoning XML blocks before attempting parse
+    # Models like sonar-reasoning-pro prepend <think>...</think> to their output
+    text = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE).strip()
+    text = re.sub(r'<reasoning>[\s\S]*?</reasoning>', '', text, flags=re.IGNORECASE).strip()
+    
     markdown_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
     if markdown_match:
         content = markdown_match.group(1).strip()
@@ -705,7 +729,7 @@ def classify_topic_sector(topic: str, flash_model=None) -> str:
     return "TECHNICAL"
 
 def convert_markdown_links_to_slack(text):
-    """
+    r"""
     Converts standard markdown links into Slack's mrkdwn format.
     Example: [Text](https://example.com) -> <https://example.com|Text>
     Uses a negative lookbehind `(?<!\!)` to ignore markdown images `![Alt](URL)`.
