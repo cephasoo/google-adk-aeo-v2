@@ -131,7 +131,7 @@ def _completion_with_fallback(model_name, messages, temperature=0.3, max_tokens=
         print(f"MCP Hub: Primary Model Failure: {e}")
         
     # 2. Fallback Call (Perplexity)
-    print("MCP Hub: Attempting Perplexity Fallback (sonar-reasoning)...")
+    print("MCP Hub: Attempting Perplexity Fallback (sonar-reasoning-pro)...")
     if PERPLEXITYAI_API_KEY:
         os.environ["PERPLEXITYAI_API_KEY"] = PERPLEXITYAI_API_KEY
     else:
@@ -141,7 +141,7 @@ def _completion_with_fallback(model_name, messages, temperature=0.3, max_tokens=
 
     try:
         response = completion(
-            model="perplexity/sonar-reasoning",
+            model="perplexity/sonar-reasoning-pro",
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens if max_tokens < 4096 else 4096, # Perplexity limits
