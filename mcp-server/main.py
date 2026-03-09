@@ -35,7 +35,8 @@ WORKER_SCHEMA_URL = os.environ.get("WORKER_SCHEMA_URL")
 BROWSERLESS_API_KEY = None
 FLASH_MODEL_NAME = os.environ.get("FLASH_MODEL_NAME", "gemini-2.0-flash")
 ANTHROPIC_API_KEY = None
-DEFAULT_GEO = os.environ.get("DEFAULT_GEO", "NG") # Default to Nigeria as primary operating region, but configurable
+PERPLEXITYAI_API_KEY = None
+DEFAULT_GEO = os.environ.get("DEFAULT_GEO", "NG")
 
 # --- SEMRush-Based Power Player Benchmarking ---
 # Updated for Tiered Authority System (Step: 4500)
@@ -97,12 +98,66 @@ def ensure_initialized():
         initialize_secrets()
         global ANTHROPIC_API_KEY
         ANTHROPIC_API_KEY = get_secret("anthropic-api-key") or os.environ.get("ANTHROPIC_API_KEY")
+        global PERPLEXITYAI_API_KEY
+        PERPLEXITYAI_API_KEY = get_secret("perplexity-api-key") or os.environ.get("PERPLEXITYAI_API_KEY")
         _is_initialized = True
 
 def get_flash_model():
     """Returns a fresh GenerativeModel instance per call for gRPC fork-safety."""
     ensure_initialized()
     return GenerativeModel(FLASH_MODEL_NAME, safety_settings=safety_settings)
+
+def _completion_with_fallback(model_name, messages, temperature=0.3, max_tokens=4096, **kwargs):
+    """
+    LiteLLM wrapper with Anthropic -> Perplexity fallback.
+    """
+    ensure_initialized()
+    
+    # 1. Primary Call (Anthropic)
+    if ANTHROPIC_API_KEY:
+        os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
+    
+    try:
+        print(f"MCP Hub: Calling Primary Model ({model_name})...")
+        response = completion(
+            model=model_name,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            **kwargs
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"MCP Hub: Primary Model Failure: {e}")
+        
+    # 2. Fallback Call (Perplexity)
+    print("MCP Hub: Attempting Perplexity Fallback (sonar-reasoning)...")
+    if PERPLEXITYAI_API_KEY:
+        os.environ["PERPLEXITYAI_API_KEY"] = PERPLEXITYAI_API_KEY
+    else:
+        print("⚠️ No PERPLEXITYAI_API_KEY found. Final failover to OpenAI or error.")
+        # If no perplexity, we could try OpenAI but let's stick to the request for now.
+        raise Exception("No fallback keys available.")
+
+    try:
+        response = completion(
+            model="perplexity/sonar-reasoning",
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens if max_tokens < 4096 else 4096, # Perplexity limits
+            **kwargs
+        )
+        content = response.choices[0].message.content
+        
+        # 3. Strip Reasoning XML Tags (Dirty extraction for Perplexity)
+        content = re.sub(r'<think>[\s\S]*?</think>', '', content, flags=re.IGNORECASE).strip()
+        content = re.sub(r'<reasoning>[\s\S]*?</reasoning>', '', content, flags=re.IGNORECASE).strip()
+        
+        print("✅ Fallback to Perplexity successful.")
+        return content
+    except Exception as e:
+        print(f"❌ Perplexity Fallback also failed: {e}")
+        raise e
 
 # --- Shared Helper: SERP Parser ---
 def _parse_bing_results(results):
@@ -822,18 +877,13 @@ def handle_tool_call(name, arguments):
         COUNTRY CODE(S):
         """
         try:
-            # We remove spaces and non-alphanumeric characters (except commas) to ensure clean codes
-             # Inject key for LiteLLM
-            if ANTHROPIC_API_KEY:
-                os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
-                
-            response = completion(
-                model="anthropic/claude-sonnet-4-5",
+            result_text = _completion_with_fallback(
+                model_name="anthropic/claude-sonnet-4-5",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_tokens=10
-            ) 
-            raw_geo = response.choices[0].message.content.strip().upper()
+            )
+            raw_geo = result_text.strip().upper()
             clean_geo = re.sub(r'[^A-Z,]', '', raw_geo)
             result = clean_geo if clean_geo else DEFAULT_GEO
         except Exception:
@@ -867,20 +917,15 @@ def handle_tool_call(name, arguments):
         JSON:
         """
         try:
-             # Inject key for LiteLLM
-            if ANTHROPIC_API_KEY:
-                os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
-                
-            response = completion(
-                model="anthropic/claude-sonnet-4-5",
+            result_text = _completion_with_fallback(
+                model_name="anthropic/claude-sonnet-4-5",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_tokens=150,
                 response_format={"type": "json_object"}
             )
-            raw_response = response.choices[0].message.content.strip()
             # Basic cleanup in case the model adds markdown code blocks
-            clean_response = re.sub(r'```json|```', '', raw_response).strip()
+            clean_response = re.sub(r'```json|```', '', result_text).strip()
             result = clean_response
         except Exception:
             result = '{"intent": "FORMAT_GENERAL", "directive": ""}'
@@ -1023,20 +1068,12 @@ def handle_tool_call(name, arguments):
             reraise=True
         )
         def generate_with_retry():
-            # specialist model swap: Switch from Gemini Flash to Claude Sonnet 4.5
-            print(f"MCP Hub: Calling Specialist Model (Claude Sonnet 4.5) for {file_name}...")
-            
-            # Inject key for LiteLLM
-            if ANTHROPIC_API_KEY:
-                os.environ["ANTHROPIC_API_KEY"] = ANTHROPIC_API_KEY
-                
-            response = completion(
-                model="anthropic/claude-sonnet-4-5",
+            return _completion_with_fallback(
+                model_name="anthropic/claude-sonnet-4-5",
                 messages=[{"role": "user", "content": analysis_prompt}],
                 temperature=0.3,
                 max_tokens=4096
             )
-            return response.choices[0].message.content
 
         try:
             analysis_text = generate_with_retry()
