@@ -1001,7 +1001,8 @@ def handle_tool_call(name, arguments):
         history_context = arguments.get("history_context", "")
 
         # CONTENT PROTECTION: If content looks like a Slack error or is empty, abort early
-        if not file_content or '{"ok":false' in str(file_content) or '"error":"' in str(file_content)[:100]:
+        content_str = str(file_content).strip()
+        if not file_content or content_str.startswith('{"ok":false') or '"error":"' in content_str[:100]:
             print(f"MCP Hub: Aborting analysis for {file_name} due to invalid content (Slack Error or Empty)")
             return f"CODE_FILE ({file_name}): [Content unavailable or download error from Slack]"
         

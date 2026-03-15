@@ -283,31 +283,45 @@ def extract_core_topic(user_prompt, history=""):
     Your goal is to convert a user request into a JSON list of 1-3 distinct, powerful Google Search queries.
 
     ### SEARCH OPERATOR RULES:
-    1. **MAX 2 OPERATORS**: Never use more than 2 operators (like site: or "") in a single query.
+    1. **MAX 2 OPERATORS**: Never use more than 2 operators in a single query.
     2. **TEMPORAL CONTEXT**: If the topic is time-sensitive (news, product releases, latest trends, current specs), include words like "latest", "{current_year}", "current", or "news".
-    3. **QUOTES (VERY IMPORTANT)**: 
+    3. **QUOTES**: 
        - Use double quotes ONLY for the PRIMARY subject or specific error message.
        - **NEVER** use backslashes (`\`) for escaping.
        - **NEVER** wrap the entire query in an outer set of quotes if it already contains internal quotes.
-    4. **NO COMMAS**: Use spaces only.
-    5. **NO FLUFF**: Remove "I want to know", "Please tell me", "research for me".
-    6. **CRITICAL: FILTER EDITORIAL INSTRUCTIONS**: 
+    4. **OPERATOR PROTOCOL**:
+       - **Inclusion (`site:`)**: Anchor to the most authoritative source for the specific sector. Use placeholders like `site:[AUTHORITY.COM]` in this instruction only; in your output, **you MUST replace these with real, contextually relevant domains** (e.g., `.gov` for laws, `.org` for industry standards, or specific news/tech hubs).
+       - **Exclusion (`-site:`)**: Creatively clear debris. Use this to filter out non-authoritative noise (social/opinion) or to bypass 'Trusted Seeds' when seeking organic/niche results.
+       - **Wildcard (`*`)**: Use for semantic expansion (e.g., `sustainable packag*`) to find linguistic variants.
+       - **Related (`related:`)**: Use to find alternative authority hubs within the same verified sector.
+    5. **NO COMMAS**: Use spaces only.
+    6. **NO FLUFF**: Remove "I want to know", "Please tell me", "research for me".
+    7. **CRITICAL: FILTER EDITORIAL INSTRUCTIONS AND AVOID VAGUE, GENERAL TERMS**: 
        - REMOVE words like: "outline", "draft", "strategy", "blog post", "article", "word count", "Grade 8", "1500+ words", "logic flow".
        - PRESERVE discovery intent: "why", "how", "reasons", "causes", "factors", "impact", "trends".
 
     ### THE CORE PROBLEM:
     Do NOT generate "over-engineered" queries that include every technical or descriptive term. This creates a "technical vacuum" where no single page contains all terms, returning zero results.
+    Use site: operator with caution (prefarably when you're "SURE" of a need to anchor to the primary authority for best results). Excessive use may lead to "SERP suppression" or "SERP collapse" (where search engine returns irrelevant-to-zero results).
+    A query could be as simple as the core concept (e.g. tell me about electric cars, electric cars range efficiency) or could use any of the "strategic composition" methods below.
 
-    ### THE SOLUTION: TIERED DISCOVERY (Double-Tap)
-    Generate a JSON list of 1-3 queries, moving from BROAD/AUTHORITATIVE to SPECIFIC/REFINED.
+    ### THE SOLUTION: STRATEGIC COMPOSITION (Search Mix Selection)
+    **Generate a JSON list of 1-3 queries.**
+    Analyze the **Search Terrain** (Is it ambiguous? Is it technical? Is it a news pulse?). Decide the composition of these queries as **Alternative Paths** to the same goal to ensure **Fail-Safe Redundancy** (if the first search angle fails, the others must provide legitimate alternative discovery paths). 
+    
+    Choose from these **Strategic Capabilities**:
+    - **Structural Anchoring**: Target the primary authority or industry hub (e.g., `site:[DOMAIN.COM]`).
+    - **Semantic Variation**: Use alternative terminology or natural language to bypass 'technical vacuums' or ambiguity. Repeat this angle if the intent is elusive.
+    - **Discovery/Clearance**: Use advanced operators (exclusions `-`, wildcards `*`, `related:`) to clear noise or find niche signals.
 
-    **Tier 1: Broad Anchor (Authoritative Hubs)**
-    Focus on the "Primary Entity" and the most authoritative domain for that subject.
-    Patterns:
-    - Official: site:domain.com "Subject Name"
-    - Research: site:scholar.google.com OR site:arxiv.org
-    - Public/News: site:nytimes.com OR site:reuters.com OR site:github.com
-    Example: `site:developers.google.com "Google Merchant Center" documentation`
+    **Tier 1: Broad Anchor (Structural Hubs - To be used when it's absolutely necessary)**
+    Anchor to the primary authority for the subject sector using `site:` or `related:`.
+    - Logic: Focus on the "Primary Entity" and its most authoritative domain.
+    - Patterns (Logic Only): 
+        * Legal: `site:justice.example.gov "Section Name"`
+        * Economic: `site:data.example.org "Metric Name" {current_year}`
+        * Tech: `site:docs.example.com "Function Name" latest`
+    - Output Example: `site:official-source.com "Primary Subject" specification`
 
     **Tier 2: Discovery Pivot (Subject + Specific Intent)**
     Focus on the specialized intent or specific version/event.
@@ -316,9 +330,13 @@ def extract_core_topic(user_prompt, history=""):
     - Contextual: "comparison", "alternative", "reasons for"
     Example: `"Merchant API" product retrieval offerId`
 
+    Use **Advanced Operators** (Exclusions/Wildcards) to clear noise and expand reach.
+    - Perspective: Use **Natural Language** semantic phrasing to carry out disambiguation/chunking.
+    - Output Example: `"Subject Name" current trends -site:social-hub.com -site:opinion-site.org`
+
     **Tier 3: Refined Detail (Nuance Only)**
-    Only include implementation details or niche modifiers if primary intent fails.
-    Example: `"Merchant API" register_gcp base64url`
+    Only include implementation details, niche modifiers, or wildcard variants if primary intent fails.
+    - Output Example: `"Subject Name" implementation * variant`
 
     ### CONTEXT MAPPING:
     Use the HISTORY to resolve pronouns (he, it, that) to specific entities.
@@ -901,7 +919,9 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
     4. **MULTI-VARIATE RESEARCH**: Decide if the user needs Architectural, Contextual, or Comparative specs. 
     5. **VISUAL_INTENT**: Require seeing asset? [YES/NO]
     6. **GEO_PIVOT**: If the user refers to a specific country, you MUST return the **ISO-3166-1 alpha-2** code.
-    7. **ADEQUACY_AUDIT**: Have enough info to solve the ARCHITECTURAL/CONTEXTUAL goal? [SUFFICIENT/INSUFFICIENT]
+    7. **ADEQUACY_AUDIT**: Have enough info to solve the ARCHITECTURAL/CONTEXTUAL goal? [SUFFICIENT/INSUFFICIENT].
+       - **CRITICAL**: If the user command asks to 'find', 'retrieve', 'research', 'search', 'ground', or 'cite' specific external evidence (articles, papers, documentation, numbers), and that specific evidence is NOT present in the **RESEARCH/MEMORY SAMPLES** or **CONVERSATION HISTORY**, you MUST mark the adequacy as **INSUFFICIENT**.
+       - Your internal training data does NOT satisfy a discovery or retrieval command. Only current grounding context and history can satisfy it.
     8. **TOOL_RECRUITMENT**: List tools:
        - **WEB**: Technical documentation, news, and general grounding (Google).
        - **BING**: Cross-platform technical search and alternative perspectives.
@@ -912,7 +932,7 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
        - **TRENDS**: (USE SPARINGLY) For broad regional trending topics only (e.g., "Top searches in US").
        - **ANALYSIS**: For topic-specific historical interest and volume (e.g., "Tesla Model 2 interest").
        - **COMPLIANCE**: Legal and regulatory documentation.
-       - **SCHEMA**: Technical audit of on-page JSON-LD structured data and EDS scoring. ALWAYS recruit this tool alongside other tools for PSEO/content creation tasks (blog posts, landing pages, collection pages) to generate appropriate JSON-LD structured data for the new page.
+       - **SCHEMA**: Technical audit of on-page JSON-LD structured data and EDS scoring. Recruit this tool alongside other tools IF the task is SCHEMA_VALIDATE/SCHEMA_INJECT tasks to generate appropriate JSON-LD structured data for the new/updated page/blogpost.
        - **USE_CONVERSATIONAL_CONTEXT**: If existing history is sufficient.
     
     OUTPUT FORMAT (Raw JSON Only):
@@ -992,9 +1012,9 @@ def find_trending_keywords(raw_topic, history_context="", session_id=None, image
 
     # 4.2 Gatekeeper Short-Circuit
     # ADK HARDENING: We FORCE research for high-fidelity intents (DEEP_DIVE, BLOG_OUTLINE)
-    # if we have no unique grounding URLs in the context, even if the model thinks it's SUFFICIENT.
+    # if we have no unique grounding URLs in the context (snippets + history), even if the model thinks it's SUFFICIENT.
     # This ensures "Staff Engineer" over-confidence doesn't break the citation protocol.
-    has_grounding_urls = len(re.findall(r'https?://[^\s<>"]+', str(context_snippets))) > 0
+    has_grounding_urls = len(re.findall(r'https?://[^\s<>"]+', str(context_snippets) + str(history_context))) > 0
     is_high_fidelity = any(t in str(prev_intent) for t in ["DEEP_DIVE", "BLOG_OUTLINE", "AUTHOR"])
     
     if adequacy_score == "SUFFICIENT" and is_high_fidelity and not has_grounding_urls:
@@ -2024,7 +2044,7 @@ def generate_pseo_article(topic, context, history="", history_events=None, is_in
     raw_response = safe_generate_content(unimodel, prompt, system_instruction=sys_instruction, generation_config={"temperature": 0.4})
     return post_process_mermaid_to_images(sanitize_llm_html(raw_response), output_target)
 
-def generate_pseo_page(topic, context, history="", history_events=None, is_initial_post=True, session_id=None, output_target="CMS_DRAFT"):
+def generate_pseo_page(topic, context, history="", history_events=None, is_initial_post=True, session_id=None, output_target="CMS_DRAFT", session_data=None):
     """
     Generates a data-rich, non-narrative pSEO page for a specific entity/location.
     Uses reverse-engineered logic from generate_pseo_article for robust AUTHOR/REFACTOR paths.
@@ -2037,27 +2057,48 @@ def generate_pseo_page(topic, context, history="", history_events=None, is_initi
     audience_context = detect_audience_context(history)
     is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
 
-    # 1. Mode Detection (Reverse-engineered from generate_pseo_article)
+    # 1. Mode Detection — Structural + Semantic (replaces brittle keyword list)
     # Tri-State Logic: REFACTOR vs EXPAND vs AUTHOR
     start_mode = "AUTHOR"
-    
-    # Path A Signals (Verbatim Finalization)
-    is_repurpose_cmd = any(kw in topic_lower for kw in ["dump", "repurpose", "re-purpose", "refactor", "correct", "fix", "update", "refine", "publish", "provision", "finalize"])
-    
-    # Path B Signals (Creative Iteration)
-    is_expand_cmd = any(kw in topic_lower for kw in ["expand", "flesh out", "write from", "based on outline", "polish", "rewrite"])
-    
-    has_outline_structure = "## " in str(history) and len(str(history)) < 3500
-    has_full_draft_structure = ("## " in str(history) or "<table>" in str(history)) and len(str(history)) > 3500
 
-    if not is_initial_post and not is_repurpose_cmd and not is_expand_cmd and not has_full_draft_structure and not has_outline_structure:
-        start_mode = "AUTHOR"
-    elif is_repurpose_cmd and (has_full_draft_structure or not is_initial_post):
+    # Signal A: Page already exists in Ghost (provisionable)
+    has_ghost_page = bool(session_data.get("ghost_post_id")) if session_data else False
+
+    # Signal B: Thread contains an outline (BLOG_OUTLINE agent_answer)
+    has_outline_event = any(
+        e.get("event_type") == "agent_answer"
+        and str(e.get("intent", "")).upper() == "BLOG_OUTLINE"
+        for e in (history_events or [])
+    )
+
+    # Signal C: Thread contains an OPERATIONAL_REFORMAT answer (user-approved edit)
+    has_reformat_event = any(
+        e.get("event_type") == "agent_answer"
+        and str(e.get("intent", "")).upper() == "OPERATIONAL_REFORMAT"
+        for e in (history_events or [])
+    )
+
+    has_provisionable_asset = has_ghost_page or has_reformat_event
+
+    # Single Flash call to determine if this turn is REFACTOR or EXPAND
+    is_repurpose_cmd = False
+    if has_provisionable_asset and flash_model:
+        try:
+            sig = safe_generate_content(
+                flash_model,
+                f"Reply YES or NO only. Does this command require NEW external research? Command: '{topic}'",
+                generation_config={"temperature": 0.0, "max_output_tokens": 5}
+            )
+            needs_research = "YES" in str(sig).upper()
+            is_repurpose_cmd = not needs_research
+        except:
+            is_repurpose_cmd = False  # Safe default
+    is_expand_cmd = (not is_repurpose_cmd) and has_outline_event
+
+    if is_repurpose_cmd and has_provisionable_asset:
         start_mode = "REFACTOR"
-    elif (is_expand_cmd and "## " in str(history)) or (has_outline_structure and not is_repurpose_cmd):
+    elif is_expand_cmd:
         start_mode = "EXPAND"
-    elif is_repurpose_cmd and has_outline_structure:
-        start_mode = "EXPAND" 
     elif not is_initial_post:
         start_mode = "REFACTOR"
         
@@ -2132,7 +2173,7 @@ def generate_pseo_page(topic, context, history="", history_events=None, is_initi
 
 
 # 14.2 The LP Page Generator (Long-Form Pillar Page)
-def generate_lp_page(topic, context, history="", history_events=None, is_initial_post=True, session_id=None, output_target="CMS_DRAFT"):
+def generate_lp_page(topic, context, history="", history_events=None, is_initial_post=True, session_id=None, output_target="CMS_DRAFT", session_data=None):
     """
     Generates a long-form Landing Page (LP) for a specific framework, concept, or strategy.
     Uses the same REFACTOR / EXPAND / AUTHOR tri-state as generate_pseo_page(), but prompts
@@ -2146,20 +2187,46 @@ def generate_lp_page(topic, context, history="", history_events=None, is_initial
     audience_context = detect_audience_context(history)
     is_grounded = any("GROUNDING_CONTENT" in str(c) for c in context)
 
-    # 1. Tri-State Mode Detection (mirrors generate_pseo_page logic)
+    # 1. Tri-State Mode Detection — Structural + Semantic (mirrors generate_pseo_page logic)
     start_mode = "AUTHOR"
-    is_repurpose_cmd = any(kw in topic_lower for kw in ["dump", "repurpose", "re-purpose", "refactor", "correct", "fix", "update", "refine", "publish", "provision", "finalize"])
-    is_expand_cmd = any(kw in topic_lower for kw in ["expand", "flesh out", "write from", "based on outline", "polish", "rewrite"])
-    has_outline_structure = "## " in str(history) and len(str(history)) < 3500
-    has_full_draft_structure = ("## " in str(history) or "<table>" in str(history)) and len(str(history)) > 3500
 
-    if not is_initial_post and not is_repurpose_cmd and not is_expand_cmd and not has_full_draft_structure and not has_outline_structure:
-        start_mode = "AUTHOR"
-    elif is_repurpose_cmd and (has_full_draft_structure or not is_initial_post):
+    # Signal A: LP already exists in Ghost (provisionable)
+    has_ghost_page = bool(session_data.get("ghost_post_id")) if session_data else False
+
+    # Signal B: Thread contains an outline (BLOG_OUTLINE agent_answer)
+    has_outline_event = any(
+        e.get("event_type") == "agent_answer"
+        and str(e.get("intent", "")).upper() == "BLOG_OUTLINE"
+        for e in (history_events or [])
+    )
+
+    # Signal C: Thread contains an OPERATIONAL_REFORMAT answer (user-approved edit)
+    has_reformat_event = any(
+        e.get("event_type") == "agent_answer"
+        and str(e.get("intent", "")).upper() == "OPERATIONAL_REFORMAT"
+        for e in (history_events or [])
+    )
+
+    has_provisionable_asset = has_ghost_page or has_reformat_event
+
+    # Single Flash call to determine if this turn is REFACTOR or EXPAND
+    is_repurpose_cmd = False
+    if has_provisionable_asset and flash_model:
+        try:
+            sig = safe_generate_content(
+                flash_model,
+                f"Reply YES or NO only. Does this command require NEW external research? Command: '{topic}'",
+                generation_config={"temperature": 0.0, "max_output_tokens": 5}
+            )
+            needs_research = "YES" in str(sig).upper()
+            is_repurpose_cmd = not needs_research
+        except:
+            is_repurpose_cmd = False  # Safe default
+    is_expand_cmd = (not is_repurpose_cmd) and has_outline_event
+
+    if is_repurpose_cmd and has_provisionable_asset:
         start_mode = "REFACTOR"
-    elif (is_expand_cmd and "## " in str(history)) or (has_outline_structure and not is_repurpose_cmd):
-        start_mode = "EXPAND"
-    elif is_repurpose_cmd and has_outline_structure:
+    elif is_expand_cmd:
         start_mode = "EXPAND"
     elif not is_initial_post:
         start_mode = "REFACTOR"
@@ -3431,8 +3498,55 @@ def _process_story_logic_inner(request):
                         print(f"Sensory Double-Tap: Skipped failed image: {img_url}")
                         new_events.append({"event_type": "tool_call", "tool_name": "analyze_scraped_image", "status": "error", "content": visual_context or "empty response"})
         
+        # --- PSEO FAST-TRACK GATE ---
+        # If the thread already has a provisionable artifact, ask Flash whether
+        # the new command actually needs fresh web research before generating.
+        skip_sensory_router = False
+
+        if intent in ("PSEO_ARTICLE", "PSEO_PAGE", "PSEO_LP"):
+            provisionable_proposal_types = {
+                "PSEO_ARTICLE": {"deep_dive", "pseo_article"},
+                "PSEO_PAGE":    {"pseo_page", "pseo_article"},  # pseo_article = legacy name
+                "PSEO_LP":      {"pseo_lp"},
+            }.get(intent, set())
+
+            has_provisionable_asset = (
+                bool(session_data.get("ghost_post_id"))
+                or any(
+                    (e.get("event_type") == "agent_proposal" and e.get("proposal_type") in provisionable_proposal_types)
+                    or (e.get("event_type") == "agent_answer" and str(e.get("intent", "")).upper() in {"OPERATIONAL_REFORMAT", "BLOG_OUTLINE"})
+                    for e in (history_events or [])
+                )
+            )
+
+            if has_provisionable_asset and flash_model:
+                try:
+                    signal = safe_generate_content(
+                        flash_model,
+                        (f"A conversation thread already contains a {intent} artifact. "
+                         f"User command: '{sanitized_topic}'\n\n"
+                         f"Does this require fetching NEW external research from the web before responding? "
+                         f"Reply YES or NO only."),
+                        generation_config={"temperature": 0.0, "max_output_tokens": 5}
+                    )
+                    needs_research = "YES" in str(signal).upper()
+                    skip_sensory_router = not needs_research
+                    print(f"  + Orchestrator Semantic Gate [{intent}]: needs_research={needs_research}")
+                except Exception as e:
+                    print(f"  + Orchestrator Semantic Gate failed ({e}). Defaulting to research path.")
+                    skip_sensory_router = False
+
+        if skip_sensory_router:
+            print(f"TELEMETRY: PSEO Fast-Track — skipping Sensory Router (existing artifact detected).")
+            research_data = {
+                "context": code_analysis_context,
+                "tool_logs": [],
+                "research_intent": json.dumps({"intent": intent, "rationale": "PSEO Fast-Track: Existing artifact detected"}),
+                "detected_geo": session_data.get("detected_geo", DEFAULT_GEO)
+            }
+            
         # TIER 2: Grounding & Signal Detection (Images or URLs)
-        if force_schema_full_pipeline:
+        elif force_schema_full_pipeline:
             # === SCHEMA FULL PIPELINE: Constrained Authority Research ===
             # Instead of the generic Sensory Router, we scrape only:
             # 1. The user's target URL (already done above in L3398)
@@ -4111,7 +4225,7 @@ def _process_story_logic_inner(request):
                 target = get_output_target(intent)
                 
                 if intent == "PSEO_PAGE":
-                     article_html = generate_pseo_page(sanitized_topic, research_data['context'], history=history_text, history_events=history_events, is_initial_post=is_initial_post, output_target=target)
+                     article_html = generate_pseo_page(sanitized_topic, research_data['context'], history=history_text, history_events=history_events, is_initial_post=is_initial_post, output_target=target, session_data=session_data)
                 else:
                      article_html = generate_pseo_article(sanitized_topic, research_data['context'], history=history_text, history_events=history_events, is_initial_post=is_initial_post, output_target=target)
                 
@@ -4173,8 +4287,8 @@ def _process_story_logic_inner(request):
                 
                 # 7. SUCCESS: Log the event to subcollection
                 new_events.append({
-                    "event_type": "agent_proposal", 
-                    "proposal_type": "pseo_article", 
+                    "event_type": "agent_proposal",
+                    "proposal_type": "pseo_page" if intent == "PSEO_PAGE" else "pseo_article",
                     "text": convert_html_to_markdown(article_html),
                     "proposal_data": {"article_html": article_html}
                 })
@@ -4277,7 +4391,8 @@ def _process_story_logic_inner(request):
                 article_html = generate_lp_page(
                     sanitized_topic, research_data['context'],
                     history=history_text, history_events=history_events,
-                    is_initial_post=is_initial_post, output_target=target
+                    is_initial_post=is_initial_post, output_target=target,
+                    session_data=session_data
                 )
 
                 seo_data = generate_seo_metadata(article_html, original_topic, session_id=session_id, intent=intent)
